@@ -15,6 +15,10 @@ import {
   type NewPunch, type PunchRow,
 } from "./punches.js";
 import { createSite, matchSite, type NewSite } from "./sites.js";
+import {
+  createRoute, resolveRoute,
+  type NewRoute, type RouteCriteria, type RouteSnapshot,
+} from "../routes.js";
 import type { EmployeeId } from "../types.js";
 
 @validateRpc()
@@ -137,5 +141,13 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
 
   async reconcile(employeeId: EmployeeId, workDate: string): Promise<Reconciliation> {
     return reconcile(this.sql, employeeId, workDate);
+  }
+
+  async createRoute(input: NewRoute): Promise<number> {
+    return createRoute(this.sql, input);
+  }
+
+  async resolveRoute(criteria: RouteCriteria): Promise<RouteSnapshot> {
+    return resolveRoute(this.sql, criteria);
   }
 }
