@@ -37,8 +37,14 @@ export type NewRoute = {
 
 export class NoRouteError extends Error {
   readonly code = "KINTAI_NO_ROUTE";
-  constructor() {
-    super("No approval route matches this request. Ask an administrator to configure one.");
+  /**
+   * `detail` replaces the default message for the other way a request can end up with no usable
+   * route: a route matched, but its steps cannot ever be satisfied. The `code` is deliberately the
+   * same — from the caller's side both mean "an administrator must fix the route configuration".
+   */
+  constructor(detail?: string) {
+    super(detail
+      ?? "No approval route matches this request. Ask an administrator to configure one.");
   }
 }
 

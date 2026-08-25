@@ -16,10 +16,14 @@ import {
 } from "./punches.js";
 import { createSite, matchSite, type NewSite } from "./sites.js";
 import {
+  actOnSubmission, approvalEvents, getSubmission, resubmit, submitOvertime, withdrawSubmission,
+  type ActInput, type ApprovalEventRow, type NewSubmission, type SubmissionRow,
+} from "./submissions.js";
+import {
   createRoute, resolveRoute,
   type NewRoute, type RouteCriteria, type RouteSnapshot,
 } from "../routes.js";
-import type { EmployeeId } from "../types.js";
+import type { EmployeeId, SubmissionState } from "../types.js";
 
 @validateRpc()
 export class KintaiStore extends DurableObject<Cloudflare.Env> {
@@ -78,8 +82,10 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
     setDelegate(this.sql, employeeId, delegateId, from, to);
   }
 
-  async managersAt(employeeId: EmployeeId, at: number): Promise<EmployeeId[]> {
-    return managersAt(this.sql, employeeId, at);
+  async managersAt(
+    employeeId: EmployeeId, at: number, kind?: "report" | "delegate",
+  ): Promise<EmployeeId[]> {
+    return managersAt(this.sql, employeeId, at, kind);
   }
 
   async hasAuthorityOver(
@@ -149,5 +155,29 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
 
   async resolveRoute(criteria: RouteCriteria): Promise<RouteSnapshot> {
     return resolveRoute(this.sql, criteria);
+  }
+
+  async submitOvertime(input: NewSubmission): Promise<number> {
+    return submitOvertime(this.sql, input);
+  }
+
+  async actOnSubmission(input: ActInput): Promise<SubmissionState> {
+    return actOnSubmission(this.sql, input);
+  }
+
+  async resubmit(submissionId: number, actorId: EmployeeId, now: number): Promise<void> {
+    resubmit(this.sql, submissionId, actorId, now);
+  }
+
+  async withdrawSubmission(submissionId: number, actorId: EmployeeId): Promise<void> {
+    withdrawSubmission(this.sql, submissionId, actorId);
+  }
+
+  async getSubmission(id: number): Promise<SubmissionRow> {
+    return getSubmission(this.sql, id);
+  }
+
+  async approvalEvents(submissionId: number): Promise<ApprovalEventRow[]> {
+    return approvalEvents(this.sql, submissionId);
   }
 }

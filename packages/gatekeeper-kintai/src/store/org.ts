@@ -34,20 +34,35 @@ export function setDelegate(
   );
 }
 
-/** Everyone authorised over `employeeId` at `at` — reporting lines and live delegations. */
+/**
+ * Everyone authorised over `employeeId` at `at` — reporting lines and live delegations.
+ *
+ * This is an *enumeration* helper ("who could act?"), not the authorisation primitive: to decide
+ * whether one specific actor may act, call `hasAuthorityOver`, which also yields the edge id the
+ * audit trail needs.
+ *
+ * `kind` narrows the result to one edge kind. Unfiltered is the default so existing callers keep
+ * the full set, but callers that build a *requirement* ("every manager must approve") must pass
+ * "report": a delegate stands in for an absent manager, so counting them would turn a stand-in
+ * into an extra required signature — the exact opposite of what delegation is for.
+ */
 export function managersAt(
   sql: SqlStorage,
   employeeId: EmployeeId,
   at: number,
+  kind?: "report" | "delegate",
 ): EmployeeId[] {
-  return sql
-    .exec<{ manager_id: number }>(
-      `SELECT DISTINCT manager_id FROM org_edges
-       WHERE employee_id = ? AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)`,
+  const window = `employee_id = ? AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)`;
+  const rows = kind === undefined
+    ? sql.exec<{ manager_id: number }>(
+      `SELECT DISTINCT manager_id FROM org_edges WHERE ${window}`,
       employeeId, at, at,
     )
-    .toArray()
-    .map((row) => row.manager_id);
+    : sql.exec<{ manager_id: number }>(
+      `SELECT DISTINCT manager_id FROM org_edges WHERE ${window} AND kind = ?`,
+      employeeId, at, at, kind,
+    );
+  return rows.toArray().map((row) => row.manager_id);
 }
 
 /**
