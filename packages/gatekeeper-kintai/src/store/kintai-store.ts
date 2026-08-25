@@ -6,6 +6,10 @@ import {
   type NewEmployee,
 } from "./employees.js";
 import { hasAuthorityOver, managersAt, setDelegate, setReportingLine } from "./org.js";
+import {
+  allPunches, correctPunch, currentPunches, recordPunch, workedMinutes,
+  type NewPunch, type PunchRow,
+} from "./punches.js";
 import { createSite, matchSite, type NewSite } from "./sites.js";
 import type { EmployeeId } from "../types.js";
 
@@ -82,5 +86,27 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
 
   async matchSite(latitude: number, longitude: number, at: number): Promise<number | null> {
     return matchSite(this.sql, latitude, longitude, at);
+  }
+
+  async recordPunch(input: NewPunch): Promise<number> {
+    return recordPunch(this.sql, input);
+  }
+
+  async correctPunch(
+    supersedesId: number, input: NewPunch, amendedBy: EmployeeId, reason: string,
+  ): Promise<number> {
+    return correctPunch(this.sql, supersedesId, input, amendedBy, reason);
+  }
+
+  async currentPunches(employeeId: EmployeeId, workDate: string): Promise<PunchRow[]> {
+    return currentPunches(this.sql, employeeId, workDate);
+  }
+
+  async allPunches(employeeId: EmployeeId, workDate: string): Promise<PunchRow[]> {
+    return allPunches(this.sql, employeeId, workDate);
+  }
+
+  async workedMinutes(employeeId: EmployeeId, workDate: string): Promise<number> {
+    return workedMinutes(this.sql, employeeId, workDate);
   }
 }
