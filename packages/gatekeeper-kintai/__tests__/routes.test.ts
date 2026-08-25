@@ -11,6 +11,9 @@ const SITE: RouteConfig = {
 const HEAVY: RouteConfig = {
   id: 3, name: "heavy", department: "CONSTRUCTION", employmentType: null, minMinutes: 2700,
 };
+const FULL_TIME: RouteConfig = {
+  id: 4, name: "full-time", department: null, employmentType: "FULL_TIME", minMinutes: 0,
+};
 
 describe("selectRoute", () => {
   it("prefers a department match over the catch-all", () => {
@@ -46,6 +49,20 @@ describe("selectRoute", () => {
       department: "SALES", employmentType: null, minutes: 60,
     })).toBeNull();
   });
+
+  it("prefers an employment-type match over the catch-all", () => {
+    const picked = selectRoute([GENERIC, FULL_TIME], {
+      department: null, employmentType: "FULL_TIME", minutes: 60,
+    });
+    expect(picked?.id).toBe(FULL_TIME.id);
+  });
+
+  it("prefers a department match over an employment-type match — department is strictly dominant", () => {
+    const picked = selectRoute([FULL_TIME, SITE], {
+      department: "CONSTRUCTION", employmentType: "FULL_TIME", minutes: 60,
+    });
+    expect(picked?.id).toBe(SITE.id);
+  });
 });
 
 describe("resolveRoute", () => {
@@ -72,6 +89,31 @@ describe("resolveRoute", () => {
     expect(snapshot.routeId).toBe(routeId);
     expect(snapshot.steps.map((s) => s.stepIndex)).toEqual([0, 1]);
     expect(snapshot.steps[1].rule).toBe("all_of");
+  });
+
+  it("preserves a pinned employee approver alongside a manager step through the snapshot", async () => {
+    const director = await store.createEmployee({
+      employeeNumber: "D1", displayName: "Director", joinedOn: "2026-04-01",
+    });
+
+    const routeId = await store.createRoute({
+      name: "director-signoff", department: "CONSTRUCTION", minMinutes: 0,
+      steps: [
+        { rule: "any_of", approverKind: "manager", approverEmployeeId: null },
+        { rule: "any_of", approverKind: "employee", approverEmployeeId: director },
+      ],
+    });
+
+    const snapshot = await store.resolveRoute({
+      department: "CONSTRUCTION", employmentType: null, minutes: 120,
+    });
+
+    expect(snapshot.routeId).toBe(routeId);
+    expect(snapshot.steps).toHaveLength(2);
+    expect(snapshot.steps[0].approverKind).toBe("manager");
+    expect(snapshot.steps[0].approverEmployeeId).toBeNull();
+    expect(snapshot.steps[1].approverKind).toBe("employee");
+    expect(snapshot.steps[1].approverEmployeeId).toBe(director);
   });
 
   it("throws when no route matches", async () => {

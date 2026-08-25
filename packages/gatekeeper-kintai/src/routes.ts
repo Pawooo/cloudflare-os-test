@@ -43,8 +43,34 @@ export class NoRouteError extends Error {
 }
 
 /**
- * Most specific match wins: a route scoped to the employee's department or employment type beats
- * a catch-all, and among those, the highest minute threshold the request actually clears.
+ * Most specific match wins, where specificity is a strict priority order, not a peer comparison:
+ *   1. a route scoped to the employee's `department` outranks one that is not,
+ *   2. among routes tied on `department`, one also scoped to `employmentType` outranks one that
+ *      isn't,
+ *   3. a route scoped to neither (the catch-all) always loses to both of the above.
+ * `department` is therefore strictly dominant over `employmentType` — a route scoped only by
+ * `employmentType` (specificity 1) never outranks one scoped only by `department` (specificity 2),
+ * even though both are "one axis more specific than the catch-all." This is a deliberate product
+ * choice (encoded by the 2-vs-1 weights below), not an incidental tie-break.
+ *
+ * Only among routes tied on specificity does the highest minute threshold the request actually
+ * clears win. This means specificity is decided FIRST and totally overrides `minMinutes`: a more
+ * specific route with a low (or zero) threshold always beats a less specific route with a high
+ * threshold, even when the request clears that higher threshold. Concretely, if department
+ * "CONSTRUCTION" has both a `{department: "CONSTRUCTION", employmentType: "FULL_TIME",
+ * minMinutes: 0}` route and a generic `{department: "CONSTRUCTION", minMinutes: 2700}` escalation
+ * route intended to route heavy overtime to a higher tier, the first route's higher specificity
+ * (2 dept + 1 type = 3) beats the second's lower specificity (2 dept + 0 type = 2) for every
+ * full-time construction request, regardless of `minutes` — the 2700-minute escalation tier never
+ * fires for that department's full-time staff, silently and with no error. Threshold-based
+ * escalation tiers only compete against each other within the SAME specificity level; every
+ * department (or department+employment-type combination) that needs its own escalation ladder
+ * must define its own threshold tiers at that same specificity level rather than relying on a
+ * less-specific tier to catch the overflow.
+ *
+ * Ties on both specificity AND `minMinutes` are broken by `id ASC` — see `resolveRoute`, which
+ * feeds candidates to this function in that order, and this function's stable left-to-right
+ * reduce, which keeps the first (i.e. lowest-id, earliest-created) candidate on an exact tie.
  */
 export function selectRoute(
   candidates: RouteConfig[],
@@ -96,7 +122,13 @@ export function resolveRoute(sql: SqlStorage, criteria: RouteCriteria): RouteSna
     .exec<{
       id: number; name: string; department: string | null;
       employment_type: string | null; min_minutes: number;
-    }>(`SELECT * FROM approval_routes`)
+    }>(
+      // ORDER BY id ASC is load-bearing, not cosmetic: it makes selectRoute's tie-break policy
+      // (earliest-created route wins an exact specificity+minMinutes tie) a documented outcome
+      // rather than an accident of SQLite's unordered scan order. The chosen route is snapshotted
+      // onto a submission and cited in audits, so "arbitrary but currently stable" is not enough.
+      `SELECT * FROM approval_routes ORDER BY id ASC`,
+    )
     .toArray()
     .map((row): RouteConfig => ({
       id: row.id,
