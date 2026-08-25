@@ -5,6 +5,7 @@ import {
   createEmployee, grantExemption, isExempt, linkAccount, resolveAccount,
   type NewEmployee,
 } from "./employees.js";
+import { hasAuthorityOver, managersAt, setDelegate, setReportingLine } from "./org.js";
 import type { EmployeeId } from "../types.js";
 
 @validateRpc()
@@ -50,5 +51,27 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
 
   async isExempt(employeeId: EmployeeId, at: number): Promise<boolean> {
     return isExempt(this.sql, employeeId, at);
+  }
+
+  async setReportingLine(
+    employeeId: EmployeeId, managerId: EmployeeId, from: number, to?: number,
+  ): Promise<void> {
+    setReportingLine(this.sql, employeeId, managerId, from, to);
+  }
+
+  async setDelegate(
+    employeeId: EmployeeId, delegateId: EmployeeId, from: number, to: number,
+  ): Promise<void> {
+    setDelegate(this.sql, employeeId, delegateId, from, to);
+  }
+
+  async managersAt(employeeId: EmployeeId, at: number): Promise<EmployeeId[]> {
+    return managersAt(this.sql, employeeId, at);
+  }
+
+  async hasAuthorityOver(
+    actorId: EmployeeId, employeeId: EmployeeId, at: number,
+  ): Promise<number | null> {
+    return hasAuthorityOver(this.sql, actorId, employeeId, at);
   }
 }
