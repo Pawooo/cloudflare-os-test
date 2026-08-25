@@ -104,9 +104,8 @@ export class SubmissionNotFoundError extends Error {
 
 export class InvalidTransitionError extends Error {
   readonly code = "KINTAI_INVALID_TRANSITION";
-  constructor(from: SubmissionState, detail?: string) {
-    super(detail
-      ?? `KINTAI_INVALID_TRANSITION: a submission in state '${from}' cannot be acted on.`);
+  constructor(from: SubmissionState) {
+    super(`KINTAI_INVALID_TRANSITION: a submission in state '${from}' cannot be acted on.`);
   }
 }
 
@@ -141,8 +140,18 @@ export function approvalEvents(sql: SqlStorage, submissionId: number): ApprovalE
  * at submit time, while there is still no state to clean up, rather than at the first approval
  * attempt — and fail closed, because "no steps" is a misconfiguration, not a licence to skip
  * approval.
+ *
+ * Three ways a snapshot can be unsatisfiable, all rejected here:
+ *
+ *  - no steps at all;
+ *  - an `employee` step naming nobody;
+ *  - an `employee` step pinned to the submitter themself. `authorize` refuses everyone but the
+ *    pinned approver (`NotAuthorizedError`) and `actOnSubmission` refuses the pinned approver
+ *    because they are the submitter (`SelfApprovalError`), so the submission appears in nobody's
+ *    queue and can never advance. This is not exotic configuration: a 本社 escalation step pinned
+ *    to a named 部長 strands that 部長's own overtime the moment they file any.
  */
-function assertSatisfiable(snapshot: RouteSnapshot): void {
+function assertSatisfiable(snapshot: RouteSnapshot, employeeId: EmployeeId): void {
   if (snapshot.steps.length === 0) {
     throw new NoRouteError(
       `KINTAI_NO_ROUTE: approval route ${snapshot.routeId} has no approval steps, so nothing ` +
@@ -156,6 +165,16 @@ function assertSatisfiable(snapshot: RouteSnapshot): void {
     throw new NoRouteError(
       `KINTAI_NO_ROUTE: step ${unpinned.stepIndex} of approval route ${snapshot.routeId} names no ` +
       `approver, so nothing could ever approve this request. Ask an administrator to fix it.`,
+    );
+  }
+  const selfPinned = snapshot.steps.find(
+    (step) => step.approverKind === "employee" && step.approverEmployeeId === employeeId,
+  );
+  if (selfPinned) {
+    throw new NoRouteError(
+      `KINTAI_NO_ROUTE: step ${selfPinned.stepIndex} of approval route ${snapshot.routeId} names ` +
+      `this employee as its approver, and nobody may approve their own submission, so nothing ` +
+      `could ever approve this request. Ask an administrator to fix it.`,
     );
   }
 }
@@ -196,7 +215,7 @@ export function submitOvertime(sql: SqlStorage, input: NewSubmission): number {
     employmentType: input.employmentType,
     minutes: input.minutes,
   });
-  assertSatisfiable(snapshot);
+  assertSatisfiable(snapshot, input.employeeId);
 
   const row = sql
     .exec<{ id: number }>(
@@ -234,13 +253,38 @@ function lastReturnEventId(sql: SqlStorage, submissionId: number): number {
 }
 
 /**
+ * The employee's live reporting line, with any self-edge dropped.
+ *
+ * Reporting edges only: a delegate covers an absent manager, so counting one would make a stand-in
+ * an extra required signature. A manager edge naming the employee themself is a data error, and
+ * self-approval is structurally forbidden, so it must never read as a manager who could sign.
+ *
+ * This exists as one function because THREE decisions have to agree about it — the `all_of`
+ * requirement, who may act, and whether the designated-approver fallback applies at all. When they
+ * were written out separately they drifted, and the drift was invisible under `all_of` routes.
+ */
+function reportingManagers(sql: SqlStorage, employeeId: EmployeeId, now: number): EmployeeId[] {
+  return managersAt(sql, employeeId, now, "report").filter((id) => id !== employeeId);
+}
+
+/**
+ * The employee's `designated_approver_id`, or null if there is none or it names the employee.
+ *
+ * This is the root-of-organisation escape hatch and nothing more; `rootFallbackApplies` decides
+ * *whether* it is in play. Self-reference collapses to null for the same reason a self-edge does.
+ */
+function designatedFallback(sql: SqlStorage, employeeId: EmployeeId): EmployeeId | null {
+  const designated = designatedApproverOf(sql, employeeId);
+  return designated === null || designated === employeeId ? null : designated;
+}
+
+/**
  * The approvals an `all_of` step must collect. Deliberately *not* the same set as "who may act":
  *
- *  - manager steps require the reporting line only. A delegate covers an absent manager, so
- *    counting them would make a stand-in an extra required signature.
- *  - the employee themself is filtered out throughout. A self-edge, or an employee recorded as
- *    their own designated approver, is a data error — but if one exists it must not deadlock the
- *    submission behind an approval that self-approval structurally forbids.
+ *  - manager steps require the reporting line only (see `reportingManagers`).
+ *  - the employee themself is filtered out of every manager-kind set, and out of the designated-
+ *    approver fallback. A step *pinned* to the employee is not filtered here — it is refused
+ *    outright at submit time by `assertSatisfiable`, because such a step could never complete.
  *
  * With no reporting line at all the requirement falls back to the designated approver: the same
  * person `authorize` lets act for a root employee, so the step can actually complete rather than
@@ -261,12 +305,11 @@ function requiredApprovers(
     return step.approverEmployeeId === null ? [] : [step.approverEmployeeId];
   }
 
-  const managers = managersAt(sql, submission.employee_id, now, "report")
-    .filter((id) => id !== submission.employee_id);
+  const managers = reportingManagers(sql, submission.employee_id, now);
   if (managers.length > 0) return managers;
 
-  const designated = designatedApproverOf(sql, submission.employee_id);
-  return designated === null || designated === submission.employee_id ? [] : [designated];
+  const designated = designatedFallback(sql, submission.employee_id);
+  return designated === null ? [] : [designated];
 }
 
 /**
@@ -289,11 +332,27 @@ function authorize(
   const edge = hasAuthorityOver(sql, actorId, submission.employee_id, now);
   if (edge !== null) return edge;
 
-  // No edge — but an employee at the root of the reporting tree has no manager edge by
-  // definition, and their designated approver is the only person who can ever act. Without this
-  // their submissions would strand in `pending` for good. There is no edge to cite, so the audit
-  // records a null `authorizing_edge`: authority came from the employee record, not the org graph.
-  if (designatedApproverOf(sql, submission.employee_id) === actorId) return null;
+  // No edge — but an employee at the ROOT of the reporting tree has no manager edge by definition,
+  // and their designated approver is the only person who can ever act. Without this their
+  // submissions would strand in `pending` for good.
+  //
+  // Gated on the employee having no live reporting line, which is what makes the comment above
+  // true. `designated_approver_id` is the root-of-organisation escape hatch (spec, "Root-of-
+  // organisation rule") and nothing else: an employee who has BOTH a live manager and a designated
+  // approver must still collect a manager's signature. Ungated, the designated approver could
+  // single-handedly satisfy an `any_of` manager step — and would appear in their queue — which is
+  // the authority `requiredApprovers` and `hasReachableApprover` both already refuse to grant them.
+  // The same filters as `requiredApprovers`, through the same two functions, so the two cannot
+  // drift apart again.
+  //
+  // There is no edge to cite, so the audit records a null `authorizing_edge`: authority came from
+  // the employee record, not the org graph.
+  if (
+    reportingManagers(sql, submission.employee_id, now).length === 0 &&
+    designatedFallback(sql, submission.employee_id) === actorId
+  ) {
+    return null;
+  }
 
   throw new NotAuthorizedError();
 }

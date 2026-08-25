@@ -14,7 +14,7 @@ export { KintaiStore } from "../src/store/kintai-store.js";
 
 /** What the test-side queue recorded, read back through `KintaiFacetHost.readQueue()`. */
 export type QueueLog = {
-  observations: { title: string; description: string }[];
+  observations: { title: string; description: string; prohibitAllSharing: boolean }[];
   actions: { action: number; title: string }[];
 };
 
@@ -32,7 +32,11 @@ class TestApprovalQueue extends RpcTarget {
 
   async authorizeObservation(description: ObservationDescription): Promise<void> {
     this.state.log.observations.push({
-      title: description.title, description: description.description,
+      title: description.title,
+      description: description.description,
+      // Recorded as a definite boolean: an observation that leaves the flag off is asserting it is
+      // shareable, and a test must be able to tell that from "the harness dropped the field".
+      prohibitAllSharing: description.prohibitAllSharing === true,
     });
     if (this.state.denyObservations) throw new Error("OBSERVATION_DENIED: test queue refused.");
   }

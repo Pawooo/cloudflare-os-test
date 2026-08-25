@@ -45,6 +45,21 @@ export type PunchRow = {
 /** A repeat of the same kind inside this window is treated as a double-tap, not a new punch. */
 export const DUPLICATE_WINDOW_MS = 60_000;
 
+/**
+ * Every column a `PunchRow` carries, joined back together from the two tables that hold them.
+ *
+ * The location columns live in `punch_locations` (see schema.ts: coordinates are purgeable on a
+ * shorter clock than the punch, and `punches` is append-only) but reads present one flat row, so
+ * a caller never has to know where the split runs. LEFT JOIN, because most punches have no
+ * location at all; the columns then read as NULL exactly as they did when they sat on the punch.
+ */
+const PUNCH_COLUMNS = `
+  p.id, p.employee_id, p.work_date, p.kind, p.occurred_at, p.recorded_at, p.source,
+  l.latitude, l.longitude, l.accuracy_m, l.location_source, l.matched_site_id,
+  p.supersedes_id, p.amended_by, p.amend_reason`;
+
+const PUNCH_SOURCE = `punches p LEFT JOIN punch_locations l ON l.punch_id = p.id`;
+
 function insert(
   sql: SqlStorage,
   input: NewPunch,
@@ -53,28 +68,40 @@ function insert(
   amendedBy: EmployeeId | null,
   amendReason: string | null,
 ): number {
-  // Both the raw coordinates and the evaluated match are stored: site boundaries are redrawn over
-  // time, so a dispute needs the evaluation as it stood AND the underlying data.
-  const loc = input.location;
-  const hasFix = loc?.latitude !== undefined && loc?.longitude !== undefined;
-  const siteId = hasFix ? matchSite(sql, loc!.latitude!, loc!.longitude!, input.now) : null;
-
   const row = sql
     .exec<{ id: number }>(
       `INSERT INTO punches
          (employee_id, work_date, kind, occurred_at, recorded_at, source,
-          latitude, longitude, accuracy_m, location_source, matched_site_id,
           supersedes_id, amended_by, amend_reason)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
       input.employeeId, input.workDate, input.kind, input.now, recordedAt, input.source,
-      hasFix ? loc!.latitude! : null,
-      hasFix ? loc!.longitude! : null,
-      loc?.accuracyM ?? null,
-      loc?.source ?? null,
-      siteId,
       supersedesId, amendedBy, amendReason,
     )
     .one();
+
+  // A location row is written whenever the caller offered a location at all — a denied or
+  // unavailable fix carries no coordinates but is still recorded, because "the punch was made
+  // without a fix" is information and is not the same as never having been asked.
+  //
+  // Both the raw coordinates and the evaluated match are stored: site boundaries are redrawn over
+  // time, so a dispute needs the evaluation as it stood AND the underlying data.
+  const loc = input.location;
+  if (loc) {
+    const hasFix = loc.latitude !== undefined && loc.longitude !== undefined;
+    const siteId = hasFix ? matchSite(sql, loc.latitude!, loc.longitude!, input.now) : null;
+    sql.exec(
+      `INSERT INTO punch_locations
+         (punch_id, latitude, longitude, accuracy_m, location_source, matched_site_id)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      row.id,
+      hasFix ? loc.latitude! : null,
+      hasFix ? loc.longitude! : null,
+      loc.accuracyM ?? null,
+      loc.source ?? null,
+      siteId,
+    );
+  }
+
   return row.id;
 }
 
@@ -125,7 +152,7 @@ export function correctPunch(
   recordedAt: number,
 ): number {
   const original = sql
-    .exec<PunchRow>(`SELECT * FROM punches WHERE id = ?`, supersedesId)
+    .exec<PunchRow>(`SELECT ${PUNCH_COLUMNS} FROM ${PUNCH_SOURCE} WHERE p.id = ?`, supersedesId)
     .toArray()[0];
   if (!original) {
     throw new Error(`correctPunch: no punch with id ${supersedesId}`);
@@ -149,7 +176,7 @@ export function currentPunches(
 ): PunchRow[] {
   return sql
     .exec<PunchRow>(
-      `SELECT * FROM punches p
+      `SELECT ${PUNCH_COLUMNS} FROM ${PUNCH_SOURCE}
        WHERE p.employee_id = ? AND p.work_date = ?
          AND NOT EXISTS (SELECT 1 FROM punches s WHERE s.supersedes_id = p.id)
        ORDER BY p.occurred_at`,
@@ -164,7 +191,8 @@ export function allPunches(
 ): PunchRow[] {
   return sql
     .exec<PunchRow>(
-      `SELECT * FROM punches WHERE employee_id = ? AND work_date = ? ORDER BY id`,
+      `SELECT ${PUNCH_COLUMNS} FROM ${PUNCH_SOURCE}
+       WHERE p.employee_id = ? AND p.work_date = ? ORDER BY p.id`,
       employeeId, workDate,
     )
     .toArray();

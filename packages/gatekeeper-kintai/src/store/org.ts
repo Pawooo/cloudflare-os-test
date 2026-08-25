@@ -84,7 +84,11 @@ export function hasAuthorityOver(
       `SELECT id FROM org_edges
        WHERE employee_id = ? AND manager_id = ?
          AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)
-       ORDER BY valid_from DESC LIMIT 1`,
+       -- 'id DESC' is not decoration: two edges can share a valid_from (a same-instant transfer,
+       -- or a bulk org import), and without a secondary key SQLite may return either one. The id
+       -- that comes back is written into approval_events.authorizing_edge, so an arbitrary
+       -- tie-break would put an arbitrary edge in the audit trail. Newest row wins.
+       ORDER BY valid_from DESC, id DESC LIMIT 1`,
       employeeId, actorId, at, at,
     )
     .toArray()[0];

@@ -96,7 +96,8 @@ describe("identity resolution", () => {
   it("refuses every operation other than whoAmI for an unlinked account", async () => {
     const facet = facetFor("acct-also-never-linked");
 
-    // Thunk form throughout: the direct form races the DO's error reporting.
+    // Thunk form throughout: handing `.rejects` an already-created RPC promise leaves it
+    // unhandled for a turn, which Vitest reports as an `Unhandled Rejection` block.
     await expect(() => facet.punch("in")).rejects.toThrow(/KINTAI_ACCOUNT_NOT_LINKED/);
     await expect(() => facet.getDay("2026-07-03")).rejects.toThrow(/KINTAI_ACCOUNT_NOT_LINKED/);
     await expect(() => facet.setAllocations("2026-07-03", []))
@@ -307,7 +308,10 @@ describe("approvals through the facet", () => {
       .rejects.toThrow(/KINTAI_SELF_APPROVAL/);
 
     const bossFacet = facetFor(bossAccount);
-    expect(await bossFacet.actOnSubmission(submissionId, "approve")).toBe("approved");
+    // `actOnSubmission` returns nothing (see its comment: the signature is already shaped for the
+    // queued form), so the outcome is read back from the store rather than from the return value.
+    expect(await bossFacet.actOnSubmission(submissionId, "approve")).toBeUndefined();
+    expect((await store.getSubmission(submissionId)).state).toBe("approved");
   });
 });
 
@@ -426,6 +430,79 @@ describe("input validation at the boundary", () => {
   });
 });
 
+// The store is ONE Durable Object holding every employee's records, and the code on the other side
+// of this facet is a Gadget its owner can rewrite. Unbounded input from there is a way for one
+// employee to consume storage everybody else depends on, so the size limits sit here, at the same
+// boundary as `assertWorkDate` and `assertMinutes`.
+describe("bounds on what a caller can write into the shared store", () => {
+  it("refuses more allocation entries than a day could plausibly have", async () => {
+    const { employeeId, accountId } = await linkedEmployee("cap-entries");
+    const facet = facetFor(accountId);
+    const workDate = "2026-07-09";
+    const entry = (n: number) => ({ projectCode: `P${n}`, minutes: 1 });
+
+    // 200 is accepted; 201 is not. The boundary is asserted from both sides so a later change to
+    // the limit cannot quietly pass by loosening it.
+    const atLimit = Array.from({ length: 200 }, (_, n) => entry(n));
+    expect((await facet.setAllocations(workDate, atLimit)).allocatedMinutes).toBe(200);
+
+    await expect(() => facet.setAllocations(workDate, [...atLimit, entry(200)]))
+      .rejects.toThrow(/KINTAI_INVALID_INPUT/);
+    // Rejected before anything was written, so the accepted version is still the current one.
+    expect(await store.currentAllocations(employeeId, workDate)).toHaveLength(200);
+  });
+
+  it("refuses over-long strings on every path that writes one", async () => {
+    const { employeeId, accountId } = await linkedEmployee("cap-strings");
+    const boss = await store.createEmployee({
+      employeeNumber: `cap-boss-${seq}`, displayName: "Boss", joinedOn: "2026-04-01",
+    });
+    await store.setReportingLine(employeeId, boss, 0);
+    await managerRoute();
+    const facet = facetFor(accountId);
+    const over = (n: number) => "x".repeat(n + 1);
+
+    await expect(() => facet.setAllocations("2026-07-10", [
+      { projectCode: over(64), minutes: 60 },
+    ])).rejects.toThrow(/KINTAI_INVALID_INPUT/);
+    await expect(() => facet.setAllocations("2026-07-10", [
+      { projectCode: "P1", minutes: 60, note: over(500) },
+    ])).rejects.toThrow(/KINTAI_INVALID_INPUT/);
+    await expect(() => facet.submitOvertime("2026-07-10", 60, over(2_000)))
+      .rejects.toThrow(/KINTAI_INVALID_INPUT/);
+
+    // The comment an approver attaches lands in `approval_events`, and is bounded too.
+    const submissionId = await facet.submitOvertime("2026-07-10", 60, "fine");
+    await expect(() => facet.actOnSubmission(submissionId, "approve", over(2_000)))
+      .rejects.toThrow(/KINTAI_INVALID_INPUT/);
+
+    // Nothing from any of the refused calls reached the store.
+    expect(await store.currentAllocations(employeeId, "2026-07-10")).toEqual([]);
+    expect((await store.listSubmissionsFor(employeeId)).map((row) => row.reason))
+      .toEqual(["fine"]);
+    expect(await store.approvalEvents(submissionId)).toEqual([]);
+  });
+
+  it("accepts input right at the limit, so the bounds are not merely restrictive", async () => {
+    const { employeeId, accountId } = await linkedEmployee("cap-exact");
+    const boss = await store.createEmployee({
+      employeeNumber: `exact-boss-${seq}`, displayName: "Boss", joinedOn: "2026-04-01",
+    });
+    await store.setReportingLine(employeeId, boss, 0);
+    await managerRoute();
+    const facet = facetFor(accountId);
+    const at = (n: number) => "x".repeat(n);
+
+    await facet.setAllocations("2026-07-11", [
+      { projectCode: at(64), minutes: 60, note: at(500) },
+    ]);
+    expect(await store.currentAllocations(employeeId, "2026-07-11")).toHaveLength(1);
+
+    const submissionId = await facet.submitOvertime("2026-07-11", 60, at(2_000));
+    expect((await store.getSubmission(submissionId)).reason).toHaveLength(2_000);
+  });
+});
+
 // The oracle the Task 12 review found: `InvalidTransitionError` names the state it refused, so
 // checking state before authority let any Gadget walk the id space and read back every
 // submission's state. `withdrawSubmission` and `resubmit` already ordered ownership before state
@@ -474,7 +551,8 @@ describe("actOnSubmission discloses nothing before authority is established", ()
     await expect(() => bossFacet.actOnSubmission(rejected, "approve"))
       .rejects.toThrow(/KINTAI_INVALID_TRANSITION/);
     // ...and the pending one still works for them.
-    expect(await bossFacet.actOnSubmission(pending, "approve")).toBe("approved");
+    await bossFacet.actOnSubmission(pending, "approve");
+    expect((await store.getSubmission(pending)).state).toBe("approved");
   });
 });
 

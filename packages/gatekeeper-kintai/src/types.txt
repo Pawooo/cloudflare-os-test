@@ -18,7 +18,9 @@
 // `KINTAI_PERIOD_LOCKED: 2026-07 is closed`. The codes are:
 //
 // - `KINTAI_ACCOUNT_NOT_LINKED` — this account has no employee record yet.
-// - `KINTAI_INVALID_INPUT` — a malformed date or a negative/fractional minute count.
+// - `KINTAI_INVALID_INPUT` — a malformed date, a negative/fractional minute count, or input over
+//   a size limit (at most 200 allocation entries per day; project code 64 characters, note 500,
+//   overtime reason 2000, approval comment 2000).
 // - `KINTAI_PERIOD_LOCKED` — the month is closed for payroll; the record can no longer be edited.
 // - `KINTAI_NOT_AUTHORIZED` — the caller is not an approver for this submission at its current
 //   step. Also returned for a submission belonging to someone else, so it reveals nothing.
@@ -47,6 +49,11 @@ export type PunchLocation = {
  * One recorded punch, as stored. `occurred_at` and `recorded_at` differ only for administrative
  * corrections; a punch made through this session has them equal. A superseded punch is never
  * deleted — `supersedes_id` chains a correction back to what it replaced.
+ *
+ * The location fields (`latitude`, `longitude`, `accuracy_m`, `location_source`,
+ * `matched_site_id`) are personal data kept on a SHORTER retention clock than the punch itself:
+ * they can be purged while the attendance record stays. Read them as null for any punch made
+ * without location, and do not rely on them still being there for an old punch.
  */
 export type PunchRow = {
   id: number;
@@ -105,10 +112,18 @@ export type Reconciliation = {
  *
  * - `unpaired_in` — clocked in and never out (the usual cause of a short day).
  * - `unpaired_break` — a break was started and never ended.
- * - `orphan_out` — clocked out with no matching clock-in. A shift crossing JST midnight produces
- *   `unpaired_in` on the first date and `orphan_out` on the second; that is expected, not an error.
+ * - `orphan_out` — clocked out with no matching clock-in.
  * - `duplicate_in` — clocked in twice without clocking out.
  * - `negative_gross` — punches are out of order; the record needs an administrative correction.
+ *
+ * NIGHT SHIFTS: a shift crossing JST midnight is split across two work dates, producing
+ * `unpaired_in` on the first and `orphan_out` on the second. Do NOT present either day's
+ * `workedMinutes` as that day's hours — the first date currently credits ZERO for the hours worked
+ * before midnight, and the second credits nothing for the hours after it, so a night worker's day
+ * reads as no work at all. How overnight hours are attributed to a work date is not yet defined
+ * (it is settled with 深夜割増 calculation in a later sub-project). Until it is, report the
+ * anomalies and the raw punches for such a day rather than a minutes total, and say the total is
+ * unavailable rather than zero.
  *
  * `locked` means the month is closed for payroll: reads still work, writes throw
  * `KINTAI_PERIOD_LOCKED`.
@@ -222,12 +237,21 @@ export interface KintaiSession {
    *
    * Derived from the org chart at call time: it lists exactly those submissions the caller could
    * actually act on right now, and is empty for an employee who approves nothing.
+   *
+   * SHARING: this is the only method that returns other people's records, so it is treated as
+   * strictly private. Calling it makes this Gadget unshareable, and the call FAILS outright if the
+   * Gadget has already been shared with anyone. If a Gadget needs to be shareable, do not call
+   * this — everything else here is the caller's own data and stays shareable.
    */
   listPendingApprovals(): Promise<SubmissionRow[]>;
 
   /**
-   * Approve, reject, or return one submission from `listPendingApprovals()`, and get the state it
-   * moved to. `approve` on the last step approves the submission; earlier steps advance it.
+   * Approve, reject, or return one submission from `listPendingApprovals()`.
+   *
+   * Returns nothing: read the outcome back from `listPendingApprovals()` (an approved or rejected
+   * submission leaves your queue) or, for your own submissions, `listMySubmissions()`. `approve`
+   * on the last step approves the submission; earlier steps advance it to the next approver, and
+   * `return` sends it back to the employee as a `draft`.
    *
    * Nobody may act on their own submission, and naming a submission the caller is not an approver
    * for throws `KINTAI_NOT_AUTHORIZED` regardless of whether it exists in a different state.
@@ -236,5 +260,5 @@ export interface KintaiSession {
     submissionId: number,
     action: ApprovalAction,
     comment?: string,
-  ): Promise<SubmissionState>;
+  ): Promise<void>;
 }

@@ -109,7 +109,11 @@ export function resolveAccount(
     .exec<{ employee_id: number }>(
       `SELECT employee_id FROM account_links
        WHERE account_id = ? AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)
-       ORDER BY valid_from DESC LIMIT 1`,
+       -- 'id DESC' breaks a valid_from tie deterministically: two links opened at the same instant
+       -- would otherwise resolve to an arbitrary employee, and this is the identity boundary.
+       -- (The partial unique index allows at most one OPEN link per account, but closed links can
+       -- still share a valid_from.) Newest row wins.
+       ORDER BY valid_from DESC, id DESC LIMIT 1`,
       accountId, at, at,
     )
     .toArray()[0];

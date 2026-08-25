@@ -263,6 +263,29 @@ describe("observation authorization", () => {
     expect(actions).toEqual([]);
   });
 
+  it("marks the approval queue as unshareable, and marks nothing else", async () => {
+    // `listPendingApprovals` is the only read that returns OTHER employees' payroll records, and
+    // `addObserver` accepts every collaborator, so this flag is the only thing standing between a
+    // shared Gadget and a team's overtime data. The accepted cost is that a Gadget calling it
+    // becomes unshareable — which is why the other three reads must NOT carry the flag.
+    const { accountId } = await linkedEmployee("sharing");
+    const session = sessionFor(accountId);
+
+    await host.resetQueue();
+    await session.whoAmI();
+    await session.getDay("2026-05-14");
+    await session.listMySubmissions();
+    await session.listPendingApprovals();
+
+    const { observations } = await host.readQueue();
+    expect(observations.map((o) => [o.title, o.prohibitAllSharing])).toEqual([
+      ["Kintai identity", false],
+      ["Kintai day record for 2026-05-14", false],
+      ["Kintai submissions", false],
+      ["Kintai approval queue", true],
+    ]);
+  });
+
   it("returns no data when the queue refuses the observation", async () => {
     const { employeeId, accountId } = await linkedEmployee("refused");
     await store.recordPunch({

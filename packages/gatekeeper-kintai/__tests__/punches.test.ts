@@ -105,9 +105,11 @@ describe("corrections", () => {
       employeeNumber: "E901", displayName: "Suzuki", joinedOn: "2026-04-01",
     });
 
-    // Wrapped in a thunk rather than passed as an already-created promise: passing the settled
-    // promise straight to `expect(...).rejects` races the RPC layer's own error reporting and can
-    // trip a spurious "unhandled rejection" even though this assertion does catch it.
+    // Wrapped in a thunk rather than passed as an already-created promise: `.rejects` on an
+    // already-created RPC promise leaves it unhandled for a turn, which Vitest reports as an
+    // `Unhandled Rejection` block. (It does not silence workerd's `uncaught exception; source =
+    // Uncaught (in promise)` log lines — those accompany every exception crossing an RPC boundary,
+    // whichever form the assertion takes.)
     await expect(() =>
       store.correctPunch(
         original,

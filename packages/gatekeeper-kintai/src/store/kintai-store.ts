@@ -54,6 +54,14 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
       .map((row) => row.name);
   }
 
+  /** Column names of one table, sorted. Test-only introspection. */
+  async tableColumns(table: string): Promise<string[]> {
+    return this.sql
+      .exec<{ name: string }>(`SELECT name FROM pragma_table_info(?) ORDER BY name`, table)
+      .toArray()
+      .map((row) => row.name);
+  }
+
   async createEmployee(input: NewEmployee): Promise<EmployeeId> {
     return createEmployee(this.sql, input);
   }

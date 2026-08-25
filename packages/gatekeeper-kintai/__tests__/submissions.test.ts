@@ -2,9 +2,15 @@ import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 
 // Rejection assertions are written as `expect(() => store.method(...))`, never as
-// `expect(store.method(...))`: handing an already-created RPC promise to `.rejects` races the
-// Durable Object's own error reporting and can emit a spurious unhandled rejection that flips the
-// process exit code even when the assertion itself passes (see Task 6).
+// `expect(store.method(...))`: handing `.rejects` an already-created RPC promise leaves that
+// promise unhandled for a turn, and Vitest reports it as an `Unhandled Rejection` block that can
+// fail the run even though the assertion itself passes.
+//
+// It does NOT suppress the `uncaught exception; source = Uncaught (in promise)` lines this suite
+// prints. Those come from workerd, which logs every exception that crosses an RPC boundary
+// regardless of how the test asserts on it — `gatekeeper-scheduler` prints them too. Kintai prints
+// more of them only because it throws more coded errors than any other package here. They are
+// expected output, not a defect to hunt.
 
 const APR = Date.parse("2026-04-01T00:00:00Z");
 const JUL = Date.parse("2026-07-03T00:00:00Z");
@@ -409,9 +415,64 @@ describe("designated approver", () => {
     })).toBe("approved");
   });
 
+  it("does not let the designated approver satisfy an any_of step for a managed employee", async () => {
+    // `designated_approver_id` is the root-of-organisation escape hatch and nothing more (spec).
+    // An employee who has BOTH a live manager and a designated approver must still collect a
+    // manager's signature — the designated approver has no authority over them at all.
+    //
+    // `any_of` is the shape that exposes this: under `all_of` the requirement is computed by
+    // `requiredApprovers`, which has always gated the fallback correctly, so an ungated
+    // `authorize` would let the designated approver record an approval that then failed to satisfy
+    // the requirement — visible only as a stray approval event. Under `any_of` one approval
+    // completes the step, so an ungated fallback approves the submission outright.
+    const both = await store.createEmployee({
+      employeeNumber: "R3", displayName: "Both", joinedOn: "2026-04-01",
+      designatedApproverId: director,
+    });
+    await store.setReportingLine(both, boss, APR);
+    await singleStepRoute();
+    const id = await submit(120, both);
+
+    // director is not `both`'s manager; director being boss's manager grants nothing here.
+    expect(await store.hasAuthorityOver(director, both, JUL + 1000)).toBeNull();
+    await expect(() => store.actOnSubmission({
+      submissionId: id, actorId: director, action: "approve", now: JUL + 1000,
+    })).rejects.toThrow(/KINTAI_NOT_AUTHORIZED/);
+    expect((await store.getSubmission(id)).state).toBe("pending");
+    expect((await store.approvalEvents(id))).toEqual([]);
+
+    // ...and it is not in their queue either: the queue filters through `authorize` itself, so the
+    // two answers cannot disagree.
+    expect((await store.pendingApprovalsFor(director, JUL + 1000)).map((row) => row.id))
+      .not.toContain(id);
+
+    // The actual manager still approves it, so nothing has been broken in the process.
+    expect(await store.actOnSubmission({
+      submissionId: id, actorId: boss, action: "approve", now: JUL + 2000,
+    })).toBe("approved");
+  });
+
+  it("still lets the designated approver act, and queue, for a root employee", async () => {
+    // The other half of the gate: with no reporting line the fallback is exactly what keeps a root
+    // employee's submission from stranding, so gating it must not have switched it off.
+    const chief = await rootEmployee();
+    await singleStepRoute();
+    const id = await submit(120, chief);
+
+    expect((await store.pendingApprovalsFor(director, JUL + 1000)).map((row) => row.id))
+      .toContain(id);
+  });
+
   it("ignores a reporting line that is not there, not one that is", async () => {
     // The fallback applies only when the reporting line is empty. A worker who has both a manager
     // and a designated approver must still collect the manager's signature.
+    //
+    // The designated approver is now refused outright rather than allowed to record an approval
+    // that fails to satisfy the requirement: `authorize` gates the fallback on the reporting line
+    // being empty, exactly as `requiredApprovers` always did. This is a strictly stronger form of
+    // the same invariant — under `all_of` the old behaviour still ended at "boss must sign", but
+    // it left a stray approval event on the record from somebody with no authority, and under
+    // `any_of` (see the test above) that same stray approval completed the submission.
     const both = await store.createEmployee({
       employeeNumber: "R2", displayName: "Both", joinedOn: "2026-04-01",
       designatedApproverId: director,
@@ -420,12 +481,49 @@ describe("designated approver", () => {
     await allOfManagerRoute();
     const id = await submit(120, both);
 
-    expect(await store.actOnSubmission({
+    await expect(() => store.actOnSubmission({
       submissionId: id, actorId: director, action: "approve", now: JUL + 1000,
-    })).toBe("pending");
+    })).rejects.toThrow(/KINTAI_NOT_AUTHORIZED/);
+    expect((await store.getSubmission(id)).state).toBe("pending");
+
     expect(await store.actOnSubmission({
       submissionId: id, actorId: boss, action: "approve", now: JUL + 2000,
     })).toBe("approved");
+  });
+});
+
+describe("routes nobody could satisfy are refused at submit", () => {
+  it("refuses a step pinned to the submitter themself", async () => {
+    // Created pending, this submission would be unapprovable by construction: `authorize` refuses
+    // everyone but the pinned approver, and the pinned approver is refused as a self-approver. It
+    // would sit in `pending` in NOBODY's queue. Plausible configuration, too — a 本社 escalation
+    // step pinned to a named 部長 strands that 部長's own overtime.
+    await store.createRoute({
+      name: "self-pinned", department: "CONSTRUCTION",
+      steps: [
+        { rule: "any_of", approverKind: "manager", approverEmployeeId: null },
+        { rule: "any_of", approverKind: "employee", approverEmployeeId: worker },
+      ],
+    });
+
+    await expect(() => submit()).rejects.toThrow(/KINTAI_NO_ROUTE/);
+    // Fails before anything is written, which is the point of checking at submit time.
+    expect(await store.listSubmissionsFor(worker)).toEqual([]);
+  });
+
+  it("refuses it for the submitter only, not for everyone the route covers", async () => {
+    // The same route is perfectly satisfiable for anyone who is not the pinned approver, so the
+    // rejection above must be about who is filing, not about the route's shape.
+    await store.createRoute({
+      name: "self-pinned", department: "CONSTRUCTION",
+      steps: [
+        { rule: "any_of", approverKind: "manager", approverEmployeeId: null },
+        { rule: "any_of", approverKind: "employee", approverEmployeeId: worker },
+      ],
+    });
+
+    const id = await submit(120, boss);
+    expect((await store.getSubmission(id)).state).toBe("pending");
   });
 });
 

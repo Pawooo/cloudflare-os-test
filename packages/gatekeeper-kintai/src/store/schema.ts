@@ -66,12 +66,6 @@ export function applySchema(sql: SqlStorage): void {
     occurred_at INTEGER NOT NULL,
     recorded_at INTEGER NOT NULL,
     source TEXT NOT NULL CHECK (source IN ('gadget', 'admin', 'import')),
-    latitude REAL,
-    longitude REAL,
-    accuracy_m REAL,
-    location_source TEXT CHECK (
-      location_source IS NULL OR location_source IN ('gps', 'denied', 'unavailable', 'manual')),
-    matched_site_id INTEGER REFERENCES sites(id),
     supersedes_id INTEGER REFERENCES punches(id),
     amended_by INTEGER REFERENCES employees(id),
     amend_reason TEXT
@@ -83,6 +77,31 @@ export function applySchema(sql: SqlStorage): void {
   // supersede the same original.
   sql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS punches_supersedes_unique
     ON punches(supersedes_id) WHERE supersedes_id IS NOT NULL`);
+
+  // Location lives in its OWN table, one row per punch at most, rather than as columns on the
+  // punch. Coordinates tied to an individual are personal data under 個人情報保護法 and the design
+  // gives them a shorter retention clock than the punch itself — but `punches` is append-only, so
+  // purging columns off a punch row would require UPDATE or DELETE against a table where both are
+  // forbidden. Separating them makes the purge sub-project 5 owns a DELETE against this table
+  // alone, leaving every attendance record untouched and unrewritten.
+  //
+  // Both the raw coordinates and the evaluated `matched_site_id` are kept together: site
+  // boundaries are redrawn over time, so a dispute needs the evaluation as it stood AND the
+  // underlying data — and a purge that removes the coordinates must remove the derived match with
+  // them, which one row makes automatic.
+  //
+  // A row exists whenever the caller supplied any location at all, including a refusal
+  // (`location_source = 'denied'`, no coordinates): recording that the punch was made without a
+  // fix is itself information, and it is distinct from a punch that never offered one.
+  sql.exec(`CREATE TABLE IF NOT EXISTS punch_locations (
+    punch_id INTEGER PRIMARY KEY REFERENCES punches(id),
+    latitude REAL,
+    longitude REAL,
+    accuracy_m REAL,
+    location_source TEXT CHECK (
+      location_source IS NULL OR location_source IN ('gps', 'denied', 'unavailable', 'manual')),
+    matched_site_id INTEGER REFERENCES sites(id)
+  ) STRICT`);
 
   sql.exec(`CREATE TABLE IF NOT EXISTS day_allocations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

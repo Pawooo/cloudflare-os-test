@@ -22,7 +22,7 @@ import type {
   SupportedResource,
   VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
-import type { ApprovalAction, EmployeeId, PunchKind, SubmissionState } from "./types.js";
+import type { ApprovalAction, EmployeeId, PunchKind } from "./types.js";
 import type { AllocationEntry, AllocationRow, Reconciliation } from "./store/allocations.js";
 import type { PunchLocation, PunchRow } from "./store/punches.js";
 import type { SubmissionRow } from "./store/submissions.js";
@@ -136,6 +136,47 @@ function assertWorkDate(label: string, value: string): void {
 function assertMinutes(label: string, value: number): void {
   if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
     throw new InvalidInputError(`${label} must be a whole number of minutes, and not negative.`);
+  }
+}
+
+/**
+ * Size limits on everything a caller can write into the store.
+ *
+ * The store is ONE Durable Object holding every employee's payroll record, and the code calling
+ * this facet is a Gadget the employee can rewrite at will. Nothing downstream bounds these: the
+ * schema's CHECK constraints cover value ranges, never lengths, so an unbounded string or array is
+ * a way for any one employee to consume storage every other employee depends on. A single call
+ * capped here is worth roughly 100 KB rather than however much the caller felt like sending.
+ *
+ * The numbers are chosen to sit far above any honest use and far below anything that hurts:
+ *
+ *  - 200 allocation entries — a day split across 200 distinct projects is already implausible.
+ *  - 64 characters of project code — an accounting code, not prose.
+ *  - 500 characters of note, per entry — a line of explanation for one project line.
+ *  - 2,000 characters of overtime reason — a paragraph or two, which is what an approver reads.
+ *  - 2,000 characters of approval comment — the same, from the other side.
+ *
+ * These are facet-level input validation, alongside `assertWorkDate`/`assertMinutes`, because this
+ * is the untrusted boundary. They are NOT a rate limit: nothing here stops a caller making the
+ * same bounded call a million times, which stays an open item for the store layer.
+ */
+const LIMITS = {
+  allocationEntries: 200,
+  projectCode: 64,
+  note: 500,
+  reason: 2_000,
+  comment: 2_000,
+} as const;
+
+/** A caller-supplied string that lands in the shared store: must be a string, and bounded. */
+function assertText(label: string, value: string, maxLength: number): void {
+  if (typeof value !== "string") {
+    throw new InvalidInputError(`${label} must be a string.`);
+  }
+  if (value.length > maxLength) {
+    throw new InvalidInputError(
+      `${label} must be at most ${maxLength} characters (received ${value.length}).`,
+    );
   }
 }
 
@@ -312,9 +353,19 @@ export class KintaiSession extends RpcTarget {
    * Called AFTER the data is fetched and BEFORE it is returned, matching `ScheduleSessionImpl` and
    * `LibraryReadSession`: the description can then report what was actually read, and a refusal
    * still blocks the caller from seeing any of it.
+   *
+   * `prohibitAllSharing` marks an observation that must never reach anyone but the account owner.
+   * It is passed only when true, never as an explicit `false`, so the description a permissive read
+   * sends is byte-identical to what it always sent.
    */
-  async #authorize(title: string, description: string): Promise<void> {
-    await this.#approvalQueue.authorizeObservation({ title, description });
+  async #authorize(
+    title: string, description: string, prohibitAllSharing?: true,
+  ): Promise<void> {
+    await this.#approvalQueue.authorizeObservation(
+      prohibitAllSharing
+        ? { title, description, prohibitAllSharing: true }
+        : { title, description },
+    );
   }
 
   /**
@@ -376,7 +427,24 @@ export class KintaiSession extends RpcTarget {
 
   async setAllocations(workDate: string, entries: AllocationEntry[]): Promise<Reconciliation> {
     assertWorkDate("workDate", workDate);
-    for (const entry of entries) assertMinutes(`allocation for ${entry.projectCode}`, entry.minutes);
+    if (!Array.isArray(entries)) {
+      throw new InvalidInputError("entries must be an array of allocation lines.");
+    }
+    if (entries.length > LIMITS.allocationEntries) {
+      throw new InvalidInputError(
+        `entries must contain at most ${LIMITS.allocationEntries} allocation lines ` +
+        `(received ${entries.length}).`,
+      );
+    }
+    // Validated in full BEFORE anything is written: `setAllocations` supersedes the whole day, so
+    // a rejection partway through would already have replaced the day's allocations.
+    for (const entry of entries) {
+      assertText("projectCode", entry?.projectCode, LIMITS.projectCode);
+      assertMinutes(`allocation for ${entry.projectCode}`, entry.minutes);
+      if (entry.note !== undefined) {
+        assertText(`note for ${entry.projectCode}`, entry.note, LIMITS.note);
+      }
+    }
     const now = Date.now();
     const employeeId = await this.#requireEmployee(now);
     await this.#store.assertWritable(workDate);
@@ -386,6 +454,7 @@ export class KintaiSession extends RpcTarget {
   async submitOvertime(requestedFor: string, minutes: number, reason: string): Promise<number> {
     assertWorkDate("requestedFor", requestedFor);
     assertMinutes("minutes", minutes);
+    assertText("reason", reason, LIMITS.reason);
     const now = Date.now();
     const employeeId = await this.#requireEmployee(now);
     const profile = await this.#store.employeeProfile(employeeId);
@@ -430,7 +499,24 @@ export class KintaiSession extends RpcTarget {
     return submissions;
   }
 
-  /** Derived from the org graph. Never accepts an employee id from the caller. */
+  /**
+   * Derived from the org graph. Never accepts an employee id from the caller.
+   *
+   * The ONE read in this session that returns other people's records — minutes, stated reason,
+   * dates and employee ids for everyone the caller approves for — so it is the one observation
+   * marked `prohibitAllSharing`. Everything else here is the caller's own data, and a Gadget the
+   * caller shares with a colleague showing the caller's own attendance is a choice they are
+   * entitled to make; a Gadget showing their reports' payroll data to a collaborator is not, and
+   * `addObserver` accepts every collaborator under the low-stakes observer policy, so nothing else
+   * in this package would stop it.
+   *
+   * ACCEPTED PRODUCT COST, deliberately: a Gadget that calls this method can no longer be shared,
+   * and this call THROWS if the Gadget is already shared (the Overseer refuses the observation and
+   * no data is returned). It also puts the Gadget into lockdown for the rest of its run. A Gadget
+   * that wants to stay shareable must not call `listPendingApprovals()`; `punch()`, `getDay()` and
+   * `listMySubmissions()` stay freely shareable. Failing closed on the approval queue is the right
+   * side to err on for payroll data belonging to somebody else.
+   */
   async listPendingApprovals(): Promise<SubmissionRow[]> {
     const now = Date.now();
     const employeeId = await this.#requireEmployee(now);
@@ -441,16 +527,38 @@ export class KintaiSession extends RpcTarget {
       "Kintai approval queue",
       `Read the ${pending.length} overtime submission(s) awaiting your decision as an approver. ` +
       "These belong to employees you have approval authority over in the organisation chart.",
+      true,
     );
     return pending;
   }
 
+  /**
+   * Approve, reject or return one submission. Returns nothing.
+   *
+   * KNOWN PROTOCOL GAP, recorded here rather than hidden: this does NOT pass through the
+   * Gatekeeper's `ApprovalQueue`. `Gatekeeper.startSession` requires that "every operation
+   * performed through this session must be submitted to the approval queue" and that "side-
+   * effecting actions must not actually be performed until they are approved"
+   * (workshop-shared/src/gatekeeper.ts). This method performs a manager's approval of somebody
+   * else's pay — about as side-effecting as this package gets — directly against the store, so
+   * agent-written code can move a submission to `approved` with no human in the loop beyond the
+   * Gadget itself. Closing it means submitting an action here and doing the write in
+   * `KintaiGatekeeper.applyAction`, which is a behavioural change, not a fix, and is the
+   * recommended next task.
+   *
+   * The signature is already the queued shape, so that change is additive rather than breaking:
+   * a queued action is applied later, by a different call, and cannot return the resulting state
+   * to this caller. Callers read the outcome back from `listMySubmissions()` (as the employee) or
+   * `listPendingApprovals()` (as the approver — an approved or rejected submission leaves the
+   * queue), which is the shape they will need either way.
+   */
   async actOnSubmission(
     submissionId: number, action: ApprovalAction, comment?: string,
-  ): Promise<SubmissionState> {
+  ): Promise<void> {
+    if (comment !== undefined) assertText("comment", comment, LIMITS.comment);
     const now = Date.now();
     const actorId = await this.#requireEmployee(now);
-    return this.#store.actOnSubmission({ submissionId, actorId, action, now, comment });
+    await this.#store.actOnSubmission({ submissionId, actorId, action, now, comment });
   }
 }
 
