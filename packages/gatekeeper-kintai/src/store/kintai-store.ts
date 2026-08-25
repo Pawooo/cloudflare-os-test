@@ -26,6 +26,8 @@ import {
   createRoute, resolveRoute,
   type NewRoute, type RouteCriteria, type RouteSnapshot,
 } from "../routes.js";
+import { assertWritable, isLocked, lockPeriod } from "./periods.js";
+import { appendAudit, auditEntries, type AuditEntry, type AuditRow } from "./audit.js";
 import type { EmployeeId, SubmissionState } from "../types.js";
 
 @validateRpc()
@@ -190,5 +192,25 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
 
   async approvalEvents(submissionId: number): Promise<ApprovalEventRow[]> {
     return approvalEvents(this.sql, submissionId);
+  }
+
+  async isLocked(workDate: string): Promise<boolean> {
+    return isLocked(this.sql, workDate);
+  }
+
+  async lockPeriod(period: string, lockedBy: EmployeeId, now: number): Promise<void> {
+    lockPeriod(this.sql, period, lockedBy, now);
+  }
+
+  async assertWritable(workDate: string): Promise<void> {
+    assertWritable(this.sql, workDate);
+  }
+
+  async appendAudit(entry: AuditEntry): Promise<void> {
+    appendAudit(this.sql, entry);
+  }
+
+  async auditEntries(): Promise<AuditRow[]> {
+    return auditEntries(this.sql);
   }
 }
