@@ -1,6 +1,7 @@
 import type { ApprovalAction, EmployeeId, SubmissionState } from "../types.js";
 import { NoRouteError, resolveRoute, type RouteSnapshot, type RouteStep } from "../routes.js";
 import { hasAuthorityOver, managersAt } from "./org.js";
+import { designatedApproverOf } from "./employees.js";
 
 // The state machine, and the three invariants it exists to hold:
 //
@@ -25,6 +26,10 @@ export type NewSubmission = {
   now: number;
   department: string | null;
   employmentType: string | null;
+  /** Who filed it, when that is not the employee themself (an importer, or an admin acting for
+   *  them). Recorded so the audit trail can distinguish whose overtime it is from whose hand
+   *  filed it. */
+  createdBy?: EmployeeId;
 };
 
 export type ActInput = {
@@ -47,6 +52,7 @@ export type SubmissionRow = {
   reason: string;
   calculation_inputs: string | null;
   route_snapshot: string;
+  created_by: number | null;
 };
 
 export type ApprovalEventRow = {
@@ -70,6 +76,13 @@ export class NotAuthorizedError extends Error {
   constructor() { super("KINTAI_NOT_AUTHORIZED: you are not an approver for this step."); }
 }
 
+export class SubmissionNotFoundError extends Error {
+  readonly code = "KINTAI_NOT_FOUND";
+  constructor(id: number) {
+    super(`KINTAI_NOT_FOUND: there is no submission ${id}.`);
+  }
+}
+
 export class InvalidTransitionError extends Error {
   readonly code = "KINTAI_INVALID_TRANSITION";
   constructor(from: SubmissionState, detail?: string) {
@@ -79,10 +92,23 @@ export class InvalidTransitionError extends Error {
 }
 
 export function getSubmission(sql: SqlStorage, id: number): SubmissionRow {
-  return sql.exec<SubmissionRow>(`SELECT * FROM submissions WHERE id = ?`, id).one();
+  // `.one()` would throw a raw SQLite error with no `code`, which the RPC boundary can only turn
+  // into a 500. An unknown id is an ordinary client mistake and gets its own coded error.
+  const row = sql
+    .exec<SubmissionRow>(`SELECT * FROM submissions WHERE id = ?`, id)
+    .toArray()[0];
+  if (!row) throw new SubmissionNotFoundError(id);
+  return row;
 }
 
 export function approvalEvents(sql: SqlStorage, submissionId: number): ApprovalEventRow[] {
+  // Asking for the history of a submission that does not exist is an error, not an empty history:
+  // returning [] would let a typo read as "this submission has never been acted on".
+  const exists = sql
+    .exec<{ id: number }>(`SELECT id FROM submissions WHERE id = ?`, submissionId)
+    .toArray()[0];
+  if (!exists) throw new SubmissionNotFoundError(submissionId);
+
   return sql
     .exec<ApprovalEventRow>(
       `SELECT * FROM approval_events WHERE submission_id = ? ORDER BY id`, submissionId,
@@ -131,10 +157,10 @@ export function submitOvertime(sql: SqlStorage, input: NewSubmission): number {
     .exec<{ id: number }>(
       `INSERT INTO submissions
          (employee_id, kind, requested_for, state, submitted_at, current_step,
-          minutes, reason, calculation_inputs, route_snapshot)
-       VALUES (?, 'overtime', ?, 'pending', ?, 0, ?, ?, NULL, ?) RETURNING id`,
+          minutes, reason, calculation_inputs, route_snapshot, created_by)
+       VALUES (?, 'overtime', ?, 'pending', ?, 0, ?, ?, NULL, ?, ?) RETURNING id`,
       input.employeeId, input.requestedFor, input.now, input.minutes, input.reason,
-      JSON.stringify(snapshot),
+      JSON.stringify(snapshot), input.createdBy ?? null,
     )
     .one();
   return row.id;
@@ -198,8 +224,15 @@ function authorize(
     return null;
   }
   const edge = hasAuthorityOver(sql, actorId, submission.employee_id, now);
-  if (edge === null) throw new NotAuthorizedError();
-  return edge;
+  if (edge !== null) return edge;
+
+  // No edge — but an employee at the root of the reporting tree has no manager edge by
+  // definition, and their designated approver is the only person who can ever act. Without this
+  // their submissions would strand in `pending` for good. There is no edge to cite, so the audit
+  // records a null `authorizing_edge`: authority came from the employee record, not the org graph.
+  if (designatedApproverOf(sql, submission.employee_id) === actorId) return null;
+
+  throw new NotAuthorizedError();
 }
 
 export function actOnSubmission(sql: SqlStorage, input: ActInput): SubmissionState {
@@ -260,9 +293,18 @@ export function actOnSubmission(sql: SqlStorage, input: ActInput): SubmissionSta
 
   // An `all_of` requirement is evaluated against the org as it stands now, so a manager who has
   // since left drops out of it rather than stalling the submission for good.
+  //
+  // An EMPTY requirement is unsatisfied, not vacuously satisfied. `[].every()` is `true`, which
+  // would let a step that asks for every manager's signature complete on none of them — reachable
+  // today by an employee whose reporting edges are all closed but who has a live delegate, since
+  // the delegate can act but is (correctly) not counted into the requirement. "Nobody is required"
+  // must fail closed, exactly as `assertSatisfiable`'s "nobody can approve" does.
+  const required = step.rule === "all_of"
+    ? requiredApprovers(sql, submission, step, input.now)
+    : [];
   const satisfied = step.rule === "any_of"
     ? approvers.size > 0
-    : requiredApprovers(sql, submission, step, input.now).every((id) => approvers.has(id));
+    : required.length > 0 && required.every((id) => approvers.has(id));
 
   if (!satisfied) return "pending";
 
@@ -281,11 +323,19 @@ export function resubmit(
   sql: SqlStorage, submissionId: number, actorId: EmployeeId, now: number,
 ): void {
   const submission = getSubmission(sql, submissionId);
-  if (submission.state !== "draft") throw new InvalidTransitionError(submission.state);
+  // Ownership before state, matching `withdrawSubmission`: a non-owner must not be able to learn
+  // a submission's state from which error comes back.
   if (submission.employee_id !== actorId) throw new NotAuthorizedError();
+  if (submission.state !== "draft") throw new InvalidTransitionError(submission.state);
 
+  // `submitted_at` keeps the ORIGINAL filing time. Overwriting it on every resubmit makes "how
+  // long has this sat unapproved?" unanswerable after a single return, which is exactly the
+  // question an overtime backlog is audited on. COALESCE only fills it if it was somehow never
+  // set.
   sql.exec(
-    `UPDATE submissions SET state = 'pending', current_step = 0, submitted_at = ? WHERE id = ?`,
+    `UPDATE submissions
+     SET state = 'pending', current_step = 0, submitted_at = COALESCE(submitted_at, ?)
+     WHERE id = ?`,
     now, submissionId,
   );
 }

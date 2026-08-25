@@ -127,7 +127,11 @@ export function applySchema(sql: SqlStorage): void {
     reason TEXT NOT NULL,
     calculation_inputs TEXT CHECK (
       calculation_inputs IS NULL OR json_valid(calculation_inputs)),
-    route_snapshot TEXT NOT NULL CHECK (json_valid(route_snapshot))
+    route_snapshot TEXT NOT NULL CHECK (json_valid(route_snapshot)),
+    -- Who filed this. Nullable because a row may predate the column or come from an importer,
+    -- but without it a fabricated submission followed by a legitimate approval leaves an audit
+    -- trail that looks clean: employee_id says whose overtime it is, never whose hand filed it.
+    created_by INTEGER REFERENCES employees(id)
   ) STRICT`);
 
   sql.exec(`CREATE TABLE IF NOT EXISTS approval_events (

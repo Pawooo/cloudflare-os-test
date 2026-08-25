@@ -83,6 +83,27 @@ export function resolveAccount(
   return row ? row.employee_id : null;
 }
 
+/**
+ * The employee's fallback approver, or null.
+ *
+ * `designated_approver_id` is the escape hatch for employees at the root of the reporting tree,
+ * who have no manager edge and would otherwise have no one able to approve anything they file.
+ * It is deliberately NOT part of `hasAuthorityOver`: that answers "which org edge authorised
+ * this?", and a designated approver is authority granted by the employee record itself, with no
+ * edge and no validity window behind it.
+ */
+export function designatedApproverOf(
+  sql: SqlStorage,
+  employeeId: EmployeeId,
+): EmployeeId | null {
+  const row = sql
+    .exec<{ designated_approver_id: number | null }>(
+      `SELECT designated_approver_id FROM employees WHERE id = ?`, employeeId,
+    )
+    .toArray()[0];
+  return row?.designated_approver_id ?? null;
+}
+
 export function grantExemption(
   sql: SqlStorage,
   employeeId: EmployeeId,

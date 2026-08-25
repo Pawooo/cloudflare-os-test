@@ -44,7 +44,8 @@ export class NoRouteError extends Error {
    */
   constructor(detail?: string) {
     super(detail
-      ?? "No approval route matches this request. Ask an administrator to configure one.");
+      ?? "KINTAI_NO_ROUTE: no approval route matches this request. Ask an administrator to " +
+        "configure one.");
   }
 }
 

@@ -115,6 +115,17 @@ describe("submission lifecycle", () => {
     await expect(() => store.resubmit(id, worker, JUL + 1000))
       .rejects.toThrow(/KINTAI_INVALID_TRANSITION/);
   });
+
+  it("tells a non-owner nothing about a submission's state", async () => {
+    // Ownership is checked before state in both `resubmit` and `withdrawSubmission`, so the error
+    // a stranger gets never varies with the state they are probing for.
+    await singleStepRoute();
+    const id = await submit();
+    await expect(() => store.resubmit(id, boss, JUL + 1000))
+      .rejects.toThrow(/KINTAI_NOT_AUTHORIZED/);
+    await expect(() => store.withdrawSubmission(id, boss))
+      .rejects.toThrow(/KINTAI_NOT_AUTHORIZED/);
+  });
 });
 
 describe("authority", () => {
@@ -270,6 +281,24 @@ describe("all_of steps", () => {
     })).toBe("approved");
   });
 
+  it("is not satisfied when nobody is required — an empty requirement fails closed", async () => {
+    // Reporting edges all closed, but a live delegate. The delegate may act (a delegate edge is a
+    // real edge) yet is correctly not counted into the requirement, so the required set is empty.
+    // `[].every()` is `true`, which would let a step demanding every manager's signature complete
+    // on none of them. "Nobody is required" must fail closed.
+    const orphan = await employee("O1");
+    const cover = await employee("C4");
+    await store.setReportingLine(orphan, boss, APR, JUL - 1);
+    await store.setDelegate(orphan, cover, JUL, JUL + 100_000);
+    await allOfManagerRoute();
+    const id = await submit(120, orphan);
+
+    expect(await store.actOnSubmission({
+      submissionId: id, actorId: cover, action: "approve", now: JUL + 1000,
+    })).toBe("pending");
+    expect((await store.getSubmission(id)).state).toBe("pending");
+  });
+
   it("drops the requirement for a manager whose edge has expired", async () => {
     const leaver = await employee("L1");
     const stayer = await employee("S1");
@@ -287,6 +316,90 @@ describe("all_of steps", () => {
     expect(await store.actOnSubmission({
       submissionId: id, actorId: stayer, action: "approve", now: JUL + 2000,
     })).toBe("approved");
+  });
+});
+
+describe("designated approver", () => {
+  async function rootEmployee() {
+    const chief = await store.createEmployee({
+      employeeNumber: "R1", displayName: "Chief", joinedOn: "2026-04-01",
+      designatedApproverId: director,
+    });
+    return chief;
+  }
+
+  it("lets the designated approver act for an employee with no manager edge", async () => {
+    const chief = await rootEmployee();
+    await singleStepRoute();
+    const id = await submit(120, chief);
+
+    expect(await store.hasAuthorityOver(director, chief, JUL + 1000)).toBeNull();
+    expect(await store.actOnSubmission({
+      submissionId: id, actorId: director, action: "approve", now: JUL + 1000,
+    })).toBe("approved");
+
+    // Authority came from the employee record, not the org graph, so there is no edge to cite.
+    const events = await store.approvalEvents(id);
+    expect(events[0].authorizing_edge).toBeNull();
+  });
+
+  it("still refuses everyone who is neither a manager nor the designated approver", async () => {
+    const chief = await rootEmployee();
+    await singleStepRoute();
+    const id = await submit(120, chief);
+
+    await expect(() => store.actOnSubmission({
+      submissionId: id, actorId: boss, action: "approve", now: JUL + 1000,
+    })).rejects.toThrow(/KINTAI_NOT_AUTHORIZED/);
+  });
+
+  it("does not count the designated approver into an all_of requirement", async () => {
+    // Documents a live interaction between two rulings rather than an intended feature: the
+    // designated approver may ACT, but the `all_of` required set is reporting managers only, and
+    // an empty requirement fails closed — so a root employee on an all_of manager step stalls.
+    // Flagged for Task 10's reachability check.
+    const chief = await rootEmployee();
+    await allOfManagerRoute();
+    const id = await submit(120, chief);
+
+    expect(await store.actOnSubmission({
+      submissionId: id, actorId: director, action: "approve", now: JUL + 1000,
+    })).toBe("pending");
+  });
+});
+
+describe("provenance", () => {
+  it("records nothing rather than guessing when the filer is not stated", async () => {
+    await singleStepRoute();
+    const id = await submit();
+    expect((await store.getSubmission(id)).created_by).toBeNull();
+  });
+
+  it("records who filed a submission on someone else's behalf", async () => {
+    await singleStepRoute();
+    const id = await store.submitOvertime({
+      employeeId: worker, requestedFor: "2026-07-03", minutes: 120,
+      reason: "entered from the paper sheet", now: JUL,
+      department: "CONSTRUCTION", employmentType: null, createdBy: director,
+    });
+    const row = await store.getSubmission(id);
+    expect(row.employee_id).toBe(worker);
+    expect(row.created_by).toBe(director);
+  });
+});
+
+describe("unknown submissions", () => {
+  it("reports a missing submission as not found, not as a storage failure", async () => {
+    await expect(() => store.getSubmission(4242)).rejects.toThrow(/KINTAI_NOT_FOUND/);
+    await expect(() => store.actOnSubmission({
+      submissionId: 4242, actorId: boss, action: "approve", now: JUL,
+    })).rejects.toThrow(/KINTAI_NOT_FOUND/);
+    await expect(() => store.resubmit(4242, worker, JUL)).rejects.toThrow(/KINTAI_NOT_FOUND/);
+    await expect(() => store.withdrawSubmission(4242, worker)).rejects.toThrow(/KINTAI_NOT_FOUND/);
+  });
+
+  it("refuses to report an empty history for a submission that does not exist", async () => {
+    await expect(() => store.approvalEvents(4242)).rejects.toThrow(/KINTAI_NOT_FOUND/);
   });
 });
 
@@ -361,6 +474,20 @@ describe("return invalidates prior approvals", () => {
     })).toBe("approved");
   });
 
+  it("keeps the original filing time across a return and resubmit", async () => {
+    // "How long has this sat unapproved?" must survive a round trip through draft.
+    await twoStepRoute();
+    const id = await submit();
+    expect((await store.getSubmission(id)).submitted_at).toBe(JUL);
+
+    await store.actOnSubmission({
+      submissionId: id, actorId: boss, action: "return", now: JUL + 2000,
+    });
+    await store.resubmit(id, worker, JUL + 3000);
+
+    expect((await store.getSubmission(id)).submitted_at).toBe(JUL);
+  });
+
   it("keeps every event in the append-only log across a return", async () => {
     await twoStepRoute();
     const id = await submit();
@@ -384,6 +511,15 @@ describe("return invalidates prior approvals", () => {
 });
 
 describe("unusable routes", () => {
+  it("reports an unmatched route by its code", async () => {
+    await singleStepRoute();
+    await expect(() => store.submitOvertime({
+      employeeId: worker, requestedFor: "2026-07-03", minutes: 120,
+      reason: "wrong department", now: JUL,
+      department: "SALES", employmentType: null,
+    })).rejects.toThrow(/KINTAI_NO_ROUTE/);
+  });
+
   it("refuses to create a submission against a route with no steps", async () => {
     await store.createRoute({ name: "empty", department: "CONSTRUCTION", steps: [] });
     await expect(() => submit()).rejects.toThrow(/KINTAI_NO_ROUTE|no approval steps/i);

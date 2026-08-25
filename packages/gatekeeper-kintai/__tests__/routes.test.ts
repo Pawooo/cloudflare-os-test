@@ -122,6 +122,6 @@ describe("resolveRoute", () => {
     // trip a spurious "unhandled rejection" even though this assertion does catch it (see Task 6).
     await expect(() => store.resolveRoute({
       department: "SALES", employmentType: null, minutes: 60,
-    })).rejects.toThrow(/KINTAI_NO_ROUTE|no approval route/i);
+    })).rejects.toThrow(/KINTAI_NO_ROUTE/);
   });
 });
