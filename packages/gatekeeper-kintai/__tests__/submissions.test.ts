@@ -282,13 +282,16 @@ describe("all_of steps", () => {
   });
 
   it("is not satisfied when nobody is required — an empty requirement fails closed", async () => {
-    // Reporting edges all closed, but a live delegate. The delegate may act (a delegate edge is a
-    // real edge) yet is correctly not counted into the requirement, so the required set is empty.
-    // `[].every()` is `true`, which would let a step demanding every manager's signature complete
-    // on none of them. "Nobody is required" must fail closed.
+    // The reporting edge is active at submission time (so Task 10's write-time guard in
+    // submitOvertime lets this through — orphan does have a reachable approver when they file) but
+    // expires moments later, before anyone acts on it, leaving only a live delegate by review time.
+    // The delegate may act (a delegate edge is a real edge) yet is correctly not counted into the
+    // requirement, so the required set is empty at approval time. `[].every()` is `true`, which
+    // would let a step demanding every manager's signature complete on none of them. "Nobody is
+    // required" must fail closed.
     const orphan = await employee("O1");
     const cover = await employee("C4");
-    await store.setReportingLine(orphan, boss, APR, JUL - 1);
+    await store.setReportingLine(orphan, boss, APR, JUL + 1);
     await store.setDelegate(orphan, cover, JUL, JUL + 100_000);
     await allOfManagerRoute();
     const id = await submit(120, orphan);
@@ -589,5 +592,22 @@ describe("exempt employees", () => {
     await store.grantExemption(worker, APR, JUL - 1000 * 60 * 60 * 24 * 3);
 
     await expect(submit()).resolves.toEqual(expect.any(Number));
+  });
+});
+
+// Closes the hole Task 10's org-write-time validation left open: `hasReachableApprover` and
+// `assertApproverReachable` were produced but never called from anywhere, so nothing actually
+// stopped a submission from an employee who never had an approver at all from being created and
+// stranding in `pending` for good.
+describe("no reachable approver", () => {
+  it("refuses a submission from an employee with no manager, no exemption, and no designated " +
+    "approver, and creates no row", async () => {
+    const orphan = await employee("O5");
+
+    await expect(() => submit(120, orphan)).rejects.toThrow(/KINTAI_NO_APPROVER/);
+
+    // Confirm no submission was left behind: this is the first submission this store would ever
+    // create, so if the guard let it through it would be id 1.
+    await expect(() => store.getSubmission(1)).rejects.toThrow(/KINTAI_NOT_FOUND/);
   });
 });

@@ -1,6 +1,6 @@
 import type { ApprovalAction, EmployeeId, SubmissionState } from "../types.js";
 import { NoRouteError, resolveRoute, type RouteSnapshot, type RouteStep } from "../routes.js";
-import { hasAuthorityOver, managersAt } from "./org.js";
+import { assertApproverReachable, hasAuthorityOver, managersAt } from "./org.js";
 import { designatedApproverOf, isExempt } from "./employees.js";
 
 // The state machine, and the three invariants it exists to hold:
@@ -166,13 +166,30 @@ function assertSatisfiable(snapshot: RouteSnapshot): void {
  */
 export function submitOvertime(sql: SqlStorage, input: NewSubmission): number {
   // `requested_for` is a calendar date (JST work date), not an instant; it is parsed as UTC
-  // midnight of that date to evaluate the exemption for the period this request is actually
-  // about. This is deliberately the requested date, not `input.now` (the filing time) — an
-  // employee exempt on the day worked but filing later, once no longer exempt, is still filing for
-  // exempt work and must still be refused.
-  if (isExempt(sql, input.employeeId, Date.parse(input.requestedFor))) {
+  // midnight of that date to evaluate both checks below against the period this request is
+  // actually about. This is deliberately the requested date, not `input.now` (the filing time) —
+  // an employee exempt on the day worked but filing later, once no longer exempt, is still filing
+  // for exempt work and must still be refused; and an employee with no approver on the day worked
+  // must not be let through just because they later happen to gain one before filing.
+  const requestedAt = Date.parse(input.requestedFor);
+
+  if (isExempt(sql, input.employeeId, requestedAt)) {
     throw new ExemptEmployeeError();
   }
+
+  // Task 10's write-time validation (`hasReachableApprover`/`assertApproverReachable`) is not
+  // wired into any org-mutation path — there is currently no API that closes an `org_edges` row
+  // (`account_links` has an UPDATE ... valid_to path; `org_edges` does not), so no write can yet
+  // orphan an employee who once had an approver. `createEmployee` cannot enforce it either, since
+  // the very first employee in an organisation has no manager by definition. That leaves exactly
+  // one reachable hole: a `submitOvertime` call for an employee who never had a manager, an
+  // exemption, or a designated approver at all. Guard it here.
+  //
+  // The moment an edge-closing API is introduced, this stops being the only hole: closing an
+  // employee's last reporting edge (or revoking their designated approver, if that ever becomes
+  // mutable) needs this same check at that write, not only at submission time — an employee who
+  // is orphaned before ever filing again would otherwise pass silently until they did.
+  assertApproverReachable(sql, input.employeeId, requestedAt);
 
   const snapshot = resolveRoute(sql, {
     department: input.department,
