@@ -14,6 +14,9 @@ export default defineConfig({
         serviceBindings: {
           KINTAI_VENDOR: { name: kCurrentWorker, entrypoint: "GatekeeperVendor" },
         },
+        durableObjects: {
+          KINTAI_STORE: { className: "KintaiStore", useSQLite: true },
+        },
       },
     }),
   ],
