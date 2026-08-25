@@ -9,11 +9,20 @@ export type NewEmployee = {
   joinedOn: string;
 };
 
-/** Thrown when a caller's account capability has no open link to an employee record. */
+/**
+ * Thrown when a caller's account capability has no open link to an employee record.
+ *
+ * The code is repeated in the message, as every other error in this package does, because `code`
+ * is a plain own property and does not survive the RPC boundary — a Gadget receives the message
+ * and nothing else, so the message is the only place a caller can read the code from.
+ */
 export class UnlinkedAccountError extends Error {
   readonly code = "KINTAI_ACCOUNT_NOT_LINKED";
   constructor() {
-    super("This account is not linked to an employee record. Contact HR to be set up.");
+    super(
+      "KINTAI_ACCOUNT_NOT_LINKED: this account is not linked to an employee record. " +
+      "Contact HR to be set up.",
+    );
   }
 }
 
@@ -133,4 +142,23 @@ export function isExempt(sql: SqlStorage, employeeId: EmployeeId, at: number): b
     )
     .one();
   return row.n > 0;
+}
+
+export type EmployeeProfile = {
+  id: number;
+  department: string | null;
+  employment_type: string | null;
+};
+
+/**
+ * The routing attributes of one employee. `.one()` is deliberate: every caller reaches this with an
+ * id that came out of `resolveAccount`, and `account_links.employee_id` has a foreign key onto
+ * `employees(id)`, so a missing row is corruption rather than an ordinary client mistake.
+ */
+export function employeeProfile(sql: SqlStorage, employeeId: EmployeeId): EmployeeProfile {
+  return sql
+    .exec<EmployeeProfile>(
+      `SELECT id, department, employment_type FROM employees WHERE id = ?`, employeeId,
+    )
+    .one();
 }

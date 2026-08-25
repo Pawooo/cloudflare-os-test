@@ -6,8 +6,8 @@ import {
   type AllocationEntry, type AllocationRow, type Reconciliation,
 } from "./allocations.js";
 import {
-  createEmployee, grantExemption, isExempt, linkAccount, resolveAccount,
-  type NewEmployee,
+  createEmployee, employeeProfile, grantExemption, isExempt, linkAccount, resolveAccount,
+  type EmployeeProfile, type NewEmployee,
 } from "./employees.js";
 import {
   assertApproverReachable, hasAuthorityOver, hasReachableApprover, managersAt, setDelegate,
@@ -19,7 +19,8 @@ import {
 } from "./punches.js";
 import { createSite, matchSite, type NewSite } from "./sites.js";
 import {
-  actOnSubmission, approvalEvents, getSubmission, resubmit, submitOvertime, withdrawSubmission,
+  actOnSubmission, approvalEvents, getSubmission, listSubmissionsFor, pendingApprovalsFor,
+  resubmit, submitOvertime, withdrawSubmission,
   type ActInput, type ApprovalEventRow, type NewSubmission, type SubmissionRow,
 } from "./submissions.js";
 import {
@@ -65,6 +66,10 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
 
   async resolveAccount(accountId: string, at: number): Promise<EmployeeId | null> {
     return resolveAccount(this.sql, accountId, at);
+  }
+
+  async employeeProfile(employeeId: EmployeeId): Promise<EmployeeProfile> {
+    return employeeProfile(this.sql, employeeId);
   }
 
   async grantExemption(employeeId: EmployeeId, from: number, to?: number): Promise<void> {
@@ -184,6 +189,14 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
 
   async withdrawSubmission(submissionId: number, actorId: EmployeeId): Promise<void> {
     withdrawSubmission(this.sql, submissionId, actorId);
+  }
+
+  async listSubmissionsFor(employeeId: EmployeeId): Promise<SubmissionRow[]> {
+    return listSubmissionsFor(this.sql, employeeId);
+  }
+
+  async pendingApprovalsFor(approverId: EmployeeId, now: number): Promise<SubmissionRow[]> {
+    return pendingApprovalsFor(this.sql, approverId, now);
   }
 
   async getSubmission(id: number): Promise<SubmissionRow> {

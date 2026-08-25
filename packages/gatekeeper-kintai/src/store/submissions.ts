@@ -413,3 +413,58 @@ export function withdrawSubmission(
   }
   sql.exec(`UPDATE submissions SET state = 'withdrawn' WHERE id = ?`, submissionId);
 }
+
+/** Every submission belonging to one employee, newest first. */
+export function listSubmissionsFor(
+  sql: SqlStorage, employeeId: EmployeeId,
+): SubmissionRow[] {
+  return sql
+    .exec<SubmissionRow>(
+      `SELECT * FROM submissions WHERE employee_id = ? ORDER BY id DESC`, employeeId,
+    )
+    .toArray();
+}
+
+/**
+ * Submissions this approver can act on right now, derived from the org graph and each submission's
+ * own route snapshot — never from a caller's claim about who they are or what they manage.
+ *
+ * The filter is `authorize` itself rather than a parallel SQL predicate. Those two must agree: a
+ * queue that lists what the approver cannot act on produces dead entries, and — much worse — a
+ * queue that omits what they alone can act on strands the submission in `pending` invisibly. The
+ * only way to keep them in step under every route shape (a step pinned to a named employee, a
+ * delegate covering an absent manager, a root employee's designated approver) is to ask the same
+ * function. Route snapshots are JSON on the row, so the current step cannot be evaluated in SQL;
+ * SQL narrows to the pending rows and the authorisation decision happens here.
+ *
+ * `employee_id != ?` is not merely an optimisation: self-approval is structurally forbidden, so an
+ * approver's own submissions could never belong in their queue.
+ */
+export function pendingApprovalsFor(
+  sql: SqlStorage, approverId: EmployeeId, now: number,
+): SubmissionRow[] {
+  const pending = sql
+    .exec<SubmissionRow>(
+      // submitted_at is caller-supplied and so is not monotonic; id breaks ties in insertion order.
+      `SELECT * FROM submissions
+       WHERE state = 'pending' AND employee_id != ?
+       ORDER BY submitted_at, id`,
+      approverId,
+    )
+    .toArray();
+
+  return pending.filter((submission) => {
+    const snapshot = JSON.parse(submission.route_snapshot) as RouteSnapshot;
+    const step = snapshot.steps[submission.current_step];
+    // A submission with no step at its current index is unactionable by anyone (see
+    // `actOnSubmission`); it must not appear in a queue that promises "you can act on this".
+    if (!step) return false;
+    try {
+      authorize(sql, submission, step, approverId, now);
+      return true;
+    } catch (err) {
+      if (err instanceof NotAuthorizedError) return false;
+      throw err;
+    }
+  });
+}

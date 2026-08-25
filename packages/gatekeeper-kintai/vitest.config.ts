@@ -16,6 +16,14 @@ export default defineConfig({
         },
         durableObjects: {
           KINTAI_STORE: { className: "KintaiStore", useSQLite: true },
+          // Registration only, never used as a binding. Without it workerd does not classify
+          // KintaiGatekeeper as a Durable Object, and `ctx.exports.KintaiGatekeeper({ props })`
+          // constructs it as a plain entrypoint ("constructor parameter 1 is not of type
+          // 'DurableObjectState'"). Tests must not mint facets through this binding: a namespace
+          // binding cannot carry `ctx.props`. See `KintaiFacetHost` in `__tests__/worker.ts`.
+          KINTAI_FACET: { className: "KintaiGatekeeper", useSQLite: true },
+          // Test-only parent, standing in for the Overseer that hosts the facet in production.
+          KINTAI_FACET_HOST: { className: "KintaiFacetHost", useSQLite: true },
         },
       },
     }),
