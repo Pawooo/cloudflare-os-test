@@ -193,8 +193,21 @@ function lastReturnEventId(sql: SqlStorage, submissionId: number): number {
  *
  *  - manager steps require the reporting line only. A delegate covers an absent manager, so
  *    counting them would make a stand-in an extra required signature.
- *  - the employee themself is filtered out. A self-edge is a data error, but if one exists it must
- *    not deadlock the submission behind an approval that self-approval forbids.
+ *  - the employee themself is filtered out throughout. A self-edge, or an employee recorded as
+ *    their own designated approver, is a data error — but if one exists it must not deadlock the
+ *    submission behind an approval that self-approval structurally forbids.
+ *
+ * With no reporting line at all the requirement falls back to the designated approver: the same
+ * person `authorize` lets act for a root employee, so the step can actually complete rather than
+ * stranding them in `pending`. It also keeps the set non-empty, which is what preserves the
+ * fail-closed guarantee on the case that guard was written for — no reporting managers AND no
+ * designated approver, e.g. an employee covered only by a delegate, where the set stays empty and
+ * the step is correctly never satisfied.
+ *
+ * Task 10's `hasReachableApprover` asks a related question with a third arm, 管理監督者 exemption.
+ * That arm has no counterpart here and must not gain one: an exemption grants nobody authority to
+ * sign, so it can never contribute a required approver. It means the employee needs no approval,
+ * which is a question about whether to route at all, not about who must sign.
  */
 function requiredApprovers(
   sql: SqlStorage, submission: SubmissionRow, step: RouteStep, now: number,
@@ -202,8 +215,13 @@ function requiredApprovers(
   if (step.approverKind === "employee") {
     return step.approverEmployeeId === null ? [] : [step.approverEmployeeId];
   }
-  return managersAt(sql, submission.employee_id, now, "report")
+
+  const managers = managersAt(sql, submission.employee_id, now, "report")
     .filter((id) => id !== submission.employee_id);
+  if (managers.length > 0) return managers;
+
+  const designated = designatedApproverOf(sql, submission.employee_id);
+  return designated === null || designated === submission.employee_id ? [] : [designated];
 }
 
 /**

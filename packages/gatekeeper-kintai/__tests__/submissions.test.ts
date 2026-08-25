@@ -353,18 +353,54 @@ describe("designated approver", () => {
     })).rejects.toThrow(/KINTAI_NOT_AUTHORIZED/);
   });
 
-  it("does not count the designated approver into an all_of requirement", async () => {
-    // Documents a live interaction between two rulings rather than an intended feature: the
-    // designated approver may ACT, but the `all_of` required set is reporting managers only, and
-    // an empty requirement fails closed — so a root employee on an all_of manager step stalls.
-    // Flagged for Task 10's reachability check.
+  it("completes an all_of step for an employee with no reporting line", async () => {
+    // With no reporting managers the requirement falls back to the designated approver, so a root
+    // employee is not stranded. Read together with "an empty requirement fails closed": the set is
+    // non-empty here precisely because a designated approver exists.
     const chief = await rootEmployee();
     await allOfManagerRoute();
     const id = await submit(120, chief);
 
     expect(await store.actOnSubmission({
       submissionId: id, actorId: director, action: "approve", now: JUL + 1000,
+    })).toBe("approved");
+  });
+
+  it("still requires the designated approver when only a delegate is available", async () => {
+    // A delegate satisfies a step, never adds one — and never substitutes for the requirement
+    // either. The fallback puts the designated approver in the required set, so the delegate's
+    // approval alone does not complete the step.
+    const chief = await rootEmployee();
+    const cover = await employee("C5");
+    await store.setDelegate(chief, cover, JUL, JUL + 100_000);
+    await allOfManagerRoute();
+    const id = await submit(120, chief);
+
+    expect(await store.actOnSubmission({
+      submissionId: id, actorId: cover, action: "approve", now: JUL + 1000,
     })).toBe("pending");
+    expect(await store.actOnSubmission({
+      submissionId: id, actorId: director, action: "approve", now: JUL + 2000,
+    })).toBe("approved");
+  });
+
+  it("ignores a reporting line that is not there, not one that is", async () => {
+    // The fallback applies only when the reporting line is empty. A worker who has both a manager
+    // and a designated approver must still collect the manager's signature.
+    const both = await store.createEmployee({
+      employeeNumber: "R2", displayName: "Both", joinedOn: "2026-04-01",
+      designatedApproverId: director,
+    });
+    await store.setReportingLine(both, boss, APR);
+    await allOfManagerRoute();
+    const id = await submit(120, both);
+
+    expect(await store.actOnSubmission({
+      submissionId: id, actorId: director, action: "approve", now: JUL + 1000,
+    })).toBe("pending");
+    expect(await store.actOnSubmission({
+      submissionId: id, actorId: boss, action: "approve", now: JUL + 2000,
+    })).toBe("approved");
   });
 });
 
