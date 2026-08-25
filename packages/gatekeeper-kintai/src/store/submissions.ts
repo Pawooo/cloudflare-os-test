@@ -1,7 +1,7 @@
 import type { ApprovalAction, EmployeeId, SubmissionState } from "../types.js";
 import { NoRouteError, resolveRoute, type RouteSnapshot, type RouteStep } from "../routes.js";
 import { hasAuthorityOver, managersAt } from "./org.js";
-import { designatedApproverOf } from "./employees.js";
+import { designatedApproverOf, isExempt } from "./employees.js";
 
 // The state machine, and the three invariants it exists to hold:
 //
@@ -69,6 +69,25 @@ export type ApprovalEventRow = {
 export class SelfApprovalError extends Error {
   readonly code = "KINTAI_SELF_APPROVAL";
   constructor() { super("KINTAI_SELF_APPROVAL: you cannot approve your own submission."); }
+}
+
+/**
+ * The spec says 管理監督者 "shouldn't be raising overtime requests at all" — they are exempt from
+ * the premiums overtime approval exists to control, so there is nothing for an approver to sign.
+ * No task in the plan wires that rule in elsewhere, and without it an exempt employee's submission
+ * would be silently accepted and then strand: their own exemption satisfies `hasReachableApprover`
+ * (Task 10), but that is a statement about them needing no approver, not about anyone being
+ * required or able to approve a step. This is defense in depth in the same spirit as
+ * `SelfApprovalError` — a store-level guard, not merely a UI concern.
+ */
+export class ExemptEmployeeError extends Error {
+  readonly code = "KINTAI_EXEMPT_EMPLOYEE";
+  constructor() {
+    super(
+      "KINTAI_EXEMPT_EMPLOYEE: this employee is 管理監督者-exempt for the requested period and " +
+      "may not raise an overtime request for it.",
+    );
+  }
 }
 
 export class NotAuthorizedError extends Error {
@@ -146,6 +165,15 @@ function assertSatisfiable(snapshot: RouteSnapshot): void {
  * configuration changes mid-approval, in-flight submissions must not mutate under their approvers.
  */
 export function submitOvertime(sql: SqlStorage, input: NewSubmission): number {
+  // `requested_for` is a calendar date (JST work date), not an instant; it is parsed as UTC
+  // midnight of that date to evaluate the exemption for the period this request is actually
+  // about. This is deliberately the requested date, not `input.now` (the filing time) — an
+  // employee exempt on the day worked but filing later, once no longer exempt, is still filing for
+  // exempt work and must still be refused.
+  if (isExempt(sql, input.employeeId, Date.parse(input.requestedFor))) {
+    throw new ExemptEmployeeError();
+  }
+
   const snapshot = resolveRoute(sql, {
     department: input.department,
     employmentType: input.employmentType,

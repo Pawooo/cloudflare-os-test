@@ -9,7 +9,10 @@ import {
   createEmployee, grantExemption, isExempt, linkAccount, resolveAccount,
   type NewEmployee,
 } from "./employees.js";
-import { hasAuthorityOver, managersAt, setDelegate, setReportingLine } from "./org.js";
+import {
+  assertApproverReachable, hasAuthorityOver, hasReachableApprover, managersAt, setDelegate,
+  setReportingLine,
+} from "./org.js";
 import {
   allPunches, correctPunch, currentPunches, dayAnomalies, recordPunch, workedMinutes,
   type NewPunch, type PunchRow,
@@ -92,6 +95,14 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
     actorId: EmployeeId, employeeId: EmployeeId, at: number,
   ): Promise<number | null> {
     return hasAuthorityOver(this.sql, actorId, employeeId, at);
+  }
+
+  async hasReachableApprover(employeeId: EmployeeId, at: number): Promise<boolean> {
+    return hasReachableApprover(this.sql, employeeId, at);
+  }
+
+  async assertApproverReachable(employeeId: EmployeeId, at: number): Promise<void> {
+    assertApproverReachable(this.sql, employeeId, at);
   }
 
   async createSite(input: NewSite): Promise<number> {

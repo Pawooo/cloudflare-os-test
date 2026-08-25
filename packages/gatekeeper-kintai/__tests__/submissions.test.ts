@@ -569,3 +569,25 @@ describe("unusable routes", () => {
     await expect(() => submit()).rejects.toThrow(/KINTAI_NO_ROUTE|no approver/i);
   });
 });
+
+// The spec says 管理監督者 "shouldn't be raising overtime requests at all", but exemption alone
+// satisfies hasReachableApprover (Task 10), so nothing else stops a submission of theirs from
+// being accepted and then stranding — no manager is required to sign it, and nobody is able to.
+// This is a store-level guard in the same spirit as the self-approval check: defense in depth, not
+// merely a UI concern.
+describe("exempt employees", () => {
+  it("refuses an overtime request from an employee exempt for the requested period", async () => {
+    await singleStepRoute();
+    await store.grantExemption(worker, APR);
+
+    await expect(() => submit()).rejects.toThrow(/KINTAI_EXEMPT_EMPLOYEE/);
+  });
+
+  it("allows the request once the exemption period has passed", async () => {
+    await singleStepRoute();
+    // Exempt only through end of June; the request is for 2026-07-03, after the window closes.
+    await store.grantExemption(worker, APR, JUL - 1000 * 60 * 60 * 24 * 3);
+
+    await expect(submit()).resolves.toEqual(expect.any(Number));
+  });
+});
