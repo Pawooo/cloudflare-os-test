@@ -2,6 +2,10 @@ import { DurableObject } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import { applySchema } from "./schema.js";
 import {
+  allAllocations, currentAllocations, reconcile, setAllocations,
+  type AllocationEntry, type AllocationRow, type Reconciliation,
+} from "./allocations.js";
+import {
   createEmployee, grantExemption, isExempt, linkAccount, resolveAccount,
   type NewEmployee,
 } from "./employees.js";
@@ -113,5 +117,25 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
 
   async dayAnomalies(employeeId: EmployeeId, workDate: string): Promise<string[]> {
     return dayAnomalies(this.sql, employeeId, workDate);
+  }
+
+  async setAllocations(
+    employeeId: EmployeeId, workDate: string, entries: AllocationEntry[],
+  ): Promise<Reconciliation> {
+    return setAllocations(this.sql, employeeId, workDate, entries);
+  }
+
+  async currentAllocations(
+    employeeId: EmployeeId, workDate: string,
+  ): Promise<AllocationRow[]> {
+    return currentAllocations(this.sql, employeeId, workDate);
+  }
+
+  async allAllocations(employeeId: EmployeeId, workDate: string): Promise<AllocationRow[]> {
+    return allAllocations(this.sql, employeeId, workDate);
+  }
+
+  async reconcile(employeeId: EmployeeId, workDate: string): Promise<Reconciliation> {
+    return reconcile(this.sql, employeeId, workDate);
   }
 }
