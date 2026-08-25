@@ -78,6 +78,11 @@ export function applySchema(sql: SqlStorage): void {
   ) STRICT`);
   sql.exec(`CREATE INDEX IF NOT EXISTS punches_by_day
     ON punches(employee_id, work_date)`);
+  // At most one current correction per punch: a database constraint, not an application check,
+  // because later tasks rely on currentPunches() never returning two rows that both claim to
+  // supersede the same original.
+  sql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS punches_supersedes_unique
+    ON punches(supersedes_id) WHERE supersedes_id IS NOT NULL`);
 
   sql.exec(`CREATE TABLE IF NOT EXISTS day_allocations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

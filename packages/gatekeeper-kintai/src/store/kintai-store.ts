@@ -7,7 +7,7 @@ import {
 } from "./employees.js";
 import { hasAuthorityOver, managersAt, setDelegate, setReportingLine } from "./org.js";
 import {
-  allPunches, correctPunch, currentPunches, recordPunch, workedMinutes,
+  allPunches, correctPunch, currentPunches, dayAnomalies, recordPunch, workedMinutes,
   type NewPunch, type PunchRow,
 } from "./punches.js";
 import { createSite, matchSite, type NewSite } from "./sites.js";
@@ -94,8 +94,9 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
 
   async correctPunch(
     supersedesId: number, input: NewPunch, amendedBy: EmployeeId, reason: string,
+    recordedAt: number,
   ): Promise<number> {
-    return correctPunch(this.sql, supersedesId, input, amendedBy, reason);
+    return correctPunch(this.sql, supersedesId, input, amendedBy, reason, recordedAt);
   }
 
   async currentPunches(employeeId: EmployeeId, workDate: string): Promise<PunchRow[]> {
@@ -108,5 +109,9 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
 
   async workedMinutes(employeeId: EmployeeId, workDate: string): Promise<number> {
     return workedMinutes(this.sql, employeeId, workDate);
+  }
+
+  async dayAnomalies(employeeId: EmployeeId, workDate: string): Promise<string[]> {
+    return dayAnomalies(this.sql, employeeId, workDate);
   }
 }
