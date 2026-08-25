@@ -6,6 +6,7 @@ import {
   type NewEmployee,
 } from "./employees.js";
 import { hasAuthorityOver, managersAt, setDelegate, setReportingLine } from "./org.js";
+import { createSite, matchSite, type NewSite } from "./sites.js";
 import type { EmployeeId } from "../types.js";
 
 @validateRpc()
@@ -73,5 +74,13 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
     actorId: EmployeeId, employeeId: EmployeeId, at: number,
   ): Promise<number | null> {
     return hasAuthorityOver(this.sql, actorId, employeeId, at);
+  }
+
+  async createSite(input: NewSite): Promise<number> {
+    return createSite(this.sql, input);
+  }
+
+  async matchSite(latitude: number, longitude: number, at: number): Promise<number | null> {
+    return matchSite(this.sql, latitude, longitude, at);
   }
 }
