@@ -126,6 +126,28 @@ describe("submission lifecycle", () => {
     await expect(() => store.withdrawSubmission(id, boss))
       .rejects.toThrow(/KINTAI_NOT_AUTHORIZED/);
   });
+
+  it("tells someone with no authority nothing about a submission's state", async () => {
+    // Same invariant, in `actOnSubmission`: authority is established before the state machine
+    // speaks. Without this ordering `InvalidTransitionError` names the state it refused, turning
+    // the method into an oracle over every submission in the company.
+    await singleStepRoute();
+    const stranger = await employee("S1");
+    const id = await submit();
+    await store.actOnSubmission({
+      submissionId: id, actorId: boss, action: "reject", now: JUL + 1000,
+    });
+
+    // The submission is `rejected`, but a stranger is told only that they may not act.
+    await expect(() => store.actOnSubmission({
+      submissionId: id, actorId: stranger, action: "approve", now: JUL + 2000,
+    })).rejects.toThrow(/KINTAI_NOT_AUTHORIZED/);
+
+    // The authorised approver still gets the informative error.
+    await expect(() => store.actOnSubmission({
+      submissionId: id, actorId: boss, action: "approve", now: JUL + 3000,
+    })).rejects.toThrow(/KINTAI_INVALID_TRANSITION/);
+  });
 });
 
 describe("authority", () => {

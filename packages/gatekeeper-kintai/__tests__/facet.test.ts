@@ -1,5 +1,6 @@
 import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
+import { jstWorkDate } from "../src/kintai.js";
 
 // The facet reads the shared store; tests seed through the store directly, then act through the
 // facet exactly as Gadget code would.
@@ -380,6 +381,135 @@ describe("the authorization property", () => {
     expect(await store.currentAllocations(victim, workDate)).toEqual([]);
     expect(await store.currentPunches(victim, punch.workDate)).toEqual([]);
     expect(await store.currentAllocations(attacker, workDate)).toHaveLength(1);
+  });
+});
+
+describe("input validation at the boundary", () => {
+  it("rejects a malformed or impossible work date rather than writing junk", async () => {
+    const { accountId } = await linkedEmployee("junk");
+    const facet = facetFor(accountId);
+
+    for (const bad of ["banana", "2026-7-3", "2026-07-03T00:00:00Z", "", "2026-02-31", "2026-13-01"]) {
+      await expect(() => facet.getDay(bad)).rejects.toThrow(/KINTAI_INVALID_INPUT/);
+      await expect(() => facet.setAllocations(bad, [])).rejects.toThrow(/KINTAI_INVALID_INPUT/);
+      await expect(() => facet.submitOvertime(bad, 60, "x"))
+        .rejects.toThrow(/KINTAI_INVALID_INPUT/);
+    }
+  });
+
+  it("rejects minutes that are negative or fractional", async () => {
+    const { accountId } = await linkedEmployee("mins");
+    const facet = facetFor(accountId);
+
+    for (const bad of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      await expect(() => facet.submitOvertime("2026-07-03", bad, "x"))
+        .rejects.toThrow(/KINTAI_INVALID_INPUT/);
+      await expect(() => facet.setAllocations("2026-07-03", [{ projectCode: "P1", minutes: bad }]))
+        .rejects.toThrow(/KINTAI_INVALID_INPUT/);
+    }
+  });
+
+  it("nothing is written when validation rejects", async () => {
+    const { employeeId, accountId } = await linkedEmployee("novalid");
+    const facet = facetFor(accountId);
+
+    await expect(() => facet.setAllocations("2026-02-31", [{ projectCode: "P1", minutes: 60 }]))
+      .rejects.toThrow(/KINTAI_INVALID_INPUT/);
+
+    expect(await store.currentAllocations(employeeId, "2026-02-31")).toEqual([]);
+    expect(await store.currentAllocations(employeeId, "2026-03-02")).toEqual([]);
+    expect(await store.listSubmissionsFor(employeeId)).toEqual([]);
+  });
+});
+
+// The oracle the Task 12 review found: `InvalidTransitionError` names the state it refused, so
+// checking state before authority let any Gadget walk the id space and read back every
+// submission's state. `withdrawSubmission` and `resubmit` already ordered ownership before state
+// for exactly this reason; `actOnSubmission` now matches them.
+describe("actOnSubmission discloses nothing before authority is established", () => {
+  it("tells a stranger nothing about another employee's submission, in any state", async () => {
+    const { accountId: strangerAccount } = await linkedEmployee("probe-stranger");
+    const { employeeId: worker } = await linkedEmployee("probe-worker");
+    const { employeeId: boss, accountId: bossAccount } = await linkedEmployee("probe-boss");
+    await store.setReportingLine(worker, boss, 0);
+    await managerRoute();
+
+    const now = Date.now();
+    // One submission per terminal state, so the probe covers every branch of the state machine.
+    const pending = await store.submitOvertime({
+      employeeId: worker, requestedFor: "2026-07-03", minutes: 60,
+      reason: "pending", now, department: null, employmentType: null,
+    });
+    const rejected = await store.submitOvertime({
+      employeeId: worker, requestedFor: "2026-07-04", minutes: 60,
+      reason: "rejected", now, department: null, employmentType: null,
+    });
+    const withdrawn = await store.submitOvertime({
+      employeeId: worker, requestedFor: "2026-07-05", minutes: 60,
+      reason: "withdrawn", now, department: null, employmentType: null,
+    });
+    const returned = await store.submitOvertime({
+      employeeId: worker, requestedFor: "2026-07-06", minutes: 60,
+      reason: "returned", now, department: null, employmentType: null,
+    });
+    await store.actOnSubmission({ submissionId: rejected, actorId: boss, action: "reject", now });
+    await store.withdrawSubmission(withdrawn, worker);
+    await store.actOnSubmission({ submissionId: returned, actorId: boss, action: "return", now });
+
+    // Every state answers with the SAME error, so the response carries no information.
+    const stranger = facetFor(strangerAccount);
+    for (const id of [pending, rejected, withdrawn, returned]) {
+      await expect(() => stranger.actOnSubmission(id, "approve"))
+        .rejects.toThrow(/KINTAI_NOT_AUTHORIZED/);
+      await expect(() => stranger.actOnSubmission(id, "approve"))
+        .rejects.not.toThrow(/KINTAI_INVALID_TRANSITION/);
+    }
+
+    // The real approver still gets the informative error, because they have authority to act.
+    const bossFacet = facetFor(bossAccount);
+    await expect(() => bossFacet.actOnSubmission(rejected, "approve"))
+      .rejects.toThrow(/KINTAI_INVALID_TRANSITION/);
+    // ...and the pending one still works for them.
+    expect(await bossFacet.actOnSubmission(pending, "approve")).toBe("approved");
+  });
+});
+
+// `jstWorkDate` is exported and pure, and it decides which day every punch lands on. Pinned as a
+// table so a later "simplification" to a local-time or Intl-based implementation has to reproduce
+// these exactly. Verified independently against `Intl.DateTimeFormat` for `Asia/Tokyo`.
+describe("jstWorkDate", () => {
+  const cases: [string, string][] = [
+    // Midnight UTC is 09:00 JST the same day.
+    ["2026-07-03T00:00:00.000Z", "2026-07-03"],
+    // The last instant of the JST day: 14:59:59.999Z is 23:59:59.999 JST.
+    ["2026-07-03T14:59:59.999Z", "2026-07-03"],
+    // ...and one millisecond later the JST day rolls over.
+    ["2026-07-03T15:00:00.000Z", "2026-07-04"],
+    // Year rollover happens at 15:00Z on 31 December, not at midnight UTC.
+    ["2025-12-31T14:59:59.999Z", "2025-12-31"],
+    ["2025-12-31T15:00:00.000Z", "2026-01-01"],
+    // Leap day, and the day after it.
+    ["2028-02-28T15:00:00.000Z", "2028-02-29"],
+    ["2028-02-29T15:00:00.000Z", "2028-03-01"],
+    // The epoch, as a lower-bound sanity check.
+    ["1970-01-01T00:00:00.000Z", "1970-01-01"],
+  ];
+
+  it.each(cases)("maps %s to %s", (instant, expected) => {
+    expect(jstWorkDate(Date.parse(instant))).toBe(expected);
+  });
+
+  it("agrees with Intl for Asia/Tokyo across a year of daily samples", () => {
+    // JST has no DST, so this is a fixed +9h offset — but that is the claim under test, not an
+    // assumption, so it is checked against the platform's own tz database.
+    const format = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Tokyo", year: "numeric", month: "2-digit", day: "2-digit",
+    });
+    for (let day = 0; day < 365; day++) {
+      // 15:00Z sits exactly on the JST day boundary, the worst case for an off-by-one.
+      const instant = Date.parse("2026-01-01T15:00:00.000Z") + day * 86_400_000;
+      expect(jstWorkDate(instant)).toBe(format.format(new Date(instant)));
+    }
   });
 });
 

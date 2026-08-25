@@ -300,24 +300,29 @@ function authorize(
 
 export function actOnSubmission(sql: SqlStorage, input: ActInput): SubmissionState {
   const submission = getSubmission(sql, input.submissionId);
-  // First, ahead of the state machine itself: nobody signs off their own overtime, in any state,
-  // under any route.
+  // First, ahead of everything else: nobody signs off their own overtime, in any state, under any
+  // route.
   if (input.actorId === submission.employee_id) throw new SelfApprovalError();
-  if (submission.state !== "pending") throw new InvalidTransitionError(submission.state);
 
   const snapshot = JSON.parse(submission.route_snapshot) as RouteSnapshot;
   const step = snapshot.steps[submission.current_step];
-  if (!step) {
-    // Unreachable: `assertSatisfiable` rejects step-less routes at submit time and `current_step`
-    // only ever advances into range. Fail closed rather than treat a corrupt row as approvable.
-    throw new InvalidTransitionError(
-      submission.state,
-      `KINTAI_INVALID_TRANSITION: submission ${submission.id} has no step ` +
-      `${submission.current_step} in its route snapshot.`,
-    );
-  }
 
+  // Authority BEFORE state, matching `withdrawSubmission` and `resubmit`. `InvalidTransitionError`
+  // names the state it refused, so checking state first would turn this method into an oracle: a
+  // Gadget could walk the id space and read back, for every submission in the company, whether it
+  // exists, whether it belongs to the caller, and its exact state. Nothing about a submission is
+  // disclosed until the caller has proven they may act on it.
+  //
+  // A row with no step at its current index is unactionable by anyone — `assertSatisfiable` rejects
+  // step-less routes at submit time and `current_step` only ever advances into range, so this is
+  // unreachable for well-formed data. "You are not an approver for this step" is literally true of
+  // it, and fails closed without disclosing anything, so the corrupt row reports that rather than
+  // its own state.
+  if (!step) throw new NotAuthorizedError();
   const authorizingEdge = authorize(sql, submission, step, input.actorId, input.now);
+
+  // Only now, with authority established, is the state safe to name.
+  if (submission.state !== "pending") throw new InvalidTransitionError(submission.state);
 
   sql.exec(
     `INSERT INTO approval_events

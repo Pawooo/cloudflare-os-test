@@ -32,6 +32,47 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
   }
 }
 
+/**
+ * Rejects malformed input at the facet, the untrusted boundary.
+ *
+ * A raw SQLite CHECK violation would surface as an uncoded error the RPC boundary can only turn
+ * into a 500, and most of these values reach no CHECK at all: `Date.parse("banana")` is `NaN` and
+ * `periodOf("banana")` is `"banana"`, so junk dates sail past the exemption, approver-reachability
+ * and period-lock queries and persist. Coded, like `SubmissionNotFoundError`, because a malformed
+ * argument is an ordinary client mistake.
+ */
+export class InvalidInputError extends Error {
+  readonly code = "KINTAI_INVALID_INPUT";
+  constructor(detail: string) {
+    super(`KINTAI_INVALID_INPUT: ${detail}`);
+  }
+}
+
+const WORK_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * A real JST calendar date in `YYYY-MM-DD` form.
+ *
+ * The round-trip is not redundant with the pattern: "2026-02-31" and "2026-13-01" both match it,
+ * and `Date.parse` silently rolls them over into March and January rather than failing.
+ */
+function assertWorkDate(label: string, value: string): void {
+  if (typeof value !== "string" || !WORK_DATE.test(value)) {
+    throw new InvalidInputError(`${label} must be a calendar date in YYYY-MM-DD form.`);
+  }
+  const parsed = new Date(`${value}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) {
+    throw new InvalidInputError(`${label} is not a real calendar date: ${value}.`);
+  }
+}
+
+/** Minutes are whole and never negative; the schema's CHECKs are the backstop, not the message. */
+function assertMinutes(label: string, value: number): void {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new InvalidInputError(`${label} must be a whole number of minutes, and not negative.`);
+  }
+}
+
 type KintaiProps = { accountId: string };
 
 /**
@@ -138,6 +179,7 @@ export class KintaiGatekeeper extends DurableObject<Cloudflare.Env, KintaiProps>
     anomalies: string[];
     locked: boolean;
   }> {
+    assertWorkDate("workDate", workDate);
     const now = Date.now();
     const employeeId = await this.#requireEmployee(now);
     return {
@@ -152,6 +194,8 @@ export class KintaiGatekeeper extends DurableObject<Cloudflare.Env, KintaiProps>
   }
 
   async setAllocations(workDate: string, entries: AllocationEntry[]): Promise<Reconciliation> {
+    assertWorkDate("workDate", workDate);
+    for (const entry of entries) assertMinutes(`allocation for ${entry.projectCode}`, entry.minutes);
     const now = Date.now();
     const employeeId = await this.#requireEmployee(now);
     await this.#store.assertWritable(workDate);
@@ -159,9 +203,17 @@ export class KintaiGatekeeper extends DurableObject<Cloudflare.Env, KintaiProps>
   }
 
   async submitOvertime(requestedFor: string, minutes: number, reason: string): Promise<number> {
+    assertWorkDate("requestedFor", requestedFor);
+    assertMinutes("minutes", minutes);
     const now = Date.now();
     const employeeId = await this.#requireEmployee(now);
     const profile = await this.#store.employeeProfile(employeeId);
+    // Deliberately NO `assertWritable`, the only write path here without one. A period lock closes
+    // the *record* — punches and allocations — and `periods.ts` frames the amendment path as the
+    // way to change a closed period. A submission IS that channel: it is a request for approval,
+    // not an edit to the ledger, and refusing it would leave an employee who missed the cutoff with
+    // no way to raise the overtime at all. `submitOvertime` already pins its own checks (exemption,
+    // approver reachability) to `requestedFor` rather than to now, for the same reason.
     return this.#store.submitOvertime({
       employeeId, requestedFor, minutes, reason, now,
       department: profile.department, employmentType: profile.employment_type,
