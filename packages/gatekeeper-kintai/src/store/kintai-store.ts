@@ -1,6 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import { applySchema } from "./schema.js";
+import {
+  createEmployee, grantExemption, isExempt, linkAccount, resolveAccount,
+  type NewEmployee,
+} from "./employees.js";
+import type { EmployeeId } from "../types.js";
 
 @validateRpc()
 export class KintaiStore extends DurableObject<Cloudflare.Env> {
@@ -22,5 +27,28 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
       )
       .toArray()
       .map((row) => row.name);
+  }
+
+  async createEmployee(input: NewEmployee): Promise<EmployeeId> {
+    return createEmployee(this.sql, input);
+  }
+
+  async linkAccount(
+    accountId: string, employeeId: EmployeeId, now: number,
+    linkedBy?: EmployeeId, reason?: string,
+  ): Promise<void> {
+    linkAccount(this.sql, accountId, employeeId, now, linkedBy, reason);
+  }
+
+  async resolveAccount(accountId: string, at: number): Promise<EmployeeId | null> {
+    return resolveAccount(this.sql, accountId, at);
+  }
+
+  async grantExemption(employeeId: EmployeeId, from: number, to?: number): Promise<void> {
+    grantExemption(this.sql, employeeId, from, to);
+  }
+
+  async isExempt(employeeId: EmployeeId, at: number): Promise<boolean> {
+    return isExempt(this.sql, employeeId, at);
   }
 }
