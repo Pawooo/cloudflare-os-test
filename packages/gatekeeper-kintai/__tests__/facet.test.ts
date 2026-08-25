@@ -10,7 +10,8 @@ import { jstWorkDate } from "../src/kintai.js";
 // `KINTAI_FACET_HOST` is a test-only Durable Object (see `__tests__/worker.ts`) standing in for the
 // Overseer: it performs the exact production expression,
 // `ctx.facets.get(name, () => ({ class: ctx.exports.KintaiGatekeeper({ props: { accountId } }) }))`,
-// and hands back the resulting stub.
+// then opens a session on it with `startSession()` and forwards each call into that session — the
+// same two steps the Overseer takes, in the same order.
 let store: ReturnType<typeof env.KINTAI_STORE.getByName>;
 let seq = 0;
 
@@ -21,8 +22,11 @@ beforeEach(() => {
 });
 
 /**
- * A caller's view of their own facet. Every property access becomes a forwarded call, so the
- * facet's real signature — not a hand-written proxy's — is what any argument has to get past.
+ * A caller's view of their own session. Every property access becomes a forwarded call, so the
+ * session's real signature — not a hand-written proxy's — is what any argument has to get past.
+ *
+ * The route is the production one end to end: the host installs the account-imbued class as a
+ * facet, calls `startSession()` on it, and forwards to the session that comes back.
  */
 function facetFor(accountId: string) {
   const host = env.KINTAI_FACET_HOST.getByName("overseer");
@@ -31,7 +35,7 @@ function facetFor(accountId: string) {
     get(_target, method) {
       // Not a thenable: `await facetFor(...)` must not resolve this proxy into a call to `then`.
       if (typeof method !== "string" || method === "then") return undefined;
-      return (...args: unknown[]) => host.callFacet(accountId, name, method, args);
+      return (...args: unknown[]) => host.callSession(accountId, name, method, args);
     },
   }) as any;
 }

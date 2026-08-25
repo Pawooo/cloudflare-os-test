@@ -7,7 +7,16 @@
     "watch_dir": "src",
   },
   "compatibility_date": "2026-02-02",
-  "compatibility_flags": ["nodejs_als"],
+  // `allow_irrevocable_stub_storage` is required, not cosmetic: the Workshop persists the
+  // `Fetcher<GatekeeperUser>` returned by `createAccount()` into the user Durable Object's storage,
+  // and workerd refuses to store a stub whose TARGET worker lacks this flag
+  // ("DataCloneError: Cannot store this stub because the target worker does not have the
+  // allow_irrevocable_stub_storage compatibility flag enabled"). Without it every provisioning
+  // attempt fails and no user ever gets a Kintai account. Every account-provisioning gatekeeper in
+  // this repo carries it.
+  "compatibility_flags": ["allow_irrevocable_stub_storage", "nodejs_als"],
+  // src/types.txt is the agent-facing KintaiSession .d.ts, imported as a string module.
+  "rules": [{ "type": "Text", "globs": ["**/*.txt"], "fallthrough": false }],
   // KintaiStore is reached through ctx.exports; no binding is required.
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["KintaiStore", "KintaiGatekeeper"] },

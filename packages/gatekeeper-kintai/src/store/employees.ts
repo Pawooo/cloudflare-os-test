@@ -75,6 +75,30 @@ export function linkAccount(
   );
 }
 
+/**
+ * Close this account's open link, if it has one. Returns whether one was open.
+ *
+ * This is the whole of account revocation, and deliberately so: it is the inverse of the closing
+ * half of `linkAccount`, not a deletion. The employee record and every punch, allocation and
+ * submission hanging off it are payroll history the company must keep; what stops is the
+ * capability's ability to resolve to that employee. Idempotent — closing an already-closed (or
+ * never-opened) account is a no-op, so a repeated `revoke()` cannot rewrite the original
+ * `valid_to`.
+ *
+ * There is no matching "unlink employee": HR re-points an employee at a new account with
+ * `linkAccount`, which closes whatever was open on either side.
+ */
+export function unlinkAccount(sql: SqlStorage, accountId: string, now: number): boolean {
+  const cursor = sql.exec(
+    `UPDATE account_links SET valid_to = ? WHERE account_id = ? AND valid_to IS NULL`,
+    now, accountId,
+  );
+  // Drain the cursor before reading rowsWritten; SqlStorage reports it only once the statement has
+  // actually run.
+  cursor.toArray();
+  return cursor.rowsWritten > 0;
+}
+
 /** The employee this account mapped to at `at`, or null if it mapped to none. */
 export function resolveAccount(
   sql: SqlStorage,

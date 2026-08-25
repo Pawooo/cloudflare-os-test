@@ -1,0 +1,240 @@
+// Kintai (勤怠) is the company attendance ledger: clock punches, per-project hour allocations, and
+// overtime requests routed to approvers through the organisation chart.
+//
+// The session is ambient and already scoped to ONE employee: the caller. Identity arrives out of
+// band with the capability itself, so NO method takes an employee identifier, and there is no way
+// to ask about somebody else. `listPendingApprovals()` is the one place another employee's data
+// appears, and only because the caller is an approver for it in the org chart.
+//
+// Every timestamp is taken from the server clock. Work dates are JST (Asia/Tokyo, no DST) calendar
+// dates in `YYYY-MM-DD` form; a punch is attributed to the JST date it happened on.
+//
+// A new account is NOT usable until HR links it to an employee record. Until then `whoAmI()`
+// returns `{ linked: false, employeeId: null }` and every other method throws
+// `KINTAI_ACCOUNT_NOT_LINKED`. Call `whoAmI()` first and tell the user to contact HR rather than
+// retrying.
+//
+// Errors carry a machine-readable code as the first token of the message, e.g.
+// `KINTAI_PERIOD_LOCKED: 2026-07 is closed`. The codes are:
+//
+// - `KINTAI_ACCOUNT_NOT_LINKED` — this account has no employee record yet.
+// - `KINTAI_INVALID_INPUT` — a malformed date or a negative/fractional minute count.
+// - `KINTAI_PERIOD_LOCKED` — the month is closed for payroll; the record can no longer be edited.
+// - `KINTAI_NOT_AUTHORIZED` — the caller is not an approver for this submission at its current
+//   step. Also returned for a submission belonging to someone else, so it reveals nothing.
+// - `KINTAI_SELF_APPROVAL` — nobody may act on their own submission.
+// - `KINTAI_EXEMPT_EMPLOYEE` — 管理監督者 (a manager exempt from overtime premiums) cannot file
+//   overtime.
+// - `KINTAI_NO_ROUTE` / `KINTAI_NO_APPROVER` — no approval route matches, or nobody can approve.
+// - `KINTAI_NOT_FOUND` — no such submission.
+// - `KINTAI_INVALID_TRANSITION` — the submission is not in a state that allows this.
+
+/** A clock event. `break_start`/`break_end` bracket unpaid time inside a shift. */
+export type PunchKind = "in" | "out" | "break_start" | "break_end";
+
+/** How a punch's coordinates were obtained. */
+export type LocationSource = "gps" | "denied" | "unavailable" | "manual";
+
+/** Optional geolocation attached to a punch, used to match a registered work site. */
+export type PunchLocation = {
+  source: LocationSource;
+  latitude?: number;
+  longitude?: number;
+  accuracyM?: number;
+};
+
+/**
+ * One recorded punch, as stored. `occurred_at` and `recorded_at` differ only for administrative
+ * corrections; a punch made through this session has them equal. A superseded punch is never
+ * deleted — `supersedes_id` chains a correction back to what it replaced.
+ */
+export type PunchRow = {
+  id: number;
+  employee_id: number;
+  work_date: string;
+  kind: PunchKind;
+  occurred_at: number;
+  recorded_at: number;
+  source: "gadget" | "admin" | "import";
+  latitude: number | null;
+  longitude: number | null;
+  accuracy_m: number | null;
+  location_source: LocationSource | null;
+  matched_site_id: number | null;
+  supersedes_id: number | null;
+  amended_by: number | null;
+  amend_reason: string | null;
+};
+
+/** One line of a day's project allocation. `minutes` must be a whole, non-negative number. */
+export type AllocationEntry = {
+  projectCode: string;
+  minutes: number;
+  note?: string;
+};
+
+/** A stored allocation line. Editing a day supersedes the previous version rather than erasing it. */
+export type AllocationRow = {
+  id: number;
+  employee_id: number;
+  work_date: string;
+  project_code: string;
+  minutes: number;
+  note: string | null;
+  version: number;
+  superseded_by: number | null;
+};
+
+/**
+ * How the day's allocated minutes compare with the minutes actually worked from the punch record.
+ * A discrepancy is information, never a rejection: `setAllocations()` succeeds either way.
+ */
+export type Reconciliation = {
+  allocatedMinutes: number;
+  workedMinutes: number;
+  /** `allocatedMinutes - workedMinutes`. Negative means the day is under-allocated. */
+  discrepancyMinutes: number;
+};
+
+/**
+ * Everything known about one work date for the caller.
+ *
+ * `anomalies` explains a day whose `workedMinutes` looks wrong, and is why it travels with the
+ * reconciliation: an unpaired clock-in contributes ZERO minutes rather than an open-ended run, so
+ * without this the day would just look short with no reason attached. Values:
+ *
+ * - `unpaired_in` — clocked in and never out (the usual cause of a short day).
+ * - `unpaired_break` — a break was started and never ended.
+ * - `orphan_out` — clocked out with no matching clock-in. A shift crossing JST midnight produces
+ *   `unpaired_in` on the first date and `orphan_out` on the second; that is expected, not an error.
+ * - `duplicate_in` — clocked in twice without clocking out.
+ * - `negative_gross` — punches are out of order; the record needs an administrative correction.
+ *
+ * `locked` means the month is closed for payroll: reads still work, writes throw
+ * `KINTAI_PERIOD_LOCKED`.
+ */
+export type KintaiDay = {
+  punches: PunchRow[];
+  allocations: AllocationRow[];
+  reconciliation: Reconciliation;
+  anomalies: string[];
+  locked: boolean;
+};
+
+/** Lifecycle of an overtime request. `return` puts it back to `draft` for the employee to amend. */
+export type SubmissionState = "draft" | "pending" | "approved" | "rejected" | "withdrawn";
+
+/** What an approver can do to a submission at its current step. */
+export type ApprovalAction = "approve" | "reject" | "return";
+
+/**
+ * An overtime request. `route_snapshot` is the approval route frozen as JSON at submission time, so
+ * a later reorganisation cannot retroactively change who was required to approve; `current_step`
+ * indexes into it.
+ */
+export type SubmissionRow = {
+  id: number;
+  employee_id: number;
+  kind: "overtime";
+  requested_for: string;
+  state: SubmissionState;
+  submitted_at: number | null;
+  current_step: number;
+  minutes: number;
+  reason: string;
+  calculation_inputs: string | null;
+  route_snapshot: string;
+  created_by: number | null;
+};
+
+/** Who the capability belongs to. `linked` is false until HR maps the account to an employee. */
+export type KintaiIdentity = {
+  linked: boolean;
+  employeeId: number | null;
+};
+
+/** Receipt for a recorded punch, including the JST work date it was attributed to. */
+export type PunchReceipt = {
+  punchId: number;
+  employeeId: number;
+  workDate: string;
+};
+
+/**
+ * The caller's own attendance record, plus the approval queue they are responsible for.
+ *
+ * This capability speaks for exactly one employee and cannot be pointed at another. Reads are
+ * authorized as observations before any data is returned.
+ */
+export interface KintaiSession {
+  /**
+   * Which employee this capability speaks for.
+   *
+   * The only method that does not throw on an unlinked account — a new hire before HR sets them up
+   * is an ordinary state the UI has to be able to explain. Call this first.
+   */
+  whoAmI(): Promise<KintaiIdentity>;
+
+  /**
+   * Record a clock event at the current server time, on today's JST work date.
+   *
+   * A repeat of the same kind within one minute is treated as a double-tap and returns the original
+   * punch rather than creating a second one. Pass `location` only if the user has actually granted
+   * geolocation; `{ source: "denied" }` records the refusal honestly.
+   *
+   * Throws `KINTAI_PERIOD_LOCKED` if today's month is already closed.
+   */
+  punch(kind: PunchKind, location?: PunchLocation): Promise<PunchReceipt>;
+
+  /** Everything recorded for one JST work date: punches, allocations, reconciliation, anomalies. */
+  getDay(workDate: string): Promise<KintaiDay>;
+
+  /**
+   * Replace the whole allocation set for one work date, superseding whatever was there.
+   *
+   * This is a full replacement, not a merge: entries you omit are dropped. Read `getDay()` first
+   * and send back the complete list. Allocations need not sum to the minutes worked; the returned
+   * reconciliation reports the difference rather than refusing.
+   */
+  setAllocations(workDate: string, entries: AllocationEntry[]): Promise<Reconciliation>;
+
+  /**
+   * File an overtime request for a past or current work date and return its submission id.
+   *
+   * The approval route is chosen from the employee's department and employment type and frozen onto
+   * the submission. Filing is deliberately still allowed for a closed month — a submission is a
+   * request for approval, not an edit to the ledger, so an employee who missed the cutoff can still
+   * raise it.
+   */
+  submitOvertime(requestedFor: string, minutes: number, reason: string): Promise<number>;
+
+  /** Take back one of the caller's own pending submissions. */
+  withdrawSubmission(submissionId: number): Promise<void>;
+
+  /** Send a returned (`draft`) submission back into the queue. The only way out of `draft`. */
+  resubmit(submissionId: number): Promise<void>;
+
+  /** The caller's own submissions, newest first. */
+  listMySubmissions(): Promise<SubmissionRow[]>;
+
+  /**
+   * Submissions awaiting the caller's decision, oldest first.
+   *
+   * Derived from the org chart at call time: it lists exactly those submissions the caller could
+   * actually act on right now, and is empty for an employee who approves nothing.
+   */
+  listPendingApprovals(): Promise<SubmissionRow[]>;
+
+  /**
+   * Approve, reject, or return one submission from `listPendingApprovals()`, and get the state it
+   * moved to. `approve` on the last step approves the submission; earlier steps advance it.
+   *
+   * Nobody may act on their own submission, and naming a submission the caller is not an approver
+   * for throws `KINTAI_NOT_AUTHORIZED` regardless of whether it exists in a different state.
+   */
+  actOnSubmission(
+    submissionId: number,
+    action: ApprovalAction,
+    comment?: string,
+  ): Promise<SubmissionState>;
+}

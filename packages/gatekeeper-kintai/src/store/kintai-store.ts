@@ -7,6 +7,7 @@ import {
 } from "./allocations.js";
 import {
   createEmployee, employeeProfile, grantExemption, isExempt, linkAccount, resolveAccount,
+  unlinkAccount,
   type EmployeeProfile, type NewEmployee,
 } from "./employees.js";
 import {
@@ -62,6 +63,11 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
     linkedBy?: EmployeeId, reason?: string,
   ): Promise<void> {
     linkAccount(this.sql, accountId, employeeId, now, linkedBy, reason);
+  }
+
+  /** Close an account's open link. Account revocation — never a delete. See `unlinkAccount`. */
+  async unlinkAccount(accountId: string, now: number): Promise<boolean> {
+    return unlinkAccount(this.sql, accountId, now);
   }
 
   async resolveAccount(accountId: string, at: number): Promise<EmployeeId | null> {
