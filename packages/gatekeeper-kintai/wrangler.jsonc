@@ -1,0 +1,20 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "gatekeeper-kintai",
+  "main": ".wrangler/validate/src/worker.ts",
+  "build": {
+    "command": "pnpm exec capnweb-validate build --out .wrangler/validate",
+    "watch_dir": "src",
+  },
+  "compatibility_date": "2026-02-02",
+  "compatibility_flags": ["nodejs_als"],
+  // KintaiStore is reached through ctx.exports; no binding is required.
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["KintaiStore", "KintaiGatekeeper"] },
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": { "invocation_logs": false },
+  },
+}
