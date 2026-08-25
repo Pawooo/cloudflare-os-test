@@ -21,6 +21,14 @@ export type AuditRow = {
   after: string | null;
 };
 
+// Normalises an optional before/after value for storage: omitted, undefined, and an explicit
+// null all mean "no value" and must all land as SQL NULL — not the JSON text "null", which would
+// pass the json_valid CHECK but silently break `WHERE before IS NULL` and hand readers a literal
+// "null" string instead of a real null. Anything else is stringified as JSON.
+function toJsonColumn(value: unknown): string | null {
+  return value === undefined || value === null ? null : JSON.stringify(value);
+}
+
 /**
  * Authority-relevant changes only: account linking, org edges, exemptions, route configuration and
  * period locks. Attendance data is not duplicated here — punches, allocations and approval_events
@@ -32,8 +40,8 @@ export function appendAudit(sql: SqlStorage, entry: AuditEntry): void {
        (at, actor_employee_id, action, entity, entity_id, before, after)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
     entry.at, entry.actorEmployeeId, entry.action, entry.entity, entry.entityId ?? null,
-    entry.before === undefined ? null : JSON.stringify(entry.before),
-    entry.after === undefined ? null : JSON.stringify(entry.after),
+    toJsonColumn(entry.before),
+    toJsonColumn(entry.after),
   );
 }
 

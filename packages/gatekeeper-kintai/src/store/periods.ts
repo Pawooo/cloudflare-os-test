@@ -32,12 +32,30 @@ export function isLocked(sql: SqlStorage, workDate: string): boolean {
 export function lockPeriod(
   sql: SqlStorage, period: string, lockedBy: EmployeeId, now: number,
 ): void {
+  // OR IGNORE, not OR REPLACE: there is no unlock anywhere in this package, so a second call for
+  // an already-locked period cannot be a legitimate re-close after a reopen — it's a duplicate
+  // call. The first close is the fact worth keeping for audit ("who closed this, and when"), so a
+  // repeat becomes a harmless no-op rather than silently overwriting locked_at/locked_by. If a
+  // reopen-then-reclose flow is ever introduced, this needs revisiting — it would have to record
+  // the new close explicitly, which it would need to do anyway to record the reopen itself.
   sql.exec(
-    `INSERT OR REPLACE INTO period_locks (period, locked_at, locked_by) VALUES (?, ?, ?)`,
+    `INSERT OR IGNORE INTO period_locks (period, locked_at, locked_by) VALUES (?, ?, ?)`,
     period, now, lockedBy,
   );
 }
 
 export function assertWritable(sql: SqlStorage, workDate: string): void {
   if (isLocked(sql, workDate)) throw new PeriodLockedError(periodOf(workDate));
+}
+
+export type PeriodLock = { lockedAt: number; lockedBy: EmployeeId };
+
+/** The lock record for `period`, or null if it isn't locked. Test-only introspection. */
+export function periodLock(sql: SqlStorage, period: string): PeriodLock | null {
+  const row = sql
+    .exec<{ locked_at: number; locked_by: EmployeeId }>(
+      `SELECT locked_at, locked_by FROM period_locks WHERE period = ?`, period,
+    )
+    .toArray()[0];
+  return row ? { lockedAt: row.locked_at, lockedBy: row.locked_by } : null;
 }

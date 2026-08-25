@@ -26,7 +26,7 @@ import {
   createRoute, resolveRoute,
   type NewRoute, type RouteCriteria, type RouteSnapshot,
 } from "../routes.js";
-import { assertWritable, isLocked, lockPeriod } from "./periods.js";
+import { assertWritable, isLocked, lockPeriod, periodLock, type PeriodLock } from "./periods.js";
 import { appendAudit, auditEntries, type AuditEntry, type AuditRow } from "./audit.js";
 import type { EmployeeId, SubmissionState } from "../types.js";
 
@@ -204,6 +204,11 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
 
   async assertWritable(workDate: string): Promise<void> {
     assertWritable(this.sql, workDate);
+  }
+
+  /** The lock record for `period`, or null if it isn't locked. Test-only introspection. */
+  async periodLock(period: string): Promise<PeriodLock | null> {
+    return periodLock(this.sql, period);
   }
 
   async appendAudit(entry: AuditEntry): Promise<void> {
