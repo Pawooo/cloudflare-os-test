@@ -22,7 +22,7 @@ import { createSite, matchSite, type NewSite } from "./sites.js";
 import {
   actOnSubmission, approvalEvents, getSubmission, listSubmissionsFor, pendingApprovalsFor,
   previewAct, resubmit, submitOvertime, withdrawSubmission,
-  type ActCheck, type ActInput, type ActPreview, type ApprovalEventRow, type NewSubmission,
+  type ActCheck, type ActInput, type ActProbe, type ApprovalEventRow, type NewSubmission,
   type SubmissionRow,
 } from "./submissions.js";
 import {
@@ -206,8 +206,11 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
    * same `checkMayAct`, so they cannot drift. It exists because `KintaiSession.actOnSubmission`
    * now queues the decision for human confirmation rather than performing it, and asking a manager
    * to confirm something that will be refused on apply is worse than refusing it immediately.
+   *
+   * It also returns the staleness marker (`ActProbe.afterEventId`), read in this same call so the
+   * authority verdict and the marker describe one consistent version of the submission.
    */
-  async previewActOnSubmission(input: ActCheck): Promise<ActPreview> {
+  async previewActOnSubmission(input: ActCheck): Promise<ActProbe> {
     return previewAct(this.sql, input);
   }
 

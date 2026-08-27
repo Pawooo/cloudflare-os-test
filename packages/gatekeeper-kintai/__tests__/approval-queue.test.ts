@@ -265,7 +265,7 @@ describe("applying", () => {
     // The staged actor is server-derived, and it must STILL be who this facet speaks for. An
     // account re-pointed at somebody else must not be able to spend a decision staged by its
     // previous holder.
-    const { bossAccount, submissionId } = await pendingUnderManager();
+    const { boss, bossAccount, submissionId } = await pendingUnderManager();
     await sessionFor(bossAccount).actOnSubmission(submissionId, "approve");
 
     const successor = await store.createEmployee({
@@ -276,10 +276,18 @@ describe("applying", () => {
     await expect(() => overseerFor(bossAccount).applyAction(1))
       .rejects.toThrow(/KINTAI_STALE_ACTOR/);
     expect(await store.approvalEvents(submissionId)).toEqual([]);
+
+    // The row went back to `pending`, not left `applying`. This is not bookkeeping: `rejectAction`
+    // also refuses an `applying` row, so a decision stuck in that state would be unappliable AND
+    // unclearable until the Durable Object restarts. HR re-points the account back and the same
+    // decision applies — which it can only do from `pending`.
+    await store.linkAccount(bossAccount, boss, Date.now());
+    await overseerFor(bossAccount).applyAction(1);
+    expect((await store.getSubmission(submissionId)).state).toBe("approved");
   });
 
   it("refuses when the account has been revoked between staging and approval", async () => {
-    const { bossAccount, submissionId } = await pendingUnderManager();
+    const { boss, bossAccount, submissionId } = await pendingUnderManager();
     await sessionFor(bossAccount).actOnSubmission(submissionId, "approve");
 
     await store.unlinkAccount(bossAccount, Date.now());
@@ -287,6 +295,13 @@ describe("applying", () => {
     await expect(() => overseerFor(bossAccount).applyAction(1))
       .rejects.toThrow(/KINTAI_ACCOUNT_NOT_LINKED/);
     expect(await store.approvalEvents(submissionId)).toEqual([]);
+
+    // Reset to `pending`, for the same reason as above: nothing was sent to the store, a revoked
+    // account can be re-linked, and the Overseer offers the user a retry that must be able to
+    // succeed. A row left `applying` would be permanently unappliable and unrejectable.
+    await store.linkAccount(bossAccount, boss, Date.now());
+    await overseerFor(bossAccount).applyAction(1);
+    expect((await store.getSubmission(submissionId)).state).toBe("approved");
   });
 
   it("leaves a refused action retryable rather than consuming it", async () => {
@@ -694,5 +709,229 @@ describe("a decision cannot be applied twice concurrently", () => {
     const after = await store.getSubmission(submissionId);
     expect(after.state).toBe("pending");
     expect(after.current_step).toBe(1);
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// Idempotent staging.
+//
+// `actOnSubmission` used to stage unconditionally, so two calls made one intent into two staged
+// rows and two queue entries. On a multi-step route the two human confirmations then land as
+// approvals at two DIFFERENT steps — one manager's single decision, two signatures — and none of
+// it can be undone: `approved` is terminal, `revertAction` refuses, and `approval_events` is
+// append-only.
+//
+// The mechanism is a partial unique index over the open states, not an application-level check:
+// `#stage` is synchronous SQLite with no `await` in it, so check-and-insert cannot interleave.
+
+/** A worker with two managers, and a two-step route that only their department resolves to. */
+async function twoStepUnderTwoManagers(department: string, requestedFor = "2026-08-03") {
+  const { employeeId: bossA, accountId: bossAAccount } = await linkedEmployee("boss-a");
+  const { employeeId: bossB, accountId: bossBAccount } = await linkedEmployee("boss-b");
+  const { employeeId: worker } = await linkedEmployee("two-step-worker", { department });
+  await store.setReportingLine(worker, bossA, 0);
+  await store.setReportingLine(worker, bossB, 0);
+  // Scoped to a department, exactly as the concurrency test above is, and for the same reason:
+  // this store is shared by every test file and `resolveRoute` breaks a specificity tie by lowest
+  // id, so a catch-all route from another test would otherwise silently win.
+  await store.createRoute({
+    name: `stale-route-${department}-${seq}`,
+    department,
+    steps: [
+      { rule: "any_of", approverKind: "manager", approverEmployeeId: null },
+      { rule: "any_of", approverKind: "manager", approverEmployeeId: null },
+    ],
+  });
+  const submissionId = await store.submitOvertime({
+    employeeId: worker, requestedFor, minutes: 60, reason: "two-step",
+    now: Date.now(), department, employmentType: null,
+  });
+  // Guard the guard: prove the two-step route is the one that was snapshotted.
+  expect(JSON.parse((await store.getSubmission(submissionId)).route_snapshot).steps)
+    .toHaveLength(2);
+  return { bossA, bossAAccount, bossB, bossBAccount, worker, submissionId };
+}
+
+describe("staging the same decision twice", () => {
+  it("stages once and queues once when two identical calls race", async () => {
+    const { bossAccount, submissionId } = await pendingUnderManager();
+    const session = sessionFor(bossAccount);
+
+    const results = await Promise.allSettled([
+      session.actOnSubmission(submissionId, "approve", "ok"),
+      session.actOnSubmission(submissionId, "approve", "ok"),
+    ]);
+
+    // Both callers succeed — a retry is the normal response to a transient failure and must not
+    // become an error — but there is only ever one decision.
+    expect(results.map((r) => r.status)).toEqual(["fulfilled", "fulfilled"]);
+    expect((await host.readQueue()).actions).toHaveLength(1);
+    await expect(() => overseerFor(bossAccount).applyAction(2))
+      .rejects.toThrow(/KINTAI_UNKNOWN_ACTION/);
+
+    await overseerFor(bossAccount).applyAction(1);
+    expect(await store.approvalEvents(submissionId)).toHaveLength(1);
+  });
+
+  it("gives a sequential retry the id it already staged, and queues nothing new", async () => {
+    const { bossAccount, submissionId } = await pendingUnderManager();
+    const session = sessionFor(bossAccount);
+
+    await session.actOnSubmission(submissionId, "approve", "ok");
+    await session.actOnSubmission(submissionId, "approve", "ok");
+
+    expect((await host.readQueue()).actions).toHaveLength(1);
+    expect((await host.readQueue()).actions[0].action).toBe(1);
+    await expect(() => overseerFor(bossAccount).applyAction(2))
+      .rejects.toThrow(/KINTAI_UNKNOWN_ACTION/);
+  });
+
+  it("refuses a DIFFERENT decision while one is awaiting confirmation", async () => {
+    // Silently replacing a decision the manager may already be looking at in the Workshop is worse
+    // than an error, so this is a refusal rather than an overwrite.
+    const { bossAccount, submissionId } = await pendingUnderManager();
+    const session = sessionFor(bossAccount);
+    await session.actOnSubmission(submissionId, "approve", "ok");
+
+    await expect(() => session.actOnSubmission(submissionId, "reject"))
+      .rejects.toThrow(/KINTAI_DECISION_CONFLICT/);
+    // The error names the decision that is already pending, or the manager cannot act on it.
+    await expect(() => session.actOnSubmission(submissionId, "reject"))
+      .rejects.toThrow(/approve/);
+    // A different comment is a different decision: the approver confirms the comment too.
+    await expect(() => session.actOnSubmission(submissionId, "approve", "actually, no"))
+      .rejects.toThrow(/KINTAI_DECISION_CONFLICT/);
+
+    // Nothing extra was queued, and the original decision is untouched and still appliable.
+    expect((await host.readQueue()).actions).toHaveLength(1);
+    await overseerFor(bossAccount).applyAction(1);
+    expect((await store.getSubmission(submissionId)).state).toBe("approved");
+    expect(await store.approvalEvents(submissionId)).toMatchObject([{ comment: "ok" }]);
+  });
+
+  it("lets the decision be staged again once the first has been discarded", async () => {
+    // The index covers the OPEN states only: a discarded decision must not block deciding again.
+    const { bossAccount, submissionId } = await pendingUnderManager();
+    const session = sessionFor(bossAccount);
+    await session.actOnSubmission(submissionId, "approve");
+    await overseerFor(bossAccount).rejectAction(1);
+
+    await session.actOnSubmission(submissionId, "reject");
+
+    expect((await host.readQueue()).actions).toHaveLength(2);
+    await overseerFor(bossAccount).applyAction(2);
+    expect((await store.getSubmission(submissionId)).state).toBe("rejected");
+  });
+
+  it("still accepts a retry when the account is already at the pending cap", async () => {
+    // The cap is counted after the insert and the row rolled back if it does not fit, rather than
+    // checked before it. Checking first would make the ONE call that adds nothing — a retry of a
+    // decision already staged — the call that fails at the boundary.
+    const { bossAccount, worker } = await pendingUnderManager();
+    const session = sessionFor(bossAccount);
+
+    const ids: number[] = [];
+    for (let i = 0; i < 51; i++) {
+      ids.push(await store.submitOvertime({
+        employeeId: worker, requestedFor: "2026-08-20", minutes: 30, reason: `cap ${i}`,
+        now: Date.now(), department: null, employmentType: null,
+      }));
+    }
+    for (let i = 0; i < 50; i++) await session.actOnSubmission(ids[i], "approve");
+
+    // Full — and a retry of one that is already staged still succeeds.
+    await expect(session.actOnSubmission(ids[49], "approve")).resolves.toBeUndefined();
+    // ...while a genuinely new decision is still refused.
+    await expect(() => session.actOnSubmission(ids[50], "approve"))
+      .rejects.toThrow(/KINTAI_TOO_MANY_PENDING_ACTIONS/);
+    // The refused one left nothing behind: 50 staged rows, 50 queue entries.
+    expect((await host.readQueue()).actions).toHaveLength(50);
+  });
+
+  it("keeps two managers' decisions on the same submission apart", async () => {
+    // The index is per (submission, actor). Two approvers deciding on one submission are two
+    // decisions, and neither may swallow the other.
+    const { bossAAccount, bossBAccount, submissionId } = await twoStepUnderTwoManagers("DEDUPE-2");
+
+    await sessionFor(bossAAccount).actOnSubmission(submissionId, "approve");
+    await sessionFor(bossBAccount).actOnSubmission(submissionId, "approve");
+
+    expect((await host.readQueue()).actions).toHaveLength(2);
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// The apply-time staleness guard.
+//
+// A staged decision is a photograph of the submission at stage time. Hours or days later the world
+// may have moved past it — another approver signed, the employee's request was returned and
+// refiled — and applying it then records a decision about something the manager never saw.
+//
+// The marker is `MAX(approval_events.id)`, read in the SAME store call as the authority check at
+// stage time and compared in the SAME store call as the write at apply time. Not a timestamp
+// (caller-supplied, non-monotonic — this package already rejected timestamps for the return
+// boundary) and not `current_step` (resets to 0 on a return, so a returned-and-refiled submission
+// looks identical to what a stale row recorded).
+
+describe("a staged decision the world has moved past", () => {
+  it("is refused at apply after another approver acted on the same submission", async () => {
+    const { bossA, bossAAccount, bossB, submissionId } = await twoStepUnderTwoManagers("STALE-1");
+    expect(bossA).toBeGreaterThan(0);
+
+    await sessionFor(bossAAccount).actOnSubmission(submissionId, "approve");
+
+    // The other manager signs step 0 first, advancing the submission to step 1.
+    await store.actOnSubmission({
+      submissionId, actorId: bossB, action: "approve", now: Date.now(),
+    });
+    expect((await store.getSubmission(submissionId)).current_step).toBe(1);
+
+    // Without the guard this lands as a SECOND approval, counted at step 1 — which satisfies the
+    // final step and approves the submission outright on one manager's single decision.
+    await expect(() => overseerFor(bossAAccount).applyAction(1))
+      .rejects.toThrow(/KINTAI_STALE_DECISION/);
+
+    expect(await store.approvalEvents(submissionId)).toHaveLength(1);
+    const after = await store.getSubmission(submissionId);
+    expect(after.state).toBe("pending");
+    expect(after.current_step).toBe(1);
+  });
+
+  it("is refused at apply after the submission was returned and refiled", async () => {
+    // `current_step` is back to 0 and the state is back to `pending`, so neither the state machine
+    // nor a step comparison can see anything wrong. The event log can.
+    const { boss, bossAccount, worker, submissionId } = await pendingUnderManager();
+
+    await sessionFor(bossAccount).actOnSubmission(submissionId, "approve", "fine by me");
+
+    await store.actOnSubmission({
+      submissionId, actorId: boss, action: "return", now: Date.now(),
+    });
+    await store.resubmit(submissionId, worker, Date.now());
+    const refiled = await store.getSubmission(submissionId);
+    expect(refiled.state).toBe("pending");
+    expect(refiled.current_step).toBe(0);
+
+    await expect(() => overseerFor(bossAccount).applyAction(1))
+      .rejects.toThrow(/KINTAI_STALE_DECISION/);
+
+    // Only the return is on the record; the approval of content the manager never saw is not.
+    expect(await store.approvalEvents(submissionId)).toMatchObject([{ action: "return" }]);
+    expect((await store.getSubmission(submissionId)).state).toBe("pending");
+  });
+
+  it("applies normally when the submission already had history that has not moved", async () => {
+    // The guard compares the marker; it does not refuse merely because events exist. A decision
+    // staged at step 1 of a route whose step 0 was already signed must still apply.
+    const { bossAAccount, bossB, submissionId } = await twoStepUnderTwoManagers("STALE-3");
+    await store.actOnSubmission({
+      submissionId, actorId: bossB, action: "approve", now: Date.now(),
+    });
+
+    await sessionFor(bossAAccount).actOnSubmission(submissionId, "approve");
+    await overseerFor(bossAAccount).applyAction(1);
+
+    expect((await store.getSubmission(submissionId)).state).toBe("approved");
+    expect(await store.approvalEvents(submissionId)).toHaveLength(2);
   });
 });

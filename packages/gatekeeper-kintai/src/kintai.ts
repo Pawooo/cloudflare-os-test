@@ -194,7 +194,22 @@ export type StagedApproval = {
   actorId: EmployeeId;
   action: ApprovalAction;
   comment?: string;
+  /**
+   * The submission's approval history as it stood when authority was checked, from the same
+   * `previewActOnSubmission` call. Carried onto the row and re-checked at apply time — see
+   * `ActInput.expectedAfterEventId`.
+   */
+  afterEventId: number;
 };
+
+/**
+ * What staging produced: the decision's id, and whether it was ALREADY there.
+ *
+ * `deduped` is not bookkeeping — it decides whether a queue entry is submitted. Two entries for
+ * one decision means two human confirmations, and on a multi-step route those land as approvals at
+ * two different steps.
+ */
+export type StageResult = { id: number; deduped: boolean };
 
 /**
  * The narrow staging capability handed to a session: record one decision, return its id.
@@ -203,7 +218,7 @@ export type StagedApproval = {
  * `RpcTarget` with no storage of its own, and handing it the facet would hand it `applyAction` too
  * — the ability to perform the very write the queue exists to gate.
  */
-export type StageApproval = (staged: StagedApproval) => number;
+export type StageApproval = (staged: StagedApproval) => StageResult;
 export type DiscardApproval = (stagedId: number) => void;
 
 /** The opaque observer ids currently recorded on the facet. See `KintaiGatekeeper.addObserver`. */
@@ -255,6 +270,30 @@ export class StaleActorError extends Error {
     super(
       "KINTAI_STALE_ACTOR: this account no longer speaks for the employee who staged this " +
       "decision, so it will not be applied on their behalf.",
+    );
+  }
+}
+
+/**
+ * Refused when this actor already has a DIFFERENT decision on the same submission awaiting
+ * confirmation.
+ *
+ * The alternative would be to replace the pending one, and that is worse: the approver may be
+ * looking at it in the Workshop right now, and the Gadget that issued both is code the account
+ * holder can rewrite. An identical re-issue is not this — that is a retry, and it is answered with
+ * the id already staged.
+ *
+ * It names the pending decision because the caller has to be able to act on the message, and it
+ * discloses nothing new: only somebody who has just passed `checkMayAct` for this submission can
+ * reach it.
+ */
+export class ConflictingDecisionError extends Error {
+  readonly code = "KINTAI_DECISION_CONFLICT";
+  constructor(pending: { id: number; action: ApprovalAction }, submissionId: number) {
+    super(
+      `KINTAI_DECISION_CONFLICT: a '${pending.action}' decision on submission ${submissionId} is ` +
+      `already awaiting confirmation as action ${pending.id}. Confirm or discard it before ` +
+      "deciding differently on the same submission.",
     );
   }
 }
@@ -879,6 +918,15 @@ export class KintaiSession extends RpcTarget {
    * Still returns nothing, as it always did. A queued action is applied later, by a different
    * call, and cannot return the resulting state to this caller: read the outcome back from
    * `listMySubmissions()` (as the employee) or `listPendingApprovals()` (as the approver).
+   *
+   * STAGING IS IDEMPOTENT per (submission, actor). Re-issuing the same decision returns the one
+   * already staged and queues nothing further; a different decision while one is pending is
+   * refused (`ConflictingDecisionError`). Without that, one manager's single intent became two
+   * queue entries, two confirmations and — on a multi-step route — two sign-offs at two different
+   * steps, none of which can be undone: `approved` is terminal, `revertAction` refuses, and
+   * `approval_events` is append-only. A retry is the ordinary response to a transient failure and
+   * becomes more so as natural language drives this, so it has to be safe rather than merely
+   * discouraged in the agent-facing docs.
    */
   async actOnSubmission(
     submissionId: number, action: ApprovalAction, comment?: string,
@@ -887,11 +935,20 @@ export class KintaiSession extends RpcTarget {
     const now = Date.now();
     const actorId = await this.#requireEmployee(now);
 
-    const preview = await this.#store.previewActOnSubmission({ submissionId, actorId, now });
+    const probe = await this.#store.previewActOnSubmission({ submissionId, actorId, now });
 
-    const stagedId = this.#stageApproval({ submissionId, actorId, action, comment });
+    const { id: stagedId, deduped } = this.#stageApproval({
+      submissionId, actorId, action, comment, afterEventId: probe.afterEventId,
+    });
+    // Already staged, and already in front of the approver: this call is a retry of a decision
+    // that was recorded, not a second decision. Returning without queueing again is the whole
+    // point — two entries would be two confirmations, and on a multi-step route those land as
+    // approvals at two different steps from one manager's single intent.
+    if (deduped) return;
     try {
-      await this.#approvalQueue.submitAction(stagedId, describeApproval(preview, action, comment));
+      await this.#approvalQueue.submitAction(
+        stagedId, describeApproval(probe.preview, action, comment),
+      );
     } catch (err) {
       // No approver will ever see this action, so nothing can ever apply it. Drop the row rather
       // than leaving an unreachable decision sitting in the facet's storage against the cap.
@@ -911,6 +968,11 @@ type StagedRow = {
   staged_at: number;
   state: "pending" | "applying" | "applied" | "failed";
   error: string | null;
+  /**
+   * `latestEventId` for the submission when this decision was staged, or NULL on a row staged
+   * before this column existed. See `applyAction` for what NULL means there.
+   */
+  staged_after_event_id: number | null;
 };
 
 /**
@@ -949,8 +1011,42 @@ export class KintaiGatekeeper
       comment TEXT,
       staged_at INTEGER NOT NULL,
       state TEXT NOT NULL CHECK (state IN ('pending', 'applying', 'applied', 'failed')),
-      error TEXT
+      error TEXT,
+      staged_after_event_id INTEGER
     ) STRICT`);
+    // Facets created before the staleness guard existed have the table without that column. Added
+    // nullable, which is the only thing ADD COLUMN can do without a default, and NULL is read as
+    // "staged before the guard" rather than as a marker value — see `applyAction`.
+    if (!this.#hasColumn("staged_approvals", "staged_after_event_id")) {
+      this.#sql.exec(`ALTER TABLE staged_approvals ADD COLUMN staged_after_event_id INTEGER`);
+    }
+    // ONE open decision per (submission, actor). This index is the dedupe mechanism, not a
+    // convenience on top of one: `#stage` is synchronous SQLite with no `await` in it, so an
+    // INSERT that the index rejects cannot have interleaved with the one that beat it — the same
+    // property the apply-time claim relies on. An application-level "is there already one?" check
+    // would be a second answer to a question the index already answers, and the kind that drifts.
+    //
+    // `applying` is in scope as well as `pending`: a decision that is mid-apply must not admit a
+    // second one for the same submission and actor. `applied` and `failed` are out, so a settled
+    // decision never blocks deciding again.
+    //
+    // A facet that predates the index may hold rows it would reject, and CREATE UNIQUE INDEX fails
+    // outright on those — which would make this constructor throw on every activation and brick
+    // the facet. So the duplicates are collapsed first, keeping the OLDEST open decision for each
+    // pair: it is the one that was staged first and the one the approver is most likely already
+    // looking at. This runs once, on the first activation after the upgrade, and is a no-op
+    // afterwards because the index then makes duplicates impossible.
+    this.#sql.exec(
+      `DELETE FROM staged_approvals
+       WHERE state IN ('pending', 'applying') AND id NOT IN (
+         SELECT MIN(id) FROM staged_approvals
+         WHERE state IN ('pending', 'applying')
+         GROUP BY submission_id, actor_employee_id
+       )`,
+    );
+    this.#sql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS staged_approvals_open
+      ON staged_approvals(submission_id, actor_employee_id)
+      WHERE state IN ('pending', 'applying')`);
     // The collaborators the Overseer has told this facet about. Recorded, not merely accepted,
     // because `listPendingApprovals` has to name them: it returns other employees' payroll records
     // and the Overseer needs to know who must not see them. Opaque ids chosen by the Overseer —
@@ -973,6 +1069,14 @@ export class KintaiGatekeeper
     return this.ctx.exports.KintaiStore.getByName("");
   }
 
+  /** Whether a table already has a column, for the one-way migrations in the constructor. */
+  #hasColumn(table: string, column: string): boolean {
+    return this.#sql
+      .exec<{ name: string }>(`PRAGMA table_info(${table})`)
+      .toArray()
+      .some((row) => row.name === column);
+  }
+
   #staged(id: number): StagedRow | undefined {
     return this.#sql
       .exec<StagedRow>(`SELECT * FROM staged_approvals WHERE id = ?`, id)
@@ -989,26 +1093,78 @@ export class KintaiGatekeeper
    * Record one decision. The narrow capability behind `StageApproval` — the session gets this and
    * `#discard`, and nothing else that touches this table.
    */
-  #stage(staged: StagedApproval): number {
+  #stage(staged: StagedApproval): StageResult {
+    // No `await` anywhere in this method, and that is load-bearing: a Durable Object's input gate
+    // is open across an await, so a check split from its insert by one would let two concurrent
+    // callers both stage. Everything here is one synchronous run-to-completion block.
+    const inserted = this.#sql
+      .exec<{ id: number }>(
+        `INSERT INTO staged_approvals
+           (submission_id, actor_employee_id, action, comment, staged_at, state,
+            staged_after_event_id)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?)
+         ON CONFLICT DO NOTHING
+         RETURNING id`,
+        staged.submissionId, staged.actorId, staged.action, staged.comment ?? null, Date.now(),
+        staged.afterEventId,
+      )
+      .toArray()[0];
+
+    if (!inserted) return this.#openDecision(staged);
+
     // Bounded for the same reason as `LIMITS`: the code calling this is a Gadget the employee can
     // rewrite, and it can call in a loop. An unbounded staging table would let one account fill
     // its own facet's storage and the Overseer's approval queue with decisions nobody asked for.
+    //
+    // Counted AFTER the insert, and the row is rolled back if it does not fit. Checking first
+    // would make a retry of an already-staged decision fail once the account is at the cap, when
+    // it is the one call that adds nothing — and a retry is the normal response to a transient
+    // failure, so it has to keep working right up to the limit.
     const { count } = this.#sql
       .exec<{ count: number }>(
         `SELECT count(*) AS count FROM staged_approvals WHERE state IN ('pending', 'applying')`,
       )
       .one();
-    if (count >= MAX_PENDING_STAGED_ACTIONS) {
+    if (count > MAX_PENDING_STAGED_ACTIONS) {
+      this.#sql.exec(`DELETE FROM staged_approvals WHERE id = ?`, inserted.id);
       throw new TooManyPendingActionsError(MAX_PENDING_STAGED_ACTIONS);
     }
-    return this.#sql
-      .exec<{ id: number }>(
-        `INSERT INTO staged_approvals
-           (submission_id, actor_employee_id, action, comment, staged_at, state)
-         VALUES (?, ?, ?, ?, ?, 'pending') RETURNING id`,
-        staged.submissionId, staged.actorId, staged.action, staged.comment ?? null, Date.now(),
+    return { id: inserted.id, deduped: false };
+  }
+
+  /**
+   * The insert was refused by `staged_approvals_open`, so this actor already has an open decision
+   * on this submission. Which of the two things that means depends on whether it is the SAME
+   * decision:
+   *
+   *  - the same one re-issued (same action, same comment) is a retry. It gets the id that is
+   *    already staged, and its caller submits no second queue entry.
+   *  - a different one is refused. See `ConflictingDecisionError` for why replacing is worse.
+   *
+   * The comment counts as part of the decision because the approver confirms the comment too: it
+   * is rendered into the description they read, and it is written to the permanent approval event.
+   */
+  #openDecision(staged: StagedApproval): StageResult {
+    const open = this.#sql
+      .exec<StagedRow>(
+        `SELECT * FROM staged_approvals
+         WHERE submission_id = ? AND actor_employee_id = ? AND state IN ('pending', 'applying')`,
+        staged.submissionId, staged.actorId,
       )
-      .one().id;
+      .toArray()[0];
+    if (!open) {
+      // Unreachable: `staged_approvals_open` is the only constraint an ON CONFLICT DO NOTHING can
+      // trip here, and it matches exactly this query. Refusing is still the safe direction if it
+      // ever happens — the harm this whole mechanism exists to prevent is staging a duplicate.
+      throw new Error(
+        "KINTAI_DECISION_CONFLICT: this decision could not be staged, and no decision awaiting " +
+        "confirmation explains why. Nothing was recorded.",
+      );
+    }
+    if (open.action !== staged.action || (open.comment ?? undefined) !== staged.comment) {
+      throw new ConflictingDecisionError(open, staged.submissionId);
+    }
+    return { id: open.id, deduped: true };
   }
 
   #observers(): string[] {
@@ -1200,6 +1356,12 @@ export class KintaiGatekeeper
         action: row.action,
         now,
         comment: row.comment ?? undefined,
+        // The store compares this to the submission's history in the same call as the write, so
+        // nothing can slip in between the check and the insert. NULL means a row staged before
+        // this column existed: those keep the behaviour they were staged under (authority and
+        // state re-checked, no staleness check) rather than being made permanently unappliable by
+        // an upgrade.
+        expectedAfterEventId: row.staged_after_event_id ?? undefined,
       });
     } catch (err) {
       if (isDomainRefusal(err)) {

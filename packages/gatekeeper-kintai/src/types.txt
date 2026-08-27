@@ -263,9 +263,19 @@ export interface KintaiSession {
    * only performed once the account holder confirms it — which may be minutes or days later, or
    * never. Returning without throwing means "submitted", not "done".
    *
-   * Do NOT poll for the result or re-issue the call: the submission is unchanged until the
-   * decision is confirmed, and calling again just queues a second decision. Nothing else here
-   * simulates the pending change either, so every read still shows the submission as `pending`.
+   * Do NOT poll for the result: the submission is unchanged until the decision is confirmed, and
+   * nothing here simulates the pending change, so every read still shows it as `pending`.
+   *
+   * Re-issuing the SAME decision (same action, same comment) is safe. It is recognised as the one
+   * already awaiting confirmation and does not queue a second one, so a retry after a transient
+   * failure cannot turn one intent into two sign-offs. Issuing a DIFFERENT decision while one is
+   * still awaiting confirmation throws `KINTAI_DECISION_CONFLICT`: the pending one must be
+   * confirmed or discarded first, because a human may be looking at it right now.
+   *
+   * A decision is applied to the submission as it stood when you made it. If the submission is
+   * acted on in the meantime — another approver signs it, it is returned, the employee refiles it
+   * — the confirmed decision is refused with `KINTAI_STALE_DECISION` instead of being recorded
+   * against something its approver never saw. Read the submission again and decide afresh.
    *
    * Authority is checked twice: once now, so an invalid decision is refused immediately rather
    * than put in front of a human, and again when the confirmed decision is applied — the

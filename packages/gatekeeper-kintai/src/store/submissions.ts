@@ -43,6 +43,16 @@ export type ActCheck = {
 export type ActInput = ActCheck & {
   action: ApprovalAction;
   comment?: string;
+  /**
+   * The submission's approval history as it stood when this decision was made — `latestEventId`
+   * at that moment. Refuse if it has moved since. Omit for a decision made and performed in the
+   * same call, which has no "since".
+   *
+   * Passed INTO the write rather than checked by the caller beforehand, because a caller-side
+   * check would read the marker over one RPC and write over another, leaving exactly the window
+   * this is meant to close. Here the comparison and the `INSERT` are one synchronous run.
+   */
+  expectedAfterEventId?: number;
 };
 
 export type SubmissionRow = {
@@ -111,6 +121,26 @@ export class InvalidTransitionError extends Error {
   readonly code = "KINTAI_INVALID_TRANSITION";
   constructor(from: SubmissionState) {
     super(`KINTAI_INVALID_TRANSITION: a submission in state '${from}' cannot be acted on.`);
+  }
+}
+
+/**
+ * Refused when a decision made earlier is applied to a submission whose approval history has moved
+ * on since — another approver signed, it was returned, it was refiled.
+ *
+ * Distinct from `InvalidTransitionError`, which catches only the cases where the submission left
+ * `pending`. The dangerous cases are the ones where it is STILL `pending` and still looks
+ * actionable: a decision staged before a return and applied after the employee refiled would be
+ * recorded as a sign-off on content the approver never saw.
+ */
+export class StaleDecisionError extends Error {
+  readonly code = "KINTAI_STALE_DECISION";
+  constructor() {
+    super(
+      "KINTAI_STALE_DECISION: this submission has been acted on since this decision was made, so " +
+      "the decision no longer applies to what it was made about. Discard it and decide again on " +
+      "the submission as it now stands.",
+    );
   }
 }
 
@@ -252,6 +282,28 @@ function lastReturnEventId(sql: SqlStorage, submissionId: number): number {
       `SELECT MAX(id) AS id FROM approval_events
        WHERE submission_id = ? AND action = 'return'`,
       submissionId,
+    )
+    .one();
+  return row.id ?? 0;
+}
+
+/**
+ * The id of this submission's most recent approval event, or 0 if it has none yet.
+ *
+ * The staleness marker: a decision records this when it is made and refuses to be applied if it
+ * has changed. `approval_events.id` is `INTEGER PRIMARY KEY AUTOINCREMENT`, so it is monotonic by
+ * construction and never reused — the same reason `lastReturnEventId` uses row ids rather than
+ * `at`, since every time in this system is caller-supplied and therefore not monotonic.
+ *
+ * 0 rather than NULL for "no events yet", matching `lastReturnEventId`: ids start at 1, so 0 is
+ * unambiguous, and it keeps the comparison a plain `!==` in every case rather than one that has to
+ * remember that `NULL` is not equal to itself. A freshly filed submission nobody has acted on gets
+ * a real marker like any other.
+ */
+function latestEventId(sql: SqlStorage, submissionId: number): number {
+  const row = sql
+    .exec<{ id: number | null }>(
+      `SELECT MAX(id) AS id FROM approval_events WHERE submission_id = ?`, submissionId,
     )
     .one();
   return row.id ?? 0;
@@ -440,18 +492,39 @@ export type ActPreview = {
 };
 
 /**
- * Run the authority prologue WITHOUT writing, and report what an approver needs to see.
+ * What `previewAct` answers: the display half, and the staleness marker.
+ *
+ * Two fields rather than one flat object on purpose. `ActPreview` is display-only and says so, and
+ * `describeApproval` renders every field of it into text a human reads; `afterEventId` decides
+ * whether a decision may be applied at all. Flattening the marker into `ActPreview` would put a
+ * load-bearing value into a type whose contract is that nothing in it decides anything, and the
+ * next person to add a display field would have no way to know which kind they were adding.
+ */
+export type ActProbe = {
+  preview: ActPreview;
+  /** `latestEventId` at the moment authority was checked. See `ActInput.expectedAfterEventId`. */
+  afterEventId: number;
+};
+
+/**
+ * Run the authority prologue WITHOUT writing, and report what an approver needs to see, plus the
+ * marker that says which version of the submission they are being shown.
  *
  * This is how a decision can be staged for human confirmation without a second implementation of
  * "who may approve": it and `actOnSubmission` share `checkMayAct`, so they cannot disagree. It
  * writes nothing, and it returns nothing at all to a caller who has not already proven they may
  * act — so it discloses no more than `actOnSubmission` itself always has.
+ *
+ * The marker is read HERE, in the same call as the authority check, and not by the caller
+ * afterwards. Two calls would leave a window in which precisely the thing the marker guards
+ * against — somebody else acting — could happen between them, and the decision would then be
+ * stamped with a marker for a submission it was never shown.
  */
-export function previewAct(sql: SqlStorage, input: ActCheck): ActPreview {
+export function previewAct(sql: SqlStorage, input: ActCheck): ActProbe {
   const { submission, snapshot } = checkMayAct(sql, input);
   const employee = employeeLabel(sql, submission.employee_id);
   const actor = employeeLabel(sql, input.actorId);
-  return {
+  const preview: ActPreview = {
     employeeName: employee.display_name,
     employeeNumber: employee.employee_number,
     actorName: actor.display_name,
@@ -461,10 +534,23 @@ export function previewAct(sql: SqlStorage, input: ActCheck): ActPreview {
     stepNumber: submission.current_step + 1,
     stepCount: snapshot.steps.length,
   };
+  return { preview, afterEventId: latestEventId(sql, submission.id) };
 }
 
 export function actOnSubmission(sql: SqlStorage, input: ActInput): SubmissionState {
   const { submission, snapshot, step, authorizingEdge } = checkMayAct(sql, input);
+
+  // AFTER authority, before any write. Ordered after `checkMayAct` for the same reason state is:
+  // this error names something about the submission, and only somebody who may act on it may
+  // learn that. Before the insert because a stale decision must leave no trace at all — and
+  // because throwing here keeps the guarantee `isDomainRefusal` rests on, that every `KINTAI_`
+  // error out of this function comes from before the write.
+  if (
+    input.expectedAfterEventId !== undefined &&
+    latestEventId(sql, submission.id) !== input.expectedAfterEventId
+  ) {
+    throw new StaleDecisionError();
+  }
 
   sql.exec(
     `INSERT INTO approval_events
