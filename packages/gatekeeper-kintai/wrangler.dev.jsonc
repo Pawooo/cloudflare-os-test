@@ -1,0 +1,43 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "gatekeeper-kintai",
+  "main": ".wrangler/validate/src/worker.ts",
+  "build": {
+    "command": "\"/Users/shemberkoandrian/.nvm/versions/node/v24.15.0/bin/node\" \"/Users/shemberkoandrian/Documents/cloudflare-os-test/node_modules/.pnpm/capnweb-validate@0.3.0_capnweb@0.12.0_esbuild@0.28.1_rollup@4.62.3_vite@7.3.6_@types+no_06715193e91fd8bea3f73bcc789112d6/node_modules/capnweb-validate/dist/cli.cjs\" build --out .wrangler/validate",
+    "watch_dir": "src",
+    "cwd": "/Users/shemberkoandrian/Documents/cloudflare-os-test/packages/gatekeeper-kintai"
+  },
+  "compatibility_date": "2026-02-02",
+  "compatibility_flags": [
+    "allow_irrevocable_stub_storage",
+    "nodejs_als"
+  ],
+  "rules": [
+    {
+      "type": "Text",
+      "globs": [
+        "**/*.txt"
+      ],
+      "fallthrough": false
+    }
+  ],
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "KintaiStore",
+        "KintaiGatekeeper"
+      ]
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": {
+      "invocation_logs": false
+    }
+  },
+  "vars": {
+    "BASE_URL": "http://localhost:8787/gatekeeper/kintai"
+  }
+}
