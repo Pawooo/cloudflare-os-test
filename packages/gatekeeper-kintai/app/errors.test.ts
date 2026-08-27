@@ -46,6 +46,29 @@ describe("describeFailure", () => {
       .toBe("That employee record no longer exists. Reload the roster and try again.");
   });
 
+  // Every employee id this page sends comes from a select, so `Number("")` is `0` and the API
+  // answers with a fact about an argument. What the reader did was forget to pick somebody — and
+  // with the sandbox making `required` inert, this is the likeliest failure on the screen.
+  it.each([
+    "KINTAI_INVALID_INPUT: employee must be a positive employee id.",
+    "KINTAI_INVALID_INPUT: manager must be a positive employee id.",
+    "KINTAI_INVALID_INPUT: designated approver must be a positive employee id.",
+  ])("turns %o into something the reader can act on", (message) => {
+    expect(describeFailure(new Error(message), "fallback"))
+      .toBe("Choose someone from the list first.");
+  });
+
+  // The rewrite is keyed on the detail, so it must not swallow its neighbours under the same code.
+  it("leaves other invalid-input details alone", () => {
+    expect(describeFailure(
+      new Error("KINTAI_INVALID_INPUT: employee number is required."), "fallback",
+    )).toBe("Employee number is required.");
+    expect(describeFailure(
+      new Error("KINTAI_INVALID_INPUT: this employee is already recorded as 管理監督者."),
+      "fallback",
+    )).toBe("This employee is already recorded as 管理監督者.");
+  });
+
   it("keeps 管理監督者 and other non-Latin text intact when capitalising", () => {
     expect(describeFailure(
       new Error("KINTAI_NO_APPROVER: 管理監督者 exemption missing for employee 3."),

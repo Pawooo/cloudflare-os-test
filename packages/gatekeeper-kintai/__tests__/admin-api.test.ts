@@ -57,6 +57,7 @@ const CALL_ARGS: Record<string, unknown[]> = {
   createEmployee: [{ employeeNumber: "X-1", displayName: "X", joinedOn: "2026-04-01" }],
   linkAccount: ["acct-victim", 1],
   setReportingLine: [1, 2],
+  grantExemption: [1],
 };
 
 /**
@@ -67,9 +68,33 @@ const CALL_ARGS: Record<string, unknown[]> = {
  * interface means adding it here and deciding what it does to a non-admin.
  */
 const INTERFACE_MEMBERS = [
-  "createEmployee", "linkAccount", "listEmployees", "listReportingLines", "setReportingLine",
-  "whoAmI",
+  "createEmployee", "grantExemption", "linkAccount", "listEmployees", "listReportingLines",
+  "setReportingLine", "whoAmI",
 ];
+
+/**
+ * The exact fields every reading method hands the browser.
+ *
+ * `INTERFACE_MEMBERS` pins method NAMES, and that turned out to be half a pin: `listEmployees`
+ * went from returning the raw `employees` row to returning `RosterEntry` — four more fields,
+ * including every employee's position in the org chart — without a single name changing, so
+ * nothing here had to move and nothing noticed. `toMatchObject` elsewhere in the suite is
+ * permissive in the same direction: it cannot see a field that was added.
+ *
+ * So the shapes are written out too. Widening what an admin-only read returns is a decision about
+ * what leaves the worker, and it should have to be made here, in the file a reviewer already opens
+ * to see what this surface exposes. Pinned by CALLING each method, as the surface test is, rather
+ * than against a type that would move with the code.
+ */
+const RETURN_SHAPES: Record<string, string[]> = {
+  whoAmI: ["accountId", "employeeId", "linked"],
+  listEmployees: [
+    "approverReachable", "departed_on", "department", "designated_approver_id", "display_name",
+    "employee_number", "employment_type", "exempt", "id", "joined_on", "linked", "managerIds",
+    "status",
+  ],
+  listReportingLines: ["employee_id", "id", "manager_id", "valid_from", "valid_to"],
+};
 
 /** The names a caller can actually invoke on `cls` over RPC. */
 function callableSurface(cls: { prototype: object }): string[] {
@@ -136,6 +161,41 @@ describe("the capability a non-admin receives", () => {
   it("keeps the admin capability to exactly the interface too", () => {
     expect(callableSurface(AdminKintaiApi)).toEqual(INTERFACE_MEMBERS.toSorted());
   });
+
+  /**
+   * The other half of the pin: not just which methods exist, but what they hand back.
+   *
+   * A method that starts returning more fields widens this surface without touching a single name,
+   * which is exactly how `listEmployees` grew four fields in part 2. Every reading method is called
+   * for real and its keys compared against a written-out list; the writes are checked to return
+   * nothing, so one cannot start leaking an id or a row on the way out.
+   */
+  it("returns exactly the fields written down for each read, and nothing from the writes",
+    async () => {
+      const hr = appUi(`acct-shape-${seq}`, true);
+      const employeeId = await employee("Shape");
+      const managerId = await employee("ShapeBoss");
+      await hr.linkAccount(`acct-shape-linked-${seq}`, employeeId);
+      await hr.setReportingLine(employeeId, managerId);
+
+      expect(Object.keys(await hr.whoAmI()).toSorted()).toEqual(RETURN_SHAPES.whoAmI);
+      for (const method of ["listEmployees", "listReportingLines"]) {
+        const rows = await hr[method]();
+        expect(rows.length, `${method} returned nothing to inspect`).toBeGreaterThan(0);
+        for (const row of rows) {
+          expect(Object.keys(row).toSorted(), method).toEqual(RETURN_SHAPES[method]);
+        }
+      }
+
+      // The mutations answer with nothing. `createEmployee` is the one exception and answers with
+      // the id it created, which the caller has no other way to learn.
+      expect(await hr.linkAccount(`acct-shape-two-${seq}`, employeeId)).toBeUndefined();
+      expect(await hr.setReportingLine(managerId, employeeId)).toBeUndefined();
+      expect(await hr.grantExemption(employeeId)).toBeUndefined();
+      expect(typeof await hr.createEmployee({
+        employeeNumber: `E-shape-${seq}`, displayName: "Shaped", joinedOn: "2026-04-01",
+      })).toBe("number");
+    });
 
   it("still answers whoAmI, which is how an employee reads their code for HR", async () => {
     const accountId = `acct-unlinked-${seq}`;
@@ -413,6 +473,76 @@ describe("what an admin may write", () => {
   });
 });
 
+describe("recording 管理監督者", () => {
+  // The case this method exists for, and the one the roster could otherwise only be made green
+  // for by writing a reporting line that does not exist. A company officer reports to nobody.
+  it("completes an employee who reports to nobody, without inventing a manager", async () => {
+    const hr = appUi(`acct-admin-exempt-${seq}`, true);
+    const officer = await employee("Officer");
+    await hr.linkAccount(`acct-officer-${seq}`, officer);
+
+    const before = (await hr.listEmployees()).find((row: { id: number }) => row.id === officer);
+    expect(before).toMatchObject({ linked: true, exempt: false, approverReachable: false });
+
+    await hr.grantExemption(officer);
+
+    const after = (await hr.listEmployees()).find((row: { id: number }) => row.id === officer);
+    // Ready, and with an EMPTY manager list: nothing false was written into the org chart.
+    expect(after).toMatchObject({ exempt: true, approverReachable: true, managerIds: [] });
+    expect(await store.listReportingLines())
+      .not.toContainEqual(expect.objectContaining({ employee_id: officer }));
+  });
+
+  // `hasReachableApprover` is what `submitOvertime` enforces through, so the roster's verdict has
+  // to be the runtime's verdict and not a second reading that happens to agree today.
+  it("makes the runtime agree that the employee can now file", async () => {
+    const hr = appUi(`acct-admin-exempt-runtime-${seq}`, true);
+    const officer = await employee("Runtime Officer");
+
+    await expect(() => store.assertApproverReachable(officer, Date.now()))
+      .rejects.toThrow(/KINTAI_NO_APPROVER/);
+    await hr.grantExemption(officer);
+    await store.assertApproverReachable(officer, Date.now());
+  });
+
+  it("opens the period now and leaves it open", async () => {
+    const hr = appUi(`acct-admin-exempt-open-${seq}`, true);
+    const officer = await employee("Open Officer");
+    const before = Date.now();
+
+    await hr.grantExemption(officer);
+
+    expect(await store.isExempt(officer, before - 1)).toBe(false);
+    expect(await store.isExempt(officer, Date.now() + 10 * 365 * 24 * 60 * 60 * 1000)).toBe(true);
+  });
+
+  // Not a new rule: the check is `isExempt`, the same function the premium calculation asks. A
+  // second open period changes no answer and leaves two rows claiming to be the determination.
+  it("refuses a second exemption for someone who already has one", async () => {
+    const hr = appUi(`acct-admin-exempt-twice-${seq}`, true);
+    const officer = await employee("Twice Officer");
+    await hr.grantExemption(officer);
+
+    await expect(() => hr.grantExemption(officer))
+      .rejects.toThrow(/KINTAI_INVALID_INPUT.*already recorded as 管理監督者/);
+  });
+
+  it("refuses an employee who does not exist", async () => {
+    await expect(() => appUi(`acct-admin-exempt-ghost-${seq}`, true).grantExemption(999_999))
+      .rejects.toThrow(/KINTAI_NOT_FOUND/);
+  });
+
+  // 管理監督者 exempts overtime from a premium under 労働基準法 §37. An employee who could record
+  // it for themselves could write their own exemption into the payroll record.
+  it("is refused to a non-administrator", async () => {
+    const officer = await employee("Self Officer");
+
+    await expect(() => appUi(`acct-nonadmin-exempt-${seq}`, false).grantExemption(officer))
+      .rejects.toThrow(/KINTAI_ADMIN_REQUIRED/);
+    expect(await store.isExempt(officer, Date.now())).toBe(false);
+  });
+});
+
 describe("the audit trail", () => {
   // src/store/audit.ts promises to record "account linking, org edges, exemptions, route
   // configuration and period locks". Before part 1 nothing in the runtime called `appendAudit` at
@@ -478,6 +608,27 @@ describe("the audit trail", () => {
     // entity_id is the org_edges row itself, so the entry joins back to the authority it granted.
     expect(entry).toMatchObject({ entity: "org_edges", actor_employee_id: adminEmployee });
     expect(JSON.parse(entry.after!)).toMatchObject({ employeeId: worker, managerId: boss });
+  });
+
+  // `audit.ts` names exemptions among the authority-relevant changes it exists to record, and
+  // until now nothing wrote one. 管理監督者 decides whether an employee's overtime bears a premium
+  // at all, so who recorded it, and which period, is what an inspection asks for.
+  it("records who recorded a 管理監督者 exemption, naming the period it opened", async () => {
+    const adminEmployee = await employee("Determiner");
+    const adminAccount = `acct-audit-exempt-${seq}`;
+    await store.linkAccount(adminAccount, adminEmployee, Date.now());
+    const officer = await employee("Audited Officer");
+
+    await appUi(adminAccount, true).grantExemption(officer);
+
+    const entries = (await store.auditEntries())
+      .filter((row) => row.action === "grant_exemption");
+    const entry = entries.at(-1)!;
+    expect(entry).toMatchObject({ entity: "exemption_periods", actor_employee_id: adminEmployee });
+    // entity_id is the exemption_periods row itself, so the entry joins back to the determination.
+    expect(entry.entity_id).toEqual(expect.any(Number));
+    expect(JSON.parse(entry.after!))
+      .toMatchObject({ employeeId: officer, kind: "kanri_kantokusha" });
   });
 
   // A real case: the first administrator acts before anybody is onboarded, so they have no

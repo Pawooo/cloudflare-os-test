@@ -81,6 +81,23 @@ export interface KintaiAdminApi {
 
   /** Open a reporting line from `employeeId` to `managerId`, effective now. Admin only. */
   setReportingLine(employeeId: EmployeeId, managerId: EmployeeId): Promise<void>;
+
+  /**
+   * Record that `employeeId` is 管理監督者, from now, open-ended. Admin only.
+   *
+   * Here because it is the only way to complete an employee at the top of the organisation
+   * honestly. `hasReachableApprover` accepts three answers, and the other two both require someone
+   * above them: a reporting line, or a designated approver. For a company officer there is nobody,
+   * so without this the only route to a usable record is a reporting line that does not exist —
+   * writing a fiction into the org chart to get a green tick, in the table an audit reads.
+   *
+   * 管理監督者 is also the status this is really about. It is a determination under 労働基準法 §41
+   * about a specific person's authority and treatment, and it decides whether their overtime bears
+   * a premium at all. It belongs to HR, is recorded rather than derived, and is exactly the kind of
+   * thing an inspection asks to see the provenance of — which is why it is audited and why the
+   * period keeps its own row rather than becoming a flag on `employees`.
+   */
+  grantExemption(employeeId: EmployeeId): Promise<void>;
 }
 
 // Re-exported so worker-side callers of this API read its return type from the API's own module.
@@ -262,6 +279,42 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
   }
 
   /**
+   * Record a 管理監督者 period, open from now.
+   *
+   * Additive, exactly as `setReportingLine` is: the period opens at the server's clock and stays
+   * open, and there is no way here to close one, back-date one, or edit one. That is the same
+   * decision for the same reason — this table is a temporal record an audit reads, and a control
+   * that rewrites it is a different feature with a different review. Ending an exemption is a
+   * genuine gap and a deliberate one.
+   *
+   * Refused when the employee is ALREADY 管理監督者 at this instant. Not a new rule: the check is
+   * `isExempt`, the same function `hasReachableApprover` and the premium calculation ask. A second
+   * open period would change nothing about the answer and would leave two rows claiming to be the
+   * determination, which is the sort of thing that has to be explained later. A period that has
+   * been closed is not in the way — `isExempt` is false then, and a fresh grant is right.
+   *
+   * The window is `Date.now()` here, never an argument: when someone became 管理監督者 decides
+   * which of their past overtime was premium-bearing, and that is not a caller's to choose.
+   */
+  async grantExemption(employeeId: EmployeeId): Promise<void> {
+    const now = Date.now();
+    assertEmployeeId("employee", employeeId);
+    await this.#assertEmployeeExists(employeeId);
+    if (await this.#store.isExempt(employeeId, now)) {
+      throw new InvalidInputError(
+        "this employee is already recorded as 管理監督者. Ending an exemption is not supported " +
+        "here yet.",
+      );
+    }
+    const actorEmployeeId = await this.#actor(now);
+    const periodId = await this.#store.grantExemption(employeeId, now);
+    await this.#store.appendAudit({
+      at: now, actorEmployeeId, action: "grant_exemption", entity: "exemption_periods",
+      entityId: periodId, after: { employeeId, kind: "kanri_kantokusha", validFrom: now },
+    });
+  }
+
+  /**
    * Reject a `NewEmployee` that the schema would accept but HR could not live with.
    *
    * `@validateRpc()` already rejects anything of the wrong TYPE, which is why nothing here
@@ -397,5 +450,14 @@ export class ViewerKintaiApi extends RpcTarget implements KintaiAdminApi {
    */
   setReportingLine(_employeeId: EmployeeId, _managerId: EmployeeId): never {
     throw new AdminRequiredError("setReportingLine");
+  }
+
+  /**
+   * Refused: 管理監督者 is a determination about an employee's authority that exempts their
+   * overtime from premium pay. Reachable by the employee it describes, it would be a way to write
+   * one's own exemption from 労働基準法 §37 into the payroll record.
+   */
+  grantExemption(_employeeId: EmployeeId): never {
+    throw new AdminRequiredError("grantExemption");
   }
 }

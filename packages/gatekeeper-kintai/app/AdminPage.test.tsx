@@ -54,6 +54,7 @@ function adminApi(overrides: Partial<KintaiAdminClient> = {}, roster: RosterEntr
     createEmployee: vi.fn<KintaiAdminClient["createEmployee"]>(async () => 42),
     linkAccount: vi.fn<KintaiAdminClient["linkAccount"]>(async () => {}),
     setReportingLine: vi.fn<KintaiAdminClient["setReportingLine"]>(async () => {}),
+    grantExemption: vi.fn<KintaiAdminClient["grantExemption"]>(async () => {}),
     ...overrides,
   };
 }
@@ -75,6 +76,9 @@ function viewerApi(overrides: Partial<KintaiAdminClient> = {}) {
     }),
     setReportingLine: vi.fn<KintaiAdminClient["setReportingLine"]>(async () => {
       throw REFUSED("setReportingLine");
+    }),
+    grantExemption: vi.fn<KintaiAdminClient["grantExemption"]>(async () => {
+      throw REFUSED("grantExemption");
     }),
     ...overrides,
   });
@@ -128,6 +132,7 @@ describe("AdminPage", () => {
       expect(api.createEmployee).not.toHaveBeenCalled();
       expect(api.linkAccount).not.toHaveBeenCalled();
       expect(api.setReportingLine).not.toHaveBeenCalled();
+      expect(api.grantExemption).not.toHaveBeenCalled();
     });
 
     // The refusal is HOW the page learns it is not talking to an administrator. It must never
@@ -240,6 +245,30 @@ describe("AdminPage", () => {
       expect(row(8).textContent).toContain("Ready · approver Tanaka");
     });
 
+    // A reporting line needs somebody to report TO. With one employee the form correctly refuses
+    // to render its fields, which used to leave the row's "Set manager" button pointing at a ref
+    // that was null — it rendered, it was clickable, and it did nothing. That failure signature is
+    // the one this page went to some trouble to eliminate, and it landed at the moment HR is most
+    // confused: the very first employee.
+    it("offers no 'Set manager' on the only employee, because there is nobody to report to",
+      async () => {
+        const alone = person({ id: 9, display_name: "First Hire", linked: true });
+        await render(<AdminPage api={adminApi({}, [alone])} />);
+
+        expect(row(9).querySelector('[data-action="manager-for-this"]')).toBeNull();
+        expect(container!.textContent)
+          .toContain("Two employee records are needed before anyone can report to anyone.");
+        // The other route out is still offered, and it is the right one for a first hire who is
+        // genuinely at the top of the organisation.
+        expect(row(9).querySelector('[data-action="exempt-this"]')).not.toBeNull();
+      });
+
+    it("offers 'Set manager' again as soon as there is somebody to report to", async () => {
+      await render(<AdminPage api={adminApi({}, [TANAKA, STRANDED])} />);
+
+      expect(row(STRANDED.id).querySelector('[data-action="manager-for-this"]')).not.toBeNull();
+    });
+
     it("says so plainly when there is nobody on the roster at all", async () => {
       await render(<AdminPage api={adminApi({}, [])} />);
 
@@ -325,6 +354,48 @@ describe("AdminPage", () => {
       expect(api.setReportingLine).toHaveBeenCalledWith(3, 1);
     });
 
+    // The only honest way to complete somebody at the top of the organisation. Without it the
+    // roster can be turned green only by writing a reporting line that does not exist — a fiction
+    // in the table an audit reads.
+    it("records a 管理監督者 exemption for someone who reports to nobody", async () => {
+      const officer = person({ id: 9, display_name: "Officer", linked: true });
+      const api = adminApi({}, [officer]);
+      await render(<AdminPage api={api} />);
+
+      await choose('[data-form="grant-exemption"] [name="employeeId"]', "9");
+      await submit("grant-exemption");
+
+      expect(api.grantExemption).toHaveBeenCalledWith(9);
+      expect(text('[data-testid="grant-exemption-notice"]'))
+        .toBe("Officer is recorded as 管理監督者 from now.");
+      // Re-read afterwards: an exemption is one of the three things that make a row ready.
+      expect(api.listEmployees).toHaveBeenCalledTimes(2);
+    });
+
+    it("offers the exemption from the row of anyone who has no approver, and preselects them",
+      async () => {
+        const officer = person({ id: 9, display_name: "Officer", linked: true });
+        const api = adminApi({}, [TANAKA, officer]);
+        await render(<AdminPage api={api} />);
+        expect(row(TANAKA.id).querySelector('[data-action="exempt-this"]')).toBeNull();
+
+        await click('[data-employee="9"] [data-action="exempt-this"]');
+        await submit("grant-exemption");
+
+        expect(api.grantExemption).toHaveBeenCalledWith(9);
+      });
+
+    it("shows an exempt employee as ready, on the exemption rather than a manager", async () => {
+      const officer = person({
+        id: 9, display_name: "Officer", linked: true, exempt: true, approverReachable: true,
+      });
+      await render(<AdminPage api={adminApi({}, [officer])} />);
+
+      expect(row(9).textContent).toContain("Ready · 管理監督者");
+      expect(row(9).querySelector('[data-action="exempt-this"]')).toBeNull();
+      expect(row(9).querySelector('[data-action="manager-for-this"]')).toBeNull();
+    });
+
     it("clears the form after a success so the next entry starts empty", async () => {
       const api = adminApi({}, [TANAKA, STRANDED]);
       await render(<AdminPage api={api} />);
@@ -360,13 +431,16 @@ describe("AdminPage", () => {
     it("runs every action from a plain button, never from form submission", async () => {
       await render(<AdminPage api={adminApi({}, [TANAKA, STRANDED])} />);
 
-      const buttons = [
-        ...container!.querySelectorAll<HTMLButtonElement>("button[data-action]"),
-      ];
+      // EVERY button, not only the ones carrying `data-action`: a button inside a form defaults to
+      // `type="submit"`, so a new one added without the attribute would be inert in production and
+      // would have slipped past a narrower selector.
+      const buttons = [...container!.querySelectorAll<HTMLButtonElement>("button")];
       expect(buttons.length).toBeGreaterThan(0);
       for (const button of buttons) {
-        expect(button.type, `${button.dataset.action} must not rely on form submission`)
-          .toBe("button");
+        expect(
+          button.type,
+          `${button.dataset.action ?? button.textContent} must not rely on form submission`,
+        ).toBe("button");
       }
     });
 

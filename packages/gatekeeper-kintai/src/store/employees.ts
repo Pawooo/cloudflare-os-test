@@ -242,17 +242,28 @@ export function designatedApproverOf(
   return row?.designated_approver_id ?? null;
 }
 
+/**
+ * Records a 管理監督者 period and returns its id.
+ *
+ * The id is returned for the same reason `setReportingLine` returns its edge id: this is an
+ * authority-relevant change, and an audit entry that cannot be joined back to the row it created
+ * only records that *something* happened. 管理監督者 decides whether an employee's overtime is
+ * premium-bearing at all, so "which period said so, and who recorded it" is the question an
+ * inspection asks.
+ */
 export function grantExemption(
   sql: SqlStorage,
   employeeId: EmployeeId,
   from: number,
   to?: number,
-): void {
-  sql.exec(
-    `INSERT INTO exemption_periods (employee_id, kind, valid_from, valid_to)
-     VALUES (?, 'kanri_kantokusha', ?, ?)`,
-    employeeId, from, to ?? null,
-  );
+): number {
+  return sql
+    .exec<{ id: number }>(
+      `INSERT INTO exemption_periods (employee_id, kind, valid_from, valid_to)
+       VALUES (?, 'kanri_kantokusha', ?, ?) RETURNING id`,
+      employeeId, from, to ?? null,
+    )
+    .one().id;
 }
 
 /**

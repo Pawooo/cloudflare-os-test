@@ -33,6 +33,25 @@ const REWRITTEN: Record<string, string> = {
 };
 
 /**
+ * Details that are correct for an API caller but wrong for the person in front of this screen.
+ *
+ * Keyed on the detail rather than the code, because `KINTAI_INVALID_INPUT` covers everything from
+ * a bad date to a blank name and almost all of it already reads well.
+ *
+ * The one entry so far is the empty dropdown. Every employee id this page sends comes from a
+ * `<select>`, and an untouched one submits `""`, which `Number("")` turns into `0` — so the API
+ * answers "employee must be a positive employee id", which is a true statement about an argument
+ * and useless as a description of what the reader did, which is forget to pick somebody. It is
+ * also now the LIKELIEST failure on the screen: the host's iframe sandbox forbids form submission,
+ * so the browser's own `required` handling never runs (see `FormCard`). The server's message stays
+ * as it is — it is right for whoever called the method directly — and this rewrites it on the way
+ * to a human. Rewriting is not re-checking: nothing here decides whether the value is valid.
+ */
+const DETAIL_REWRITES: ReadonlyArray<[RegExp, string]> = [
+  [/ must be a positive employee id\.$/, "Choose someone from the list first."],
+];
+
+/**
  * A sentence describing why something failed, or `fallback` when there is nothing to go on.
  *
  * `fallback` is required and has no default on purpose: it should say which action failed ("Couldn’t
@@ -43,7 +62,9 @@ export function describeFailure(error: unknown, fallback: string): string {
   const match = CODED.exec(message);
   if (!match) return fallback;
   const [, code, detail] = match;
-  return REWRITTEN[code] ?? capitalize(detail);
+  if (REWRITTEN[code]) return REWRITTEN[code];
+  const rewrite = DETAIL_REWRITES.find(([pattern]) => pattern.test(detail));
+  return rewrite ? rewrite[1] : capitalize(detail);
 }
 
 /** Whether this failure is the capability refusing a non-administrator. */

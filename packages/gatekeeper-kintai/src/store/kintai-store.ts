@@ -109,8 +109,9 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
     return employeeProfile(this.sql, employeeId);
   }
 
-  async grantExemption(employeeId: EmployeeId, from: number, to?: number): Promise<void> {
-    grantExemption(this.sql, employeeId, from, to);
+  /** Records a 管理監督者 period and returns its id. See `grantExemption`. */
+  async grantExemption(employeeId: EmployeeId, from: number, to?: number): Promise<number> {
+    return grantExemption(this.sql, employeeId, from, to);
   }
 
   async isExempt(employeeId: EmployeeId, at: number): Promise<boolean> {

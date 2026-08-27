@@ -16,6 +16,7 @@ export type KintaiAdminClient = {
   createEmployee(input: NewEmployee): Promise<EmployeeId>;
   linkAccount(accountId: string, employeeId: EmployeeId): Promise<void>;
   setReportingLine(employeeId: EmployeeId, managerId: EmployeeId): Promise<void>;
+  grantExemption(employeeId: EmployeeId): Promise<void>;
 };
 
 type View =
@@ -26,7 +27,7 @@ type View =
   | { status: "admin"; identity: KintaiIdentity; roster: RosterEntry[] };
 
 /** Which form a message or a spinner belongs to. Failures must land beside what failed. */
-type FormKey = "create" | "link" | "report";
+type FormKey = "create" | "link" | "report" | "exempt";
 type Notice = { kind: "ok" | "error"; text: string };
 
 /**
@@ -52,8 +53,10 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
   // Set by the roster's row actions so a form opens on the employee whose row was clicked.
   const [linkTarget, setLinkTarget] = useState<string>("");
   const [reportTarget, setReportTarget] = useState<string>("");
+  const [exemptTarget, setExemptTarget] = useState<string>("");
   const linkCodeRef = useRef<HTMLInputElement>(null);
   const managerRef = useRef<HTMLSelectElement>(null);
+  const exemptRef = useRef<HTMLSelectElement>(null);
   const live = useRef(true);
 
   useEffect(() => () => { live.current = false; }, []);
@@ -164,13 +167,22 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
         <>
           <Roster
             roster={view.roster}
+            // A reporting line needs somebody to report TO, so with one employee on the roster the
+            // form has nothing to offer and says so. The row's button is hidden to match: rendering
+            // it would leave a control that looks like the fix, is clickable, and does nothing —
+            // the same silent no-op this page went to some trouble to stop producing.
+            canSetManager={view.roster.length >= 2}
             onLink={(employee) => {
               setLinkTarget(String(employee.id));
-              reveal(linkCodeRef.current);
+              reveal(linkCodeRef.current, "link-account");
             }}
             onSetManager={(employee) => {
               setReportTarget(String(employee.id));
-              reveal(managerRef.current);
+              reveal(managerRef.current, "set-reporting-line");
+            }}
+            onExempt={(employee) => {
+              setExemptTarget(String(employee.id));
+              reveal(exemptRef.current, "grant-exemption");
             }}
           />
 
@@ -202,6 +214,19 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
                     `${nameOf(view.roster, managerId)}.`;
                 })}
             />
+            <ExemptionForm
+              roster={view.roster}
+              employeeId={exemptTarget}
+              onEmployeeId={setExemptTarget}
+              selectRef={exemptRef}
+              busy={pending === "exempt"}
+              notice={notices.exempt}
+              onSubmit={(employeeId) =>
+                submit("exempt", "Couldn’t record that exemption.", async () => {
+                  await api.grantExemption(employeeId);
+                  return `${nameOf(view.roster, employeeId)} is recorded as 管理監督者 from now.`;
+                })}
+            />
             <CreateEmployeeForm
               roster={view.roster}
               busy={pending === "create"}
@@ -223,13 +248,19 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
 /**
  * Move the reader to the control that fixes the row they just clicked.
  *
- * `scrollIntoView` is guarded because it is absent in jsdom and, more to the point, because
- * nothing about jumping to a field is worth throwing out of a click handler if a host ever
+ * Falls back to the form's card when the field is not rendered — a disabled `FormCard` renders its
+ * explanation instead of its fields, so the ref is null and focusing nothing would make the row's
+ * button look broken. Scrolling to the card at least shows the reader why the form is not there.
+ * The row hides the button in that case anyway; this is the belt to that pair of braces.
+ *
+ * `scrollIntoView` is optional-called because it is absent in jsdom and, more to the point,
+ * because nothing about jumping to a field is worth throwing out of a click handler if a host ever
  * disagrees about it. Focus is what actually matters; the scroll is a courtesy.
  */
-function reveal(node: HTMLElement | null): void {
+function reveal(node: HTMLElement | null, formAction: string): void {
+  const target = node ?? document.querySelector<HTMLElement>(`[data-form="${formAction}"]`);
   node?.focus();
-  node?.scrollIntoView?.({ block: "center" });
+  target?.scrollIntoView?.({ block: "center" });
 }
 
 /**
@@ -327,11 +358,13 @@ function AccountCard({ identity, admin }: { identity: KintaiIdentity; admin: boo
  * the manager list, because that list is shown to explain the verdict rather than to reach it.
  */
 function Roster({
-  roster, onLink, onSetManager,
+  roster, canSetManager, onLink, onSetManager, onExempt,
 }: {
   roster: RosterEntry[];
+  canSetManager: boolean;
   onLink: (employee: RosterEntry) => void;
   onSetManager: (employee: RosterEntry) => void;
+  onExempt: (employee: RosterEntry) => void;
 }) {
   const names = new Map(roster.map((row) => [row.id, row.display_name]));
   const incomplete = roster.filter((row) => !isReady(row)).length;
@@ -359,8 +392,10 @@ function Roster({
               key={employee.id}
               employee={employee}
               names={names}
+              canSetManager={canSetManager}
               onLink={() => onLink(employee)}
               onSetManager={() => onSetManager(employee)}
+              onExempt={() => onExempt(employee)}
             />
           ))}
         </ul>
@@ -370,12 +405,14 @@ function Roster({
 }
 
 function RosterRow({
-  employee, names, onLink, onSetManager,
+  employee, names, canSetManager, onLink, onSetManager, onExempt,
 }: {
   employee: RosterEntry;
   names: Map<number, string>;
+  canSetManager: boolean;
   onLink: () => void;
   onSetManager: () => void;
+  onExempt: () => void;
 }) {
   const ready = isReady(employee);
   return (
@@ -420,7 +457,7 @@ function RosterRow({
             Link code
           </button>
         )}
-        {!employee.approverReachable && (
+        {!employee.approverReachable && canSetManager && (
           <button
             type="button"
             data-action="manager-for-this"
@@ -428,6 +465,19 @@ function RosterRow({
             onClick={onSetManager}
           >
             Set manager
+          </button>
+        )}
+        {/* The other honest way to complete this row, and the only one for somebody at the top of
+            the organisation. Offered beside "Set manager" so the choice is visible at the moment
+            HR would otherwise reach for a reporting line that does not exist. */}
+        {!employee.approverReachable && (
+          <button
+            type="button"
+            data-action="exempt-this"
+            className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-xs font-medium text-kumo-default hover:bg-kumo-tint"
+            onClick={onExempt}
+          >
+            管理監督者
           </button>
         )}
       </div>
@@ -572,6 +622,57 @@ function ReportingLineForm({
           roster={roster}
           value={managerId}
           onChange={setManagerId}
+        />
+      </Field>
+    </FormCard>
+  );
+}
+
+/**
+ * Record that somebody is 管理監督者.
+ *
+ * Its own form rather than a button that writes straight from the roster row, and not only for
+ * consistency with the other two. This is a determination under 労働基準法 §41 that exempts the
+ * person's overtime from a premium; it is additive, cannot be undone here, and lands in a table an
+ * inspection reads. A control that does all that on one click from a list, next to two buttons
+ * that merely scroll somewhere, is the wrong shape. The row's button brings the reader here; the
+ * second, deliberate press is the one that writes.
+ */
+function ExemptionForm({
+  roster, employeeId, onEmployeeId, selectRef, busy, notice, onSubmit,
+}: {
+  roster: RosterEntry[];
+  employeeId: string;
+  onEmployeeId: (value: string) => void;
+  selectRef: React.RefObject<HTMLSelectElement | null>;
+  busy: boolean;
+  notice?: Notice;
+  onSubmit: (employeeId: EmployeeId) => Promise<boolean>;
+}) {
+  const id = useId();
+
+  return (
+    <FormCard
+      title="Record a 管理監督者 exemption"
+      hint="For a manager or officer who reports to nobody: it marks them exempt from overtime premiums, and from needing anybody to approve for them. Recorded from now and open-ended — there is no way to end it here yet, so use it only where the determination has actually been made."
+      disabled={roster.length === 0}
+      disabledHint="Add an employee record first."
+      busy={busy}
+      notice={notice}
+      action="grant-exemption"
+      submitLabel="Record exemption"
+      onSubmit={async () => {
+        if (await onSubmit(Number(employeeId))) onEmployeeId("");
+      }}
+    >
+      <Field label="Employee" htmlFor={`${id}-employee`}>
+        <EmployeeSelect
+          id={`${id}-employee`}
+          name="employeeId"
+          selectRef={selectRef}
+          roster={roster}
+          value={employeeId}
+          onChange={onEmployeeId}
         />
       </Field>
     </FormCard>
@@ -783,7 +884,7 @@ function Field({
         {optional && <span className="ml-1 font-normal text-kumo-inactive">optional</span>}
       </label>
       {children}
-      {note && <p className="text-[11px] text-kumo-inactive">{note}</p>}
+      {note && <p className="text-xs text-kumo-inactive">{note}</p>}
     </div>
   );
 }
