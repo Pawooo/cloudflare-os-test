@@ -52,6 +52,10 @@ const EXPECTED: Record<string, ExpectedArea> = {
     forwarded: ["VITE_FRONTEND_ERROR_REPORTING"],
     injected: ["GATEKEEPER_APP_UNMINIFIED"],
   },
+  "packages/gatekeeper-kintai": {
+    forwarded: ["VITE_FRONTEND_ERROR_REPORTING"],
+    injected: ["GATEKEEPER_APP_UNMINIFIED"],
+  },
   "packages/gatekeeper-scheduler": {
     forwarded: ["VITE_FRONTEND_ERROR_REPORTING"],
     injected: ["GATEKEEPER_APP_UNMINIFIED"],
