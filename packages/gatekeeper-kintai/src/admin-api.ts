@@ -14,10 +14,23 @@ import type { KintaiStore } from "./store/kintai-store.js";
  * iframe, so there is nothing for a browser to lie about — a non-admin's capability simply has no
  * admin behaviour behind it.
  *
- * Both classes `implements KintaiAdminApi`, which is the load-bearing part. Adding a method here
- * makes `ViewerKintaiApi` fail to compile until someone writes down whether a non-admin may call
- * it, so the default for anything added later is deny. This mirrors `UseOverseerInterface` in
- * `workshop-backend`, for the same reason (see docs/sharing.md).
+ * Both classes `implements KintaiAdminApi`, which is the load-bearing part: adding a REQUIRED
+ * member to this interface makes both classes fail to compile until someone writes down whether a
+ * non-admin may call it. This mirrors `UseOverseerInterface` in `workshop-backend`, for the same
+ * reason (see docs/sharing.md).
+ *
+ * Know the two things that guard does NOT cover, because both compile clean:
+ *
+ *  - a public method added to `ViewerKintaiApi` itself that is absent from this interface. It is
+ *    callable over RPC, and `implements` says nothing about it. (Narrowing the decorator to
+ *    `@validateRpc<KintaiAdminApi>()` does generate a narrowed `methods` map, but
+ *    capnweb-validate 0.3.0's runtime wrapper dispatches the extra method regardless.)
+ *  - an OPTIONAL member (`foo?(): Promise<void>`) added here, which both classes satisfy without
+ *    implementing.
+ *
+ * Neither is caught by the compiler, so both are caught by the test instead: see "exposes exactly
+ * the interface" in `__tests__/admin-api.test.ts`, which pins the callable surface of both classes
+ * against a written-out list of these members. Add a member here and that list must change too.
  */
 export interface KintaiAdminApi {
   /**
@@ -118,7 +131,14 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
   }
 
   async createEmployee(input: NewEmployee): Promise<EmployeeId> {
-    return this.#store.createEmployee(input);
+    const now = Date.now();
+    const actorEmployeeId = await this.#actor(now);
+    const employeeId = await this.#store.createEmployee(input);
+    await this.#store.appendAudit({
+      at: now, actorEmployeeId, action: "create_employee", entity: "employees",
+      entityId: employeeId, after: input,
+    });
+    return employeeId;
   }
 
   /**
@@ -141,13 +161,47 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
    */
   async linkAccount(accountId: string, employeeId: EmployeeId): Promise<void> {
     const now = Date.now();
-    const linkedBy = await this.#store.resolveAccount(this.#accountId, now);
+    const linkedBy = await this.#actor(now);
+    // Read before the write, so the entry records what this account resolved to beforehand. For
+    // the operation that grants identity, "who was this before" is the question an auditor asks
+    // first, and it is unrecoverable once the old link is closed.
+    const previous = await this.#store.resolveAccount(accountId, now);
     await this.#store.linkAccount(accountId, employeeId, now, linkedBy ?? undefined);
+    await this.#store.appendAudit({
+      at: now, actorEmployeeId: linkedBy, action: "link_account", entity: "account_links",
+      entityId: employeeId,
+      before: previous === null ? undefined : { accountId, employeeId: previous },
+      after: { accountId, employeeId },
+    });
   }
 
-  /** Opens the line now and leaves it open; closing and back-dating are part 2's problem. */
+  /**
+   * Opens the line now and leaves it open; closing and back-dating are part 2's problem.
+   *
+   * Audited because a reporting line grants approval authority over another employee's
+   * submissions — writing one is handing out signing power, and until now it recorded no actor at
+   * all.
+   */
   async setReportingLine(employeeId: EmployeeId, managerId: EmployeeId): Promise<void> {
-    await this.#store.setReportingLine(employeeId, managerId, Date.now());
+    const now = Date.now();
+    const actorEmployeeId = await this.#actor(now);
+    const edgeId = await this.#store.setReportingLine(employeeId, managerId, now);
+    await this.#store.appendAudit({
+      at: now, actorEmployeeId, action: "set_reporting_line", entity: "org_edges",
+      entityId: edgeId, after: { employeeId, managerId, validFrom: now },
+    });
+  }
+
+  /**
+   * The acting admin's own employee id, or null when they have no employee record.
+   *
+   * Resolved from their own capability on every call, never taken as an argument: the actor on an
+   * authority-changing audit entry is the one field an admin must not be able to choose. Null is a
+   * real case — the first administrator, before anybody is onboarded — and `actor_employee_id` is
+   * nullable for it.
+   */
+  async #actor(now: number): Promise<EmployeeId | null> {
+    return this.#store.resolveAccount(this.#accountId, now);
   }
 }
 
@@ -156,9 +210,14 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
  *
  * Every member of `KintaiAdminApi` is written out, and all but `whoAmI` refuse. That is
  * deliberately more verbose than a check inside each admin method would be, and it buys the one
- * thing a check cannot: because this class `implements KintaiAdminApi`, a method added to the
- * interface in part 2 fails to compile here until a developer decides whether non-admins may call
- * it. The failure mode of forgetting is a build error, not a quietly-widened surface.
+ * thing a check cannot: because this class `implements KintaiAdminApi`, a REQUIRED member added to
+ * that interface in part 2 fails to compile here until a developer decides whether non-admins may
+ * call it. The failure mode of forgetting is a build error, not a quietly-widened surface.
+ *
+ * The compiler's reach stops there. A public method added to THIS CLASS but not to the interface,
+ * and an optional member added to the interface, both compile clean and would widen what a
+ * non-admin can call — see the interface's own comment. The surface test is what covers those, and
+ * it is not optional decoration.
  *
  * `never` as the return type rather than the interface's `Promise<...>`: `never` satisfies any
  * return type, and writing it says the body cannot produce a value at all, which is the point.

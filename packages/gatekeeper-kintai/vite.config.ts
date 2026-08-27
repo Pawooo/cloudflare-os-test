@@ -13,7 +13,7 @@ export default defineConfig({
       // separate commands so the app suite can replay when only the worker suite's inputs moved.
       test: vitestTask(["vitest run", "vitest run -c vitest.app.config.ts"]),
       // Uncached: a cache hit restores archived outputs but never deletes files, so the sourcemap
-      // artifacts of an enabled-reporting build (dist-app/gatekeeper-scheduler.js + .js.map) would
+      // artifacts of an enabled-reporting build (dist-app/gatekeeper-kintai.js + .js.map) would
       // survive a later disabled-reporting cache hit and could be collected as if they matched the
       // current bundle. This runs every time, before the cache lookup.
       "clean:error-reporting-artifacts": {

@@ -460,35 +460,13 @@
       }
     },
     "gatekeeper-kintai": {
-      "bindings": [
-        {
-          "name": "CLIENT_ID",
-          "text": "$SECRET(CLIENT_ID)",
-          "type": "secret_text"
-        },
-        {
-          "name": "CLIENT_SECRET",
-          "text": "$SECRET(CLIENT_SECRET)",
-          "type": "secret_text"
-        }
-      ],
+      "bindings": [],
       "compatibilityDate": "2026-02-02",
       "compatibilityFlags": [
         "allow_irrevocable_stub_storage",
         "nodejs_als"
       ],
-      "inputs": [
-        {
-          "kind": "secret",
-          "label": "OAuth client ID",
-          "name": "CLIENT_ID"
-        },
-        {
-          "kind": "secret",
-          "label": "OAuth client secret",
-          "name": "CLIENT_SECRET"
-        }
-      ],
+      "inputs": [],
       "installable": true,
       "kind": "gatekeeper",
       "mainModule": "kintai.js",
@@ -518,6 +496,7 @@
         }
       },
       "shortName": "kintai",
+      "singleton": true,
       "vars": {
         "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/kintai"
       }

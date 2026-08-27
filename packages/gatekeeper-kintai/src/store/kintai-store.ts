@@ -106,10 +106,11 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
     return isExempt(this.sql, employeeId, at);
   }
 
+  /** Opens a reporting edge and returns its id. See `setReportingLine`. */
   async setReportingLine(
     employeeId: EmployeeId, managerId: EmployeeId, from: number, to?: number,
-  ): Promise<void> {
-    setReportingLine(this.sql, employeeId, managerId, from, to);
+  ): Promise<number> {
+    return setReportingLine(this.sql, employeeId, managerId, from, to);
   }
 
   async setDelegate(

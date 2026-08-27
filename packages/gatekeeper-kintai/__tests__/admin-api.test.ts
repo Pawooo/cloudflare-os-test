@@ -1,5 +1,6 @@
 import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
+import { AdminKintaiApi, ViewerKintaiApi } from "../src/admin-api.js";
 
 // The HR admin surface, reached the way the Workshop reaches it: `KintaiAccount.startAppUi({
 // isAdmin })` hands back a capability, and the iframe can only ever call what that capability
@@ -47,16 +48,39 @@ async function employee(tag: string) {
   });
 }
 
-// Every method that changes state, plus the two admin-only reads. Each entry is called with
-// arguments that are valid for its signature, so a refusal can only come from the authorization
-// shape and never from argument validation running first.
-const ADMIN_ONLY: [string, unknown[]][] = [
-  ["listEmployees", []],
-  ["listReportingLines", []],
-  ["createEmployee", [{ employeeNumber: "X-1", displayName: "X", joinedOn: "2026-04-01" }]],
-  ["linkAccount", ["acct-victim", 1]],
-  ["setReportingLine", [1, 2]],
+// Valid arguments for every member of `KintaiAdminApi`, so a refusal can only come from the
+// authorization shape and never from argument validation running first.
+const CALL_ARGS: Record<string, unknown[]> = {
+  whoAmI: [],
+  listEmployees: [],
+  listReportingLines: [],
+  createEmployee: [{ employeeNumber: "X-1", displayName: "X", joinedOn: "2026-04-01" }],
+  linkAccount: ["acct-victim", 1],
+  setReportingLine: [1, 2],
+};
+
+/**
+ * Every member of `KintaiAdminApi`, written out.
+ *
+ * A literal list rather than something derived, because it is pinning the two classes against the
+ * interface and anything derived from those classes would move with them. Adding a member to the
+ * interface means adding it here and deciding what it does to a non-admin.
+ */
+const INTERFACE_MEMBERS = [
+  "createEmployee", "linkAccount", "listEmployees", "listReportingLines", "setReportingLine",
+  "whoAmI",
 ];
+
+/** The names a caller can actually invoke on `cls` over RPC. */
+function callableSurface(cls: { prototype: object }): string[] {
+  return Object.getOwnPropertyNames(cls.prototype)
+    .filter((name) => name !== "constructor")
+    .toSorted();
+}
+
+// Everything admin-only: the mutations plus the two admin-only reads.
+const ADMIN_ONLY: [string, unknown[]][] =
+  INTERFACE_MEMBERS.filter((name) => name !== "whoAmI").map((name) => [name, CALL_ARGS[name]]);
 
 describe("the capability a non-admin receives", () => {
   // The whole point of part 1. `linkAccount` maps an account capability onto an employee record —
@@ -74,14 +98,43 @@ describe("the capability a non-admin receives", () => {
     await expect(() => ui.linkAccount("acct-victim", 1)).rejects.toThrow(/linkAccount/);
   });
 
-  // A non-admin refused `linkAccount` must not be able to reach it by any other name on the same
-  // capability. This is what distinguishes "a different class" from "an admin object with a flag".
-  it("leaves no admin method reachable under another name", async () => {
-    const ui = appUi(`acct-nonadmin-alias-${seq}`, false);
+  /**
+   * The guard the `implements` check does NOT give us.
+   *
+   * `implements KintaiAdminApi` catches a method added to the INTERFACE — both classes then fail
+   * to compile until someone decides. It does not catch a method added to the CLASS: an extra
+   * public method on `ViewerKintaiApi` that is absent from the interface compiles clean and is
+   * callable over RPC. (Nor does an OPTIONAL interface member, which satisfies both classes
+   * without either implementing it.) Narrowing the decorator to `@validateRpc<KintaiAdminApi>()`
+   * does generate a narrowed `methods` map, but capnweb-validate 0.3.0's runtime wrapper
+   * dispatches the extra method anyway, so there is no decorator-level fix today.
+   *
+   * So the surface is pinned here instead, and pinned by *calling* rather than by reflection
+   * alone: every name reachable on the viewer must be a member of the interface, and every member
+   * but `whoAmI` must come back refused. The previous version of this test only tried invented
+   * names, which passed on "no such method" and never distinguished refused from absent — it would
+   * not have caught the hole this test exists for.
+   */
+  it("exposes exactly the interface, and refuses every member of it but whoAmI", async () => {
+    expect(callableSurface(ViewerKintaiApi)).toEqual(INTERFACE_MEMBERS.toSorted());
 
-    for (const alias of ["link", "grantIdentity", "store", "sql", "admin"]) {
-      await expect(() => ui[alias]()).rejects.toThrow();
+    const ui = appUi(`acct-surface-${seq}`, false);
+    for (const method of callableSurface(ViewerKintaiApi)) {
+      const args = CALL_ARGS[method];
+      expect(args, `no arguments recorded for ${method}`).toBeDefined();
+      if (method === "whoAmI") {
+        expect(await ui.whoAmI()).toMatchObject({ linked: false });
+        continue;
+      }
+      // Refused, not absent: "no such method" would throw too, and would pass a weaker assertion.
+      await expect(() => ui[method](...args)).rejects.toThrow(/KINTAI_ADMIN_REQUIRED/);
     }
+  });
+
+  // The admin class is pinned to the same interface, so an unreviewed public method cannot appear
+  // on the administrator's capability either.
+  it("keeps the admin capability to exactly the interface too", () => {
+    expect(callableSurface(AdminKintaiApi)).toEqual(INTERFACE_MEMBERS.toSorted());
   });
 
   it("still answers whoAmI, which is how an employee reads their code for HR", async () => {
@@ -213,6 +266,85 @@ describe("the capability an admin receives", () => {
       .toEqual({ accountId: newAccount, linked: true, employeeId });
     expect(await appUi(oldAccount, false).whoAmI())
       .toEqual({ accountId: oldAccount, linked: false, employeeId: null });
+  });
+});
+
+describe("the audit trail", () => {
+  // src/store/audit.ts promises to record "account linking, org edges, exemptions, route
+  // configuration and period locks". Before part 1 nothing in the runtime called `appendAudit` at
+  // all -- only tests did. These are the first three runtime callers, and each records an actor
+  // taken from the acting admin's own capability.
+  async function entriesFor(action: string, entityId: number) {
+    return (await store.auditEntries())
+      .filter((row) => row.action === action && row.entity_id === entityId);
+  }
+
+  it("records who created an employee", async () => {
+    const adminEmployee = await employee("Creator");
+    const adminAccount = `acct-audit-create-${seq}`;
+    await store.linkAccount(adminAccount, adminEmployee, Date.now());
+
+    const employeeId = await appUi(adminAccount, true).createEmployee({
+      employeeNumber: `E-ac-${seq}`, displayName: "Created", joinedOn: "2026-04-01",
+    });
+
+    const [entry] = await entriesFor("create_employee", employeeId);
+    expect(entry).toMatchObject({ entity: "employees", actor_employee_id: adminEmployee });
+    expect(JSON.parse(entry.after!)).toMatchObject({ displayName: "Created" });
+  });
+
+  it("records who linked an account, and what it resolved to before", async () => {
+    const adminEmployee = await employee("Linker");
+    const adminAccount = `acct-audit-link-${seq}`;
+    await store.linkAccount(adminAccount, adminEmployee, Date.now());
+    const hr = appUi(adminAccount, true);
+
+    const first = await employee("First");
+    const second = await employee("Second");
+    const subject = `acct-audit-subject-${seq}`;
+
+    await hr.linkAccount(subject, first);
+    await hr.linkAccount(subject, second);
+
+    const [opened] = await entriesFor("link_account", first);
+    expect(opened).toMatchObject({ entity: "account_links", actor_employee_id: adminEmployee });
+    // Nothing was there before, so `before` is SQL NULL rather than the JSON text "null".
+    expect(opened.before).toBeNull();
+    expect(JSON.parse(opened.after!)).toEqual({ accountId: subject, employeeId: first });
+
+    // Re-pointing records what the account resolved to beforehand -- unrecoverable once the old
+    // link is closed, and the first question an auditor asks about an identity change.
+    const [moved] = await entriesFor("link_account", second);
+    expect(JSON.parse(moved.before!)).toEqual({ accountId: subject, employeeId: first });
+    expect(JSON.parse(moved.after!)).toEqual({ accountId: subject, employeeId: second });
+  });
+
+  it("records who granted approval authority, naming the edge it created", async () => {
+    const adminEmployee = await employee("Granter");
+    const adminAccount = `acct-audit-org-${seq}`;
+    await store.linkAccount(adminAccount, adminEmployee, Date.now());
+
+    const worker = await employee("Reportee");
+    const boss = await employee("Manager");
+    await appUi(adminAccount, true).setReportingLine(worker, boss);
+
+    const edge = (await store.listReportingLines())
+      .find((row) => row.employee_id === worker && row.manager_id === boss)!;
+    const [entry] = await entriesFor("set_reporting_line", edge.id);
+    // entity_id is the org_edges row itself, so the entry joins back to the authority it granted.
+    expect(entry).toMatchObject({ entity: "org_edges", actor_employee_id: adminEmployee });
+    expect(JSON.parse(entry.after!)).toMatchObject({ employeeId: worker, managerId: boss });
+  });
+
+  // A real case: the first administrator acts before anybody is onboarded, so they have no
+  // employee record to be the actor. The column is nullable for exactly this.
+  it("leaves the actor null when the acting admin has no employee record", async () => {
+    const employeeId = await appUi(`acct-audit-noemp-${seq}`, true).createEmployee({
+      employeeNumber: `E-first-${seq}`, displayName: "First Hire", joinedOn: "2026-04-01",
+    });
+
+    const [entry] = await entriesFor("create_employee", employeeId);
+    expect(entry.actor_employee_id).toBeNull();
   });
 });
 

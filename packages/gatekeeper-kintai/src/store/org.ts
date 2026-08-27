@@ -6,18 +6,27 @@ import { designatedApproverOf, isExempt } from "./employees.js";
 // Delegation reuses the reporting-line shape with a bounded window, so a manager on leave does not
 // silently stall their team's submissions.
 
+/**
+ * Opens a reporting edge and returns its id.
+ *
+ * The id is returned so an audit trail can name the exact row: a reporting line grants approval
+ * authority over another employee, and an entry that cannot be joined back to the edge it created
+ * only records that *something* changed.
+ */
 export function setReportingLine(
   sql: SqlStorage,
   employeeId: EmployeeId,
   managerId: EmployeeId,
   from: number,
   to?: number,
-): void {
-  sql.exec(
-    `INSERT INTO org_edges (employee_id, manager_id, kind, valid_from, valid_to)
-     VALUES (?, ?, 'report', ?, ?)`,
-    employeeId, managerId, from, to ?? null,
-  );
+): number {
+  return sql
+    .exec<{ id: number }>(
+      `INSERT INTO org_edges (employee_id, manager_id, kind, valid_from, valid_to)
+       VALUES (?, ?, 'report', ?, ?) RETURNING id`,
+      employeeId, managerId, from, to ?? null,
+    )
+    .one().id;
 }
 
 /** Delegation is always bounded — an open-ended delegate is just a second manager. */
