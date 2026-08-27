@@ -294,7 +294,7 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
     if (input.employmentType !== undefined) {
       assertText("employment type", input.employmentType, LIMITS.employmentType);
     }
-    assertWorkDate("joined on", input.joinedOn);
+    assertWorkDate("joining date", input.joinedOn);
     if (input.designatedApproverId !== undefined) {
       assertEmployeeId("designated approver", input.designatedApproverId);
       await this.#assertEmployeeExists(input.designatedApproverId);

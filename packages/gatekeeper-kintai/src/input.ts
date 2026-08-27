@@ -132,6 +132,6 @@ export function assertRequiredText(label: string, value: string, maxLength: numb
  */
 export function assertEmployeeId(label: string, value: number): void {
   if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
-    throw new InvalidInputError(`${label} must be an employee id.`);
+    throw new InvalidInputError(`${label} must be a positive employee id.`);
   }
 }

@@ -26,6 +26,25 @@ export type KintaiIdentity = {
 };
 
 /**
+ * What HR types into the "add someone" form, and the only input `createEmployee` accepts.
+ *
+ * camelCase, unlike the row types: this is an argument, not a row read back out of SQLite.
+ * Declared here rather than in `store/employees.ts` for the reason `EmployeeRow` below is — the
+ * form that fills it in is compiled by `tsconfig.app.json`, which has no worker types.
+ *
+ * Every field is checked at the API boundary before it reaches the store; `@validateRpc()` only
+ * knows the shapes. See `AdminKintaiApi.createEmployee`.
+ */
+export type NewEmployee = {
+  employeeNumber: string;
+  displayName: string;
+  department?: string;
+  employmentType?: string;
+  designatedApproverId?: EmployeeId;
+  joinedOn: string;
+};
+
+/**
  * One employee record, whole, as the HR roster shows it.
  *
  * Column names, not camelCase: these rows are read straight out of `employees` and every other row

@@ -1,19 +1,10 @@
-import type { EmployeeId, EmployeeRow } from "../types.js";
+import type { EmployeeId, EmployeeRow, NewEmployee } from "../types.js";
 import { InvalidInputError } from "../input.js";
 
-// `EmployeeRow` is declared in `types.ts` so `app/` can render it without pulling worker types
-// into the browser build; re-exported here because this is where its queries live and every
-// existing caller reads it from this module. See its comment in `types.ts`.
-export type { EmployeeRow };
-
-export type NewEmployee = {
-  employeeNumber: string;
-  displayName: string;
-  department?: string;
-  employmentType?: string;
-  designatedApproverId?: EmployeeId;
-  joinedOn: string;
-};
+// Both are declared in `types.ts` so `app/` can render one and submit the other without pulling
+// worker types into the browser build; re-exported here because this is where their queries live
+// and every existing caller reads them from this module. See their comments in `types.ts`.
+export type { EmployeeRow, NewEmployee };
 
 /**
  * Thrown when a caller's account capability has no open link to an employee record.
