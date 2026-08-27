@@ -518,11 +518,10 @@ describe("staged actions are isolated per account", () => {
 });
 
 // ------------------------------------------------------------------------------------------------
-// A REAL LIMITATION of routing this action through the queue, reproduced rather than described.
+// The regression this suite exists to guard.
 //
-// `listPendingApprovals()` is marked `prohibitAllSharing`, deliberately and after review: it is the
-// one read that returns other employees' payroll records. The Overseer's response to such an
-// observation is to put the whole workspace into lockdown — and lockdown refuses EVERY action:
+// `listPendingApprovals()` used to be marked `prohibitAllSharing`, which puts the whole workspace
+// into permanent lockdown — and lockdown refuses EVERY action:
 //
 //   async submitAction(...) {
 //     if (this.storage.prohibitAllSharing.get()) {
@@ -530,15 +529,15 @@ describe("staged actions are isolated per account", () => {
 //         workspace is prohibited from performing actions.");
 //     }
 //
-// Before this change `actOnSubmission` wrote straight to the store and was untouched by that.
-// Now it is an action, so the natural approver flow — list your queue, then decide on one of the
-// entries — cannot complete inside one Gadget. And `listPendingApprovals()` is the ONLY way a
-// Gadget can learn a submission id it may act on: the session exposes no `getSubmission`.
+// That was harmless while `actOnSubmission` wrote straight to the store. The moment it became an
+// action it was fatal: `listPendingApprovals()` is the ONLY way a Gadget can learn a submission id
+// it may act on (the session exposes no `getSubmission`), so reading the queue permanently
+// disabled deciding on anything in it — the entire approver flow, in one call.
 //
-// This is a genuine conflict between two correct decisions, not something to work around here.
-// Pinned so it is visible, and so it fails loudly if the Workshop's lockdown rule changes.
-describe("the sharing lockdown blocks the approver flow", () => {
-  it("refuses to stage a decision once the queue has been read in the same session", async () => {
+// The fix is `excludeObservers`, which blocks the read when a collaborator could see it but sets
+// no lockdown. These tests pin both halves: the flow works, and the protection still holds.
+describe("reading the approval queue does not disable deciding on it", () => {
+  it("stages and applies a decision in the very session that read the queue", async () => {
     const { bossAccount, submissionId } = await pendingUnderManager();
     const session = sessionFor(bossAccount);
 
@@ -546,24 +545,94 @@ describe("the sharing lockdown blocks the approver flow", () => {
     expect((await session.listPendingApprovals()).map((row: { id: number }) => row.id))
       .toEqual([submissionId]);
 
-    await expect(() => session.actOnSubmission(submissionId, "approve"))
-      .rejects.toThrow(/prohibited from performing actions/);
-
-    // Nothing staged, nothing submitted, nothing applied: the decision simply cannot be made here.
-    expect((await host.readQueue()).actions).toEqual([]);
-    await expect(() => overseerFor(bossAccount).applyAction(1))
-      .rejects.toThrow(/KINTAI_UNKNOWN_ACTION/);
-    expect((await store.getSubmission(submissionId)).state).toBe("pending");
-  });
-
-  it("still works for a session that never read the queue", async () => {
-    // The lockdown is what blocks it, not anything about the decision — so the same decision, from
-    // a session that reached the submission id another way, goes through unchanged.
-    const { bossAccount, submissionId } = await pendingUnderManager();
-
-    await sessionFor(bossAccount).actOnSubmission(submissionId, "approve");
+    // ...and deciding on what it returned still works. This is the assertion that would have
+    // caught the regression.
+    await session.actOnSubmission(submissionId, "approve");
     await overseerFor(bossAccount).applyAction(1);
 
     expect((await store.getSubmission(submissionId)).state).toBe("approved");
+  });
+
+  it("marks the queue read as excluding collaborators rather than as unshareable", async () => {
+    // `prohibitAllSharing` is what caused the lockdown, so nothing may set it.
+    const { bossAccount } = await pendingUnderManager();
+
+    await sessionFor(bossAccount).listPendingApprovals();
+
+    const queueRead = (await host.readQueue()).observations.at(-1)!;
+    expect(queueRead.title).toBe("Kintai approval queue");
+    expect(queueRead.prohibitAllSharing).toBe(false);
+  });
+});
+
+describe("the approval queue read still protects other employees' records", () => {
+  /** A live verifier stub, which is the only thing `addObserver` will accept. */
+  async function verifier() {
+    return (await env.KINTAI_VENDOR.createAccount()).getVerifier();
+  }
+
+  it("refuses the read outright when a current collaborator could see it", async () => {
+    const { bossAccount, submissionId } = await pendingUnderManager();
+    await overseerFor(bossAccount).addObserver("collab", await verifier());
+    await host.setShares(["collab"]);
+
+    // The Overseer cannot promise a still-authorized collaborator will not see it, so it blocks
+    // the observation and no data is returned — the same protection the old flag gave.
+    await expect(() => sessionFor(bossAccount).listPendingApprovals())
+      .rejects.toThrow(/OBSERVATION_EXCLUDED/);
+
+    // The caller's own data stays readable: only the queue read names anybody.
+    await expect(sessionFor(bossAccount).listMySubmissions()).resolves.toBeDefined();
+    expect((await store.getSubmission(submissionId)).state).toBe("pending");
+  });
+
+  it("names every recorded collaborator, because none of them can be resolved to an employee", async () => {
+    const { bossAccount } = await pendingUnderManager();
+    const stub = await verifier();
+    await overseerFor(bossAccount).addObserver("collab-b", stub);
+    await overseerFor(bossAccount).addObserver("collab-a", stub);
+    // Idempotent by contract: the Overseer re-runs verification with the same id.
+    await overseerFor(bossAccount).addObserver("collab-a", stub);
+
+    await host.resetQueue();
+    await sessionFor(bossAccount).listPendingApprovals();
+
+    const queueRead = (await host.readQueue()).observations.at(-1)!;
+    expect(queueRead.excludeObservers).toEqual(["collab-a", "collab-b"]);
+  });
+
+  it("stops naming a collaborator who has been removed", async () => {
+    const { bossAccount } = await pendingUnderManager();
+    const stub = await verifier();
+    await overseerFor(bossAccount).addObserver("stays", stub);
+    await overseerFor(bossAccount).addObserver("goes", stub);
+
+    await overseerFor(bossAccount).removeObserver("goes");
+    // Idempotent, as the contract requires of an id it no longer knows.
+    await overseerFor(bossAccount).removeObserver("goes");
+
+    await host.resetQueue();
+    await sessionFor(bossAccount).listPendingApprovals();
+    expect((await host.readQueue()).observations.at(-1)!.excludeObservers).toEqual(["stays"]);
+
+    // ...and the removed collaborator no longer blocks the read, while the remaining one does.
+    await host.setShares(["goes"]);
+    await expect(sessionFor(bossAccount).listPendingApprovals()).resolves.toBeDefined();
+    await host.setShares(["stays"]);
+    await expect(() => sessionFor(bossAccount).listPendingApprovals())
+      .rejects.toThrow(/OBSERVATION_EXCLUDED/);
+  });
+
+  it("picks up a collaborator added while the session is already running", async () => {
+    // The observer list is read on every call, not captured when the session opened — a Gadget
+    // that opened its session before being shared must not keep reading payroll data.
+    const { bossAccount } = await pendingUnderManager();
+    const session = sessionFor(bossAccount);
+    await expect(session.listPendingApprovals()).resolves.toBeDefined();
+
+    await overseerFor(bossAccount).addObserver("late", await verifier());
+    await host.setShares(["late"]);
+
+    await expect(() => session.listPendingApprovals()).rejects.toThrow(/OBSERVATION_EXCLUDED/);
   });
 });

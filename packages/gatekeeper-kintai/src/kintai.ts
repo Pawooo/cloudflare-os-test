@@ -206,6 +206,9 @@ export type StagedApproval = {
 export type StageApproval = (staged: StagedApproval) => number;
 export type DiscardApproval = (stagedId: number) => void;
 
+/** The opaque observer ids currently recorded on the facet. See `KintaiGatekeeper.addObserver`. */
+export type ListObservers = () => string[];
+
 /** How many decisions may sit unconfirmed in one facet's storage at once. */
 const MAX_PENDING_STAGED_ACTIONS = 50;
 
@@ -299,10 +302,23 @@ const APPLY_OUTCOME_UNKNOWN =
  * Did the store refuse this decision outright, or might it have recorded it and been cut off?
  *
  * Every refusal `actOnSubmission` can raise comes from its authority prologue, before any write,
- * and leads with its own code — `code` is a plain own property that does not survive the RPC
- * boundary, so the message is where the code actually travels (see `UnlinkedAccountError`).
- * Anything else reaching the caller is a transport or runtime failure that may have been cut off
- * mid-write, and must not be replayed.
+ * and leads with its own code. Anything else reaching the caller is a transport or runtime failure
+ * that may have been cut off mid-write, and must not be replayed.
+ *
+ * Matching on the MESSAGE, not on `err.code`, is deliberate and not a shortcut: `code` is a plain
+ * own property on these error classes and does not survive the RPC boundary — this package
+ * established that early enough that every error here repeats its code in the message text for
+ * exactly this reason (see `UnlinkedAccountError`'s own comment). The message is the only place a
+ * caller can read the code from.
+ *
+ * KNOWN FRAGILITY, so the next person meets it here rather than in production: the match is
+ * anchored at the start of the message. If anything in the RPC path ever starts prefixing error
+ * messages — a wrapper, a new capnweb version, an added "Error calling X:" — then every domain
+ * refusal stops being recognised as one. That fails in the SAFE direction (a refused decision
+ * would be marked terminally `failed` with "outcome unknown" instead of being left retryable), but
+ * it would quietly make every refusal a dead end. A structured signal would be better if one ever
+ * becomes available; until then, the anchoring is load-bearing and is pinned by the tests that
+ * assert a refused apply stays retryable.
  */
 function isDomainRefusal(err: unknown): boolean {
   return err instanceof Error && /^KINTAI_[A-Z_]+:/.test(err.message);
@@ -358,6 +374,15 @@ const DECISIONS = {
  * It has to say who is deciding, for whom, how many hours, on which date, and what the decision
  * is. "Approve action #7" is worse than no confirmation at all, because it trains people to click
  * through — and the thing being confirmed here is a manager's sign-off on somebody else's pay.
+ *
+ * KNOWN AND ACCEPTED LIMIT: this description carries another employee's name, number, hours and
+ * stated reason, and the Overseer persists it verbatim in an `ActionRecord` audit log. That is the
+ * intended design of the action log, but note the asymmetry — `ObservationDescription` can name
+ * `excludeObservers` and `ActionDescription` has no equivalent, so the protection
+ * `listPendingApprovals` applies to exactly this data does not extend to the action log. Keeping
+ * the description informative is the deliberate choice: a confirmation the approver cannot
+ * evaluate defeats the entire purpose of routing this through a human. Recorded here so it is a
+ * decision rather than an oversight.
  */
 function describeApproval(
   preview: ActPreview, action: ApprovalAction, comment?: string,
@@ -512,6 +537,11 @@ export class KintaiAccount
  * scoped to the one employee the capability names, and the org chart already decides who may see
  * an approval queue. There is therefore nothing for a verifier to check, exactly as with
  * `ScheduleVerifier`.
+ *
+ * That is why `listPendingApprovals` excludes every observer rather than the ones who should not
+ * see a particular submission: this interface has no members, so an observer id cannot be resolved
+ * to an employee and "may this collaborator see Tanaka's overtime?" is a question nothing here can
+ * answer. Excluding all of them is the only sound reading of a verifier that verifies nothing.
  */
 @validateRpc()
 export class KintaiVerifier
@@ -546,6 +576,7 @@ export class KintaiSession extends RpcTarget {
   readonly #approvalQueue: NativeRpcStub<ApprovalQueue>;
   readonly #stageApproval: StageApproval;
   readonly #discardApproval: DiscardApproval;
+  readonly #listObservers: ListObservers;
 
   constructor(dependencies: {
     accountId: string;
@@ -559,6 +590,11 @@ export class KintaiSession extends RpcTarget {
     stageApproval: StageApproval;
     /** Drops a staged row that was never submitted. See `actOnSubmission`. */
     discardApproval: DiscardApproval;
+    /**
+     * The collaborators currently recorded on the owning facet, read fresh on every use, because
+     * one can be added while a Gadget is still running.
+     */
+    listObservers: ListObservers;
   }) {
     super();
     this.#accountId = dependencies.accountId;
@@ -566,6 +602,7 @@ export class KintaiSession extends RpcTarget {
     this.#approvalQueue = dependencies.approvalQueue;
     this.#stageApproval = dependencies.stageApproval;
     this.#discardApproval = dependencies.discardApproval;
+    this.#listObservers = dependencies.listObservers;
   }
 
   /** Releases the approval queue this session owns (it holds a `dup()`, not the caller's stub). */
@@ -590,16 +627,16 @@ export class KintaiSession extends RpcTarget {
    * `LibraryReadSession`: the description can then report what was actually read, and a refusal
    * still blocks the caller from seeing any of it.
    *
-   * `prohibitAllSharing` marks an observation that must never reach anyone but the account owner.
-   * It is passed only when true, never as an explicit `false`, so the description a permissive read
-   * sends is byte-identical to what it always sent.
+   * `excludeObservers` names collaborators who must not see this observation. It is passed only
+   * when there is at least one, never as an empty array, so the description an unshared read sends
+   * is byte-identical to what it always sent.
    */
   async #authorize(
-    title: string, description: string, prohibitAllSharing?: true,
+    title: string, description: string, excludeObservers?: string[],
   ): Promise<void> {
     await this.#approvalQueue.authorizeObservation(
-      prohibitAllSharing
-        ? { title, description, prohibitAllSharing: true }
+      excludeObservers && excludeObservers.length > 0
+        ? { title, description, excludeObservers }
         : { title, description },
     );
   }
@@ -740,30 +777,53 @@ export class KintaiSession extends RpcTarget {
    *
    * The ONE read in this session that returns other people's records — minutes, stated reason,
    * dates and employee ids for everyone the caller approves for — so it is the one observation
-   * marked `prohibitAllSharing`. Everything else here is the caller's own data, and a Gadget the
+   * that names `excludeObservers`. Everything else here is the caller's own data, and a Gadget the
    * caller shares with a colleague showing the caller's own attendance is a choice they are
    * entitled to make; a Gadget showing their reports' payroll data to a collaborator is not, and
    * `addObserver` accepts every collaborator under the low-stakes observer policy, so nothing else
    * in this package would stop it.
    *
-   * ACCEPTED PRODUCT COST, deliberately: a Gadget that calls this method can no longer be shared,
-   * and this call THROWS if the Gadget is already shared (the Overseer refuses the observation and
-   * no data is returned). It also puts the Gadget into lockdown for the rest of its run. A Gadget
-   * that wants to stay shareable must not call `listPendingApprovals()`; `punch()`, `getDay()` and
+   * This call THROWS if a current collaborator could see the result: the Overseer cannot promise
+   * to hide it from them, so it refuses the observation and no data is returned. A Gadget that
+   * wants to stay shareable must not call `listPendingApprovals()`; `punch()`, `getDay()` and
    * `listMySubmissions()` stay freely shareable. Failing closed on the approval queue is the right
    * side to err on for payroll data belonging to somebody else.
+   *
+   * WHY `excludeObservers` AND NOT `prohibitAllSharing`. Both block this read on a shared Gadget,
+   * but `prohibitAllSharing` also puts the whole workspace into permanent lockdown, and lockdown
+   * refuses EVERY action — including `actOnSubmission`, which is now an action. That combination
+   * made the only approver flow there is impossible: this method is the sole way a Gadget can
+   * learn a submission id it may act on, so reading the queue permanently disabled deciding on
+   * anything in it. `excludeObservers` is the targeted tool for exactly this case — the
+   * interface's own TODO on `prohibitAllSharing` calls it a stopgap and names sharing sensitive
+   * data with recipients who already have access as the intended direction, and a manager
+   * approving their subordinate's overtime is precisely such a recipient.
+   *
+   * Every recorded observer is excluded, not a computed subset: `GatekeeperUserVerifier` exposes
+   * only `verify()`, so there is no path from an opaque observer id to an employee record and no
+   * way to ask whether a particular collaborator is entitled to this data. Excluding all of them
+   * is the safe reading, and it preserves the original intent exactly — nobody but the account
+   * owner sees another employee's payroll record.
+   *
+   * ACCEPTED RESIDUAL RISK, recorded rather than hidden: lockdown also used to stop the Gadget
+   * performing any action after this read, which blocked exfiltrating the data through some other
+   * gatekeeper (an email, a Slack post). Re-enabling actions is not a side effect but the entire
+   * point — approving IS an action — and `prohibitAllSharing` is workspace-wide with no
+   * per-gatekeeper form, so the two cannot be separated. The remaining mitigation is that any such
+   * action is itself queued for the same human, with a description saying what is being sent.
    */
   async listPendingApprovals(): Promise<SubmissionRow[]> {
     const now = Date.now();
     const employeeId = await this.#requireEmployee(now);
     const pending = await this.#store.pendingApprovalsFor(employeeId, now);
     // The one read that can surface another employee's data, so it says so: the org chart, not the
-    // caller, decided which submissions these are.
+    // caller, decided which submissions these are. The observer list is read at call time and not
+    // captured when the session opened, because a collaborator can be added mid-run.
     await this.#authorize(
       "Kintai approval queue",
       `Read the ${pending.length} overtime submission(s) awaiting your decision as an approver. ` +
       "These belong to employees you have approval authority over in the organisation chart.",
-      true,
+      this.#listObservers(),
     );
     return pending;
   }
@@ -872,6 +932,13 @@ export class KintaiGatekeeper
       state TEXT NOT NULL CHECK (state IN ('pending', 'applying', 'applied', 'failed')),
       error TEXT
     ) STRICT`);
+    // The collaborators the Overseer has told this facet about. Recorded, not merely accepted,
+    // because `listPendingApprovals` has to name them: it returns other employees' payroll records
+    // and the Overseer needs to know who must not see them. Opaque ids chosen by the Overseer —
+    // never interpreted here, and never used for authorization.
+    this.#sql.exec(`CREATE TABLE IF NOT EXISTS observers (
+      id TEXT PRIMARY KEY
+    ) STRICT`);
     // A fresh instance means a fresh activation, so a row still marked `applying` belonged to an
     // interrupted one: the decision had already been sent to the store and may or may not have
     // landed. It must never be replayed — applying twice is not harmless, because on a multi-step
@@ -923,6 +990,13 @@ export class KintaiGatekeeper
         staged.submissionId, staged.actorId, staged.action, staged.comment ?? null, Date.now(),
       )
       .one().id;
+  }
+
+  #observers(): string[] {
+    return this.#sql
+      .exec<{ id: string }>(`SELECT id FROM observers ORDER BY id`)
+      .toArray()
+      .map((row) => row.id);
   }
 
   /** Drop a staged row. Only ever used on one that has not been applied. */
@@ -993,6 +1067,7 @@ export class KintaiGatekeeper
         // local call into this Durable Object's own SQLite.
         stageApproval: (staged) => this.#stage(staged),
         discardApproval: (stagedId) => this.#discard(stagedId),
+        listObservers: () => this.#observers(),
       });
     } catch (err) {
       ownedQueue[Symbol.dispose]?.();
@@ -1015,15 +1090,28 @@ export class KintaiGatekeeper
   }
 
   /**
-   * Accepts collaborators under the low-stakes observer policy.
+   * Accepts a collaborator under the low-stakes observer policy, and RECORDS them.
    *
-   * Adding an observer does not widen the session: it still speaks for one employee, and the org
-   * chart still decides whose approval queue that employee sees. See `KintaiVerifier`.
+   * Accepting is still trivial — adding an observer does not widen the session, which still speaks
+   * for one employee, and the org chart still decides whose approval queue that employee sees (see
+   * `KintaiVerifier`). What is no longer trivial is the bookkeeping: `listPendingApprovals` is the
+   * one read that returns another employee's payroll record, and it protects it by naming every
+   * observer in the observation's `excludeObservers`, which the Overseer then either enforces or
+   * refuses the read over. That list can only be as complete as what is stored here, so these two
+   * methods are load-bearing rather than the no-ops they used to be.
    */
-  async addObserver(_id: string, _user: Fetcher<GatekeeperUserVerifier>): Promise<void> {}
+  async addObserver(id: string, _user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
+    // Idempotent by contract: the Overseer may call again with the same id to re-run whatever
+    // verification the gatekeeper does. Kintai's verification is trivial (see `KintaiVerifier`),
+    // but the id must still be RECORDED, because `listPendingApprovals` excludes every recorded
+    // observer and an unrecorded one would be excluded from nothing.
+    this.#sql.exec(`INSERT INTO observers (id) VALUES (?) ON CONFLICT (id) DO NOTHING`, id);
+  }
 
-  /** Removes a collaborator; no observer state is retained. */
-  async removeObserver(_id: string): Promise<void> {}
+  /** Removes a collaborator, so later reads stop naming them. Idempotent, as the contract says. */
+  async removeObserver(id: string): Promise<void> {
+    this.#sql.exec(`DELETE FROM observers WHERE id = ?`, id);
+  }
 
   // ---------------------------------------------------------------------------------------------
   // The Overseer's callbacks, once a human has decided about a staged approval.

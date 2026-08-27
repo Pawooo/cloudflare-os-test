@@ -273,11 +273,16 @@ describe("observation authorization", () => {
     expect(actions).toEqual([]);
   });
 
-  it("marks the approval queue as unshareable, and marks nothing else", async () => {
+  it("protects the approval queue with excludeObservers, and marks nothing unshareable", async () => {
     // `listPendingApprovals` is the only read that returns OTHER employees' payroll records, and
-    // `addObserver` accepts every collaborator, so this flag is the only thing standing between a
-    // shared Gadget and a team's overtime data. The accepted cost is that a Gadget calling it
-    // becomes unshareable — which is why the other three reads must NOT carry the flag.
+    // `addObserver` accepts every collaborator, so the protection on that one read is all that
+    // stands between a shared Gadget and a team's overtime data — which is why the other three
+    // reads must carry nothing.
+    //
+    // It is `excludeObservers` and NOT `prohibitAllSharing`: the latter puts the workspace into
+    // lockdown, and lockdown refuses every action including `actOnSubmission`, which would make
+    // the approver flow impossible. Nothing here may set that flag; see the suites in
+    // `approval-queue.test.ts`.
     const { accountId } = await linkedEmployee("sharing");
     const session = sessionFor(accountId);
 
@@ -288,11 +293,36 @@ describe("observation authorization", () => {
     await session.listPendingApprovals();
 
     const { observations } = await host.readQueue();
-    expect(observations.map((o) => [o.title, o.prohibitAllSharing])).toEqual([
-      ["Kintai identity", false],
-      ["Kintai day record for 2026-05-14", false],
-      ["Kintai submissions", false],
-      ["Kintai approval queue", true],
+    expect(observations.map((o) => o.prohibitAllSharing)).toEqual([false, false, false, false]);
+    // With no collaborator recorded there is nobody to name, so an unshared Gadget's descriptions
+    // are byte-identical to what they always were.
+    expect(observations.map((o) => [o.title, o.excludeObservers])).toEqual([
+      ["Kintai identity", []],
+      ["Kintai day record for 2026-05-14", []],
+      ["Kintai submissions", []],
+      ["Kintai approval queue", []],
+    ]);
+  });
+
+  it("names recorded collaborators on the approval queue read, and on no other read", async () => {
+    const { accountId } = await linkedEmployee("named");
+    const verifier = await (await env.KINTAI_VENDOR.createAccount()).getVerifier();
+    // `facetFor` and `sessionFor` share a facet name, so this is the facet the session runs on.
+    await facetFor(accountId).addObserver("collab", verifier);
+
+    await host.resetQueue();
+    const session = sessionFor(accountId);
+    await session.whoAmI();
+    await session.getDay("2026-05-15");
+    await session.listMySubmissions();
+    await session.listPendingApprovals();
+
+    const { observations } = await host.readQueue();
+    expect(observations.map((o) => [o.title, o.excludeObservers])).toEqual([
+      ["Kintai identity", []],
+      ["Kintai day record for 2026-05-15", []],
+      ["Kintai submissions", []],
+      ["Kintai approval queue", ["collab"]],
     ]);
   });
 

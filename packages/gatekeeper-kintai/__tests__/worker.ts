@@ -14,7 +14,13 @@ export { KintaiStore } from "../src/store/kintai-store.js";
 
 /** What the test-side queue recorded, read back through `KintaiFacetHost.readQueue()`. */
 export type QueueLog = {
-  observations: { title: string; description: string; prohibitAllSharing: boolean }[];
+  observations: {
+    title: string;
+    description: string;
+    prohibitAllSharing: boolean;
+    /** Definite, never `undefined`: "named nobody" must be distinguishable from "field dropped". */
+    excludeObservers: string[];
+  }[];
   actions: {
     action: number;
     title: string;
@@ -40,6 +46,8 @@ class TestApprovalQueue extends RpcTarget {
   constructor(
     private readonly state: {
       log: QueueLog; denyObservations: boolean; denyActions: boolean;
+      /** Collaborators still authorized in the Overseer's sharing graph. See `authorizeObservation`. */
+      shares: Set<string>;
     },
   ) {
     super();
@@ -58,10 +66,28 @@ class TestApprovalQueue extends RpcTarget {
     this.state.log.observations.push({
       title: description.title,
       description: description.description,
-      // Recorded as a definite boolean: an observation that leaves the flag off is asserting it is
-      // shareable, and a test must be able to tell that from "the harness dropped the field".
+      // Recorded as definite values: an observation that leaves these off is asserting it is
+      // shareable and excludes nobody, and a test must be able to tell that from "the harness
+      // dropped the field".
       prohibitAllSharing: description.prohibitAllSharing === true,
+      excludeObservers: [...description.excludeObservers ?? []],
     });
+
+    // Faithful to the real Overseer's `#enforceExcludeObservers`: a named observer who is STILL
+    // authorized in the sharing graph blocks the observation outright, because v1 has no
+    // per-thread hiding and so cannot promise they would not see it. A named id that is not an
+    // active share is ignored (already torn down). Crucially — and this is the whole reason Kintai
+    // uses this instead of `prohibitAllSharing` — it sets no workspace lockdown, so actions still
+    // work afterwards.
+    for (const observerId of description.excludeObservers ?? []) {
+      if (this.state.shares.has(observerId)) {
+        throw new Error(
+          "OBSERVATION_EXCLUDED: this observation was blocked because it contains data that a " +
+          "current collaborator is not permitted to see.",
+        );
+      }
+    }
+
     if (this.state.denyObservations) throw new Error("OBSERVATION_DENIED: test queue refused.");
   }
 
@@ -125,6 +151,7 @@ export class KintaiFacetHost extends DurableObject<Cloudflare.Env> {
     log: { observations: [], actions: [] } as QueueLog,
     denyObservations: false,
     denyActions: false,
+    shares: new Set<string>(),
   };
 
   /** One live session per facet name, as a Gadget holds one session for as long as it runs. */
@@ -234,5 +261,18 @@ export class KintaiFacetHost extends DurableObject<Cloudflare.Env> {
     this.#queueState.log.actions.length = 0;
     this.#queueState.denyObservations = denyObservations;
     this.#queueState.denyActions = denyActions;
+    this.#queueState.shares.clear();
+  }
+
+  /**
+   * Stand in for the Overseer's sharing graph: who currently has access to this workspace.
+   *
+   * Separate from `Gatekeeper.addObserver`, exactly as in production — the Overseer keeps the
+   * sharing graph and its own observer index, and tells the gatekeeper about observers through
+   * `addObserver`. A test that wants the real shape calls both.
+   */
+  setShares(observerIds: string[]): void {
+    this.#queueState.shares.clear();
+    for (const id of observerIds) this.#queueState.shares.add(id);
   }
 }
