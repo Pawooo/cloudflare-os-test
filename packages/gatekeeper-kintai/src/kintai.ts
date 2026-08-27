@@ -10,10 +10,12 @@ import type {
   ActionDescription,
   ActionKind,
   AgentCatalog,
+  AppUiContext,
   ApprovalQueue,
   Gatekeeper,
   GatekeeperConnectCallback,
   GatekeeperConnectOptions,
+  GatekeeperUiFrame,
   GatekeeperUser,
   GatekeeperUserVerifier,
   GatekeeperVendor as GatekeeperVendorContract,
@@ -29,7 +31,9 @@ import type { PunchLocation, PunchRow } from "./store/punches.js";
 import type { ActPreview, SubmissionRow } from "./store/submissions.js";
 import type { KintaiStore } from "./store/kintai-store.js";
 import { UnlinkedAccountError } from "./store/employees.js";
+import { AdminKintaiApi, ViewerKintaiApi } from "./admin-api.js";
 import TYPES_CODE from "./types.txt";
+import APP_HTML from "./generated/app.txt";
 
 const KINTAI_ICON = {
   url:
@@ -506,10 +510,11 @@ export function describeKintaiAccount(): AccountDescription {
   return {
     displayName: "Kintai",
     avatar: KINTAI_ICON,
-    // No `providesUi`: the HR/admin surface (mapping accounts to employees, closing periods) is a
-    // later sub-project. Every member of `GatekeeperUser` this account does declare is implemented,
-    // so the Workshop never reaches a method that is not here.
     singleton: { tsType: "KintaiSession" },
+    // The HR/admin surface, hosted by the Workshop at `/gatekeepers/kintai`. Declaring it is what
+    // makes the Workshop show the nav entry and call `startAppUi()`, so the two must be restored
+    // together — a declaration without the method opens a nav entry onto nothing.
+    providesUi: { title: "Kintai", icon: KINTAI_ICON },
   };
 }
 
@@ -540,6 +545,28 @@ export class KintaiAccount
    */
   async getSingletonGatekeeperClass(): Promise<DurableObjectClass<Gatekeeper<KintaiSession>>> {
     return this.ctx.exports.KintaiGatekeeper({ props: this.ctx.props });
+  }
+
+  /**
+   * Opens the HR administration app, with a capability SHAPED by the caller's admin status.
+   *
+   * This is the authorization decision for the whole admin surface, and it is made here, once, on
+   * the server. `context.isAdmin` is supplied fresh by the Workshop on every open (a user's admin
+   * status can change), and it is consumed by this expression and never travels any further: it is
+   * not put in the frame, not sent to the iframe, and not accepted back from it. The browser
+   * therefore has nothing to lie about — a non-admin holds `ViewerKintaiApi`, which has no admin
+   * behaviour to invoke under any argument.
+   *
+   * The alternative — one capability plus a boolean the app is trusted to respect — would put
+   * `linkAccount` one forged message away from anyone, and `linkAccount` grants identity.
+   */
+  async startAppUi(context: AppUiContext): Promise<GatekeeperUiFrame> {
+    const ui = new NativeRpcStub(
+      context.isAdmin
+        ? new AdminKintaiApi(this.#store(), this.ctx.props.accountId)
+        : new ViewerKintaiApi(this.#store(), this.ctx.props.accountId),
+    );
+    return { iframeHtml: APP_HTML, ui };
   }
 
   /** Returns no URL-addressed resources: attendance is ambient, not a thing with a URL. */

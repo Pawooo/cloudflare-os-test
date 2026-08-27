@@ -100,9 +100,12 @@ describe("GatekeeperVendor", () => {
     const description = await account.describe();
     expect(description.singleton).toEqual({ tsType: "KintaiSession" });
     expect(description.displayName).toBe("Kintai");
-    // Dropped deliberately: there is no HR/admin app in this package yet, and declaring it would
-    // make the Workshop open a nav entry onto a startAppUi() that does not exist.
-    expect(description.providesUi).toBeUndefined();
+    // The declaration is what makes the Workshop show a nav entry and call startAppUi(), so it
+    // must not be declared without the method behind it. Asserted together for that reason.
+    expect(description.providesUi).toEqual({ title: "Kintai", icon: expect.anything() });
+    expect(await account.startAppUi!({ isAdmin: false })).toMatchObject({
+      iframeHtml: expect.stringContaining("<!doctype html>"),
+    });
     expect(description).toEqual(describeKintaiAccount());
   });
 });

@@ -1,6 +1,6 @@
 import { DurableObject, RpcTarget } from "cloudflare:workers";
 import type {
-  ActionDescription, ActionKind, ObservationDescription,
+  ActionDescription, ActionKind, GatekeeperUiFrame, ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { applyStagedApprovalsSchema } from "../src/kintai.js";
 import type { KintaiGatekeeper, KintaiSession } from "../src/kintai.js";
@@ -235,6 +235,40 @@ export class KintaiFacetHost extends DurableObject<Cloudflare.Env> {
     const callable =
       account as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
     return callable[method](...args);
+  }
+
+  /**
+   * Open the account's HR admin app exactly as the Workshop does, and forward one call into the
+   * capability it hands the iframe.
+   *
+   * This is the production expression verbatim — `ctx.exports.KintaiAccount({ props }).startAppUi({
+   * isAdmin })` — and `isAdmin` is passed to `startAppUi` and nowhere else. Nothing here can widen
+   * what comes back: whichever class `startAppUi` chose is the only surface the call can reach, and
+   * `args` is forwarded verbatim so an authorization test genuinely attempts the call.
+   *
+   * `ctx.exports` exists only inside a Durable Object or WorkerEntrypoint, never in a test, which
+   * is why this lives here rather than in the suite. Production mints the accountId inside
+   * `createAccount()` and never reveals it; building the account here with an id the test also
+   * linked is what makes the linked and unlinked cases reachable, and adds no way to read an
+   * accountId back out of a real account.
+   */
+  async callAppUi(
+    accountId: string, isAdmin: boolean, method: string, args: unknown[],
+  ): Promise<unknown> {
+    const account = this.ctx.exports.KintaiAccount({ props: { accountId } });
+    const frame = await account.startAppUi!({ isAdmin });
+    const callable =
+      frame.ui as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+    return callable[method](...args);
+  }
+
+  /**
+   * The whole `GatekeeperUiFrame`, handed back to the caller as the Workshop hands it to the
+   * browser — HTML and live capability together, rather than one call forwarded through this host.
+   */
+  async openAppUi(accountId: string, isAdmin: boolean): Promise<GatekeeperUiFrame> {
+    const account = this.ctx.exports.KintaiAccount({ props: { accountId } });
+    return account.startAppUi!({ isAdmin });
   }
 
   /**
