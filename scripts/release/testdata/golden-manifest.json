@@ -459,6 +459,69 @@
         "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/homeassistant"
       }
     },
+    "gatekeeper-kintai": {
+      "bindings": [
+        {
+          "name": "CLIENT_ID",
+          "text": "$SECRET(CLIENT_ID)",
+          "type": "secret_text"
+        },
+        {
+          "name": "CLIENT_SECRET",
+          "text": "$SECRET(CLIENT_SECRET)",
+          "type": "secret_text"
+        }
+      ],
+      "compatibilityDate": "2026-02-02",
+      "compatibilityFlags": [
+        "allow_irrevocable_stub_storage",
+        "nodejs_als"
+      ],
+      "inputs": [
+        {
+          "kind": "secret",
+          "label": "OAuth client ID",
+          "name": "CLIENT_ID"
+        },
+        {
+          "kind": "secret",
+          "label": "OAuth client secret",
+          "name": "CLIENT_SECRET"
+        }
+      ],
+      "installable": true,
+      "kind": "gatekeeper",
+      "mainModule": "kintai.js",
+      "migrations": [
+        {
+          "new_sqlite_classes": [
+            "KintaiStore",
+            "KintaiGatekeeper"
+          ],
+          "tag": "v1"
+        }
+      ],
+      "modules": [
+        {
+          "name": "kintai.js",
+          "r2Key": "blobs/modules/3e26ddeafa50c30035b57db26e1df6a74e2f9887aa3bee6c6330e1913c33be49",
+          "sha256": "3e26ddeafa50c30035b57db26e1df6a74e2f9887aa3bee6c6330e1913c33be49",
+          "size": 59,
+          "type": "esm"
+        }
+      ],
+      "observability": {
+        "enabled": true,
+        "head_sampling_rate": 1,
+        "logs": {
+          "invocation_logs": false
+        }
+      },
+      "shortName": "kintai",
+      "vars": {
+        "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/kintai"
+      }
+    },
     "gatekeeper-linear": {
       "bindings": [
         {
