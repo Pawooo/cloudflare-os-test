@@ -69,3 +69,35 @@ describe("temporal org graph", () => {
     expect(await store.hasAuthorityOver(other, orphan, JUL)).toBeNull();
   });
 });
+
+describe("reporting line listing", () => {
+  // Every reporting edge ever written, closed ones included: the graph is temporal, so an admin
+  // reading today's chart still has to be able to see that a line was closed rather than absent.
+  it("lists reporting edges with their validity windows", async () => {
+    const worker = await employee("E900");
+    const oldBoss = await employee("E901");
+    const newBoss = await employee("E902");
+    await store.setReportingLine(worker, oldBoss, APR, JUL);
+    await store.setReportingLine(worker, newBoss, JUL);
+
+    expect(await store.listReportingLines()).toEqual([
+      { id: expect.any(Number), employee_id: worker, manager_id: oldBoss, valid_from: APR, valid_to: JUL },
+      { id: expect.any(Number), employee_id: worker, manager_id: newBoss, valid_from: JUL, valid_to: null },
+    ]);
+  });
+
+  // A delegate is a bounded stand-in for an absent manager, not a reporting line, and
+  // `requiredApprovers` already refuses to count one. Listing it here would put it in front of an
+  // admin as though it were part of the org chart.
+  it("excludes delegate edges", async () => {
+    const worker = await employee("E910");
+    const boss = await employee("E911");
+    const standIn = await employee("E912");
+    await store.setReportingLine(worker, boss, APR);
+    await store.setDelegate(worker, standIn, APR, JUL);
+
+    expect(await store.listReportingLines()).toEqual([
+      { id: expect.any(Number), employee_id: worker, manager_id: boss, valid_from: APR, valid_to: null },
+    ]);
+  });
+});

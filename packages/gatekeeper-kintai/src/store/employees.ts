@@ -1,4 +1,4 @@
-import type { EmployeeId } from "../types.js";
+import type { EmployeeId, EmployeeStatus } from "../types.js";
 
 export type NewEmployee = {
   employeeNumber: string;
@@ -99,6 +99,34 @@ export function unlinkAccount(sql: SqlStorage, accountId: string, now: number): 
   return cursor.rowsWritten > 0;
 }
 
+/** One row of `account_links`. */
+export type AccountLinkRow = {
+  id: number;
+  account_id: string;
+  employee_id: number;
+  valid_from: number;
+  valid_to: number | null;
+  linked_by: number | null;
+  reason: string | null;
+};
+
+/**
+ * The account's currently-open link, or null. Test-only introspection.
+ *
+ * `resolveAccount` answers the question the runtime asks ("which employee is this?"); this exposes
+ * the rest of the row — notably `linked_by`, the audit trail for the one operation that grants
+ * identity — which nothing in the runtime reads back.
+ */
+export function openAccountLink(sql: SqlStorage, accountId: string): AccountLinkRow | null {
+  return sql
+    .exec<AccountLinkRow>(
+      `SELECT id, account_id, employee_id, valid_from, valid_to, linked_by, reason
+       FROM account_links WHERE account_id = ? AND valid_to IS NULL`,
+      accountId,
+    )
+    .toArray()[0] ?? null;
+}
+
 /** The employee this account mapped to at `at`, or null if it mapped to none. */
 export function resolveAccount(
   sql: SqlStorage,
@@ -177,6 +205,43 @@ export type EmployeeProfile = {
   department: string | null;
   employment_type: string | null;
 };
+
+/**
+ * One employee record, whole, as the HR roster shows it.
+ *
+ * Column names, not camelCase: these rows are read straight out of `employees` and every other row
+ * type in this package (`SubmissionRow`, `PunchRow`) does the same, so a renaming layer here would
+ * be the odd one out.
+ */
+export type EmployeeRow = {
+  id: number;
+  employee_number: string;
+  display_name: string;
+  department: string | null;
+  employment_type: string | null;
+  designated_approver_id: number | null;
+  status: EmployeeStatus;
+  joined_on: string;
+  departed_on: string | null;
+};
+
+/**
+ * Every employee, oldest first.
+ *
+ * Unfiltered by status on purpose. A departed employee still owns payroll history the company must
+ * keep, and HR re-points an account at an existing record with `linkAccount` — so a roster that
+ * hid departed rows would hide exactly the records an admin needs to find. Paging is a part-2
+ * question; the surface is admin-only and the table is one company's headcount.
+ */
+export function listEmployees(sql: SqlStorage): EmployeeRow[] {
+  return sql
+    .exec<EmployeeRow>(
+      `SELECT id, employee_number, display_name, department, employment_type,
+              designated_approver_id, status, joined_on, departed_on
+       FROM employees ORDER BY id`,
+    )
+    .toArray();
+}
 
 /** How an employee is named to a human. Never used for authorization — only for display. */
 export type EmployeeLabel = {

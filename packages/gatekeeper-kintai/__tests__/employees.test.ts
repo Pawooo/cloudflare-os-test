@@ -62,3 +62,35 @@ describe("exemptions", () => {
     expect(await store.isExempt(id, T2)).toBe(true);
   });
 });
+
+describe("roster listing", () => {
+  // The HR app's only way to see who exists. Deliberately every employee, departed ones included:
+  // a departed employee still owns payroll history, and an admin who cannot see the row cannot
+  // re-link an account to it.
+  it("lists every employee with the columns HR needs to identify one", async () => {
+    const tanaka = await store.createEmployee({
+      employeeNumber: "E900", displayName: "Tanaka", department: "Sales",
+      employmentType: "seishain", joinedOn: "2026-04-01",
+    });
+    const suzuki = await store.createEmployee({
+      employeeNumber: "E901", displayName: "Suzuki", joinedOn: "2026-04-02",
+    });
+
+    expect(await store.listEmployees()).toEqual([
+      {
+        id: tanaka, employee_number: "E900", display_name: "Tanaka", department: "Sales",
+        employment_type: "seishain", designated_approver_id: null, status: "active",
+        joined_on: "2026-04-01", departed_on: null,
+      },
+      {
+        id: suzuki, employee_number: "E901", display_name: "Suzuki", department: null,
+        employment_type: null, designated_approver_id: null, status: "active",
+        joined_on: "2026-04-02", departed_on: null,
+      },
+    ]);
+  });
+
+  it("returns an empty roster before anyone is created", async () => {
+    expect(await store.listEmployees()).toEqual([]);
+  });
+});

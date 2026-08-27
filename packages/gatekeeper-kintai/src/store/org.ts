@@ -35,6 +35,35 @@ export function setDelegate(
   );
 }
 
+/** One reporting edge, whole, as the HR org view shows it. */
+export type ReportingLineRow = {
+  id: number;
+  employee_id: number;
+  manager_id: number;
+  valid_from: number;
+  valid_to: number | null;
+};
+
+/**
+ * Every reporting edge ever written, oldest first — closed windows included.
+ *
+ * `kind = 'report'` only. A delegate is a bounded stand-in for an absent manager, not a line of
+ * report: `requiredApprovers` already refuses to count one towards an `all_of` step, and
+ * `hasReachableApprover` filters them out for the same reason. Listing them here would put them in
+ * front of an admin as though they were part of the org chart.
+ *
+ * Closed edges are kept because the graph is temporal: an admin looking at today's chart has to be
+ * able to tell "this line was closed in July" from "this person never reported to anyone".
+ */
+export function listReportingLines(sql: SqlStorage): ReportingLineRow[] {
+  return sql
+    .exec<ReportingLineRow>(
+      `SELECT id, employee_id, manager_id, valid_from, valid_to
+       FROM org_edges WHERE kind = 'report' ORDER BY id`,
+    )
+    .toArray();
+}
+
 /**
  * Everyone authorised over `employeeId` at `at` — reporting lines and live delegations.
  *

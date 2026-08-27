@@ -6,13 +6,14 @@ import {
   type AllocationEntry, type AllocationRow, type Reconciliation,
 } from "./allocations.js";
 import {
-  createEmployee, employeeProfile, grantExemption, isExempt, linkAccount, resolveAccount,
-  unlinkAccount,
-  type EmployeeProfile, type NewEmployee,
+  createEmployee, employeeProfile, grantExemption, isExempt, linkAccount, listEmployees,
+  openAccountLink, resolveAccount, unlinkAccount,
+  type AccountLinkRow, type EmployeeProfile, type EmployeeRow, type NewEmployee,
 } from "./employees.js";
 import {
-  assertApproverReachable, hasAuthorityOver, hasReachableApprover, managersAt, setDelegate,
-  setReportingLine,
+  assertApproverReachable, hasAuthorityOver, hasReachableApprover, listReportingLines, managersAt,
+  setDelegate, setReportingLine,
+  type ReportingLineRow,
 } from "./org.js";
 import {
   allPunches, correctPunch, currentPunches, dayAnomalies, recordPunch, workedMinutes,
@@ -67,6 +68,11 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
     return createEmployee(this.sql, input);
   }
 
+  /** The whole roster, departed employees included. See `listEmployees`. */
+  async listEmployees(): Promise<EmployeeRow[]> {
+    return listEmployees(this.sql);
+  }
+
   async linkAccount(
     accountId: string, employeeId: EmployeeId, now: number,
     linkedBy?: EmployeeId, reason?: string,
@@ -81,6 +87,11 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
 
   async resolveAccount(accountId: string, at: number): Promise<EmployeeId | null> {
     return resolveAccount(this.sql, accountId, at);
+  }
+
+  /** The account's open link row, or null. Test-only introspection. */
+  async openAccountLink(accountId: string): Promise<AccountLinkRow | null> {
+    return openAccountLink(this.sql, accountId);
   }
 
   async employeeProfile(employeeId: EmployeeId): Promise<EmployeeProfile> {
@@ -105,6 +116,11 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
     employeeId: EmployeeId, delegateId: EmployeeId, from: number, to: number,
   ): Promise<void> {
     setDelegate(this.sql, employeeId, delegateId, from, to);
+  }
+
+  /** Every reporting edge, closed windows included and delegates excluded. See `listReportingLines`. */
+  async listReportingLines(): Promise<ReportingLineRow[]> {
+    return listReportingLines(this.sql);
   }
 
   async managersAt(
