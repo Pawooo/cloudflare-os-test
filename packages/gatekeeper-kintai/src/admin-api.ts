@@ -130,6 +130,27 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
     return this.#store.listReportingLines();
   }
 
+  /**
+   * KNOWN LIMITATION, recorded here rather than in a review document: the three mutating methods
+   * below write their audit entry in a SECOND RPC call to the store, so the mutation and its audit
+   * entry are serialized but NOT atomic. A DO eviction or isolate kill between the two round-trips
+   * persists the mutation with no audit record — on the identity-granting operations, which is the
+   * worst place for it.
+   *
+   * Deferred deliberately. Closing it means threading an audit payload into the store primitives,
+   * which also pulls `revoke()`'s `unlinkAccount` and every existing caller of `createEmployee`
+   * into the audit trail — a change to the store contract, not a fix. The exposure is small (all
+   * four calls target the same singleton DO, on an admin-only path) but it is real.
+   *
+   * `linkAccount` is partly covered regardless: `account_links.linked_by` is written in the same
+   * statement as the link itself, so that one operation keeps its actor even if the audit write is
+   * lost. `createEmployee` and `setReportingLine` do not.
+   *
+   * If this is revisited: for `linkAccount` alone the audit write could move AHEAD of the mutation,
+   * since its `entityId` is the caller-supplied `employeeId` and does not depend on the write's
+   * result. That flips the failure mode from "identity granted, no record" to "record, no grant",
+   * which is the safer direction — at the cost of the entry meaning intent rather than fact.
+   */
   async createEmployee(input: NewEmployee): Promise<EmployeeId> {
     const now = Date.now();
     const actorEmployeeId = await this.#actor(now);
