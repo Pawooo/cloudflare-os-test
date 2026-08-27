@@ -269,6 +269,150 @@ describe("the capability an admin receives", () => {
   });
 });
 
+describe("the roster an admin reads", () => {
+  // The roster is the screen HR works from, so what it returns is what HR believes. These pin the
+  // two computed columns at the API boundary; `roster.test.ts` pins the rules behind them.
+  it("reports who is linked and who can actually file", async () => {
+    const hr = appUi(`acct-admin-roster-${seq}`, true);
+    const unlinked = await employee("Unlinked");
+    const stranded = await employee("Stranded");
+    const working = await employee("Working");
+    const boss = await employee("Boss");
+    await hr.linkAccount(`acct-stranded-${seq}`, stranded);
+    await hr.linkAccount(`acct-working-${seq}`, working);
+    await hr.setReportingLine(working, boss);
+
+    const roster: Record<string, any> = Object.fromEntries(
+      (await hr.listEmployees()).map((row: { id: number }) => [row.id, row]),
+    );
+
+    expect(roster[unlinked])
+      .toMatchObject({ linked: false, managerIds: [], approverReachable: false });
+    // Linked and still unable to use the system: the state an HR user would otherwise call done.
+    expect(roster[stranded]).toMatchObject({ linked: true, approverReachable: false });
+    expect(roster[working])
+      .toMatchObject({ linked: true, managerIds: [boss], approverReachable: true });
+  });
+
+  // The roster is the whole headcount, and every row of it carries a display name and an employee
+  // number. It must not also carry anybody's account code: HR learns those from the employee, one
+  // at a time, and a list of them would be a list of identities waiting to be pointed somewhere.
+  it("never puts another employee's account code on the roster", async () => {
+    const hr = appUi(`acct-admin-noleak-${seq}`, true);
+    const id = await employee("Secretive");
+    const accountId = `acct-secret-${seq}`;
+    await hr.linkAccount(accountId, id);
+
+    expect(JSON.stringify(await hr.listEmployees())).not.toContain(accountId);
+  });
+});
+
+describe("what an admin may write", () => {
+  // `joinedOn` is now typed into a form. `@validateRpc()` only knows it is a string, and the
+  // column has no CHECK, so a date that does not exist would persist and every later reader would
+  // treat it as real. The check is `assertWorkDate`, imported from `input.ts` -- the same one the
+  // session facet applies to every other date in this package, not a second copy of the rule.
+  it.each(["2026-02-31", "2026-13-01", "01/04/2026", "2026-4-1", ""])(
+    "refuses %o as a joining date", async (joinedOn) => {
+      const hr = appUi(`acct-admin-date-${seq}`, true);
+
+      await expect(() => hr.createEmployee({
+        employeeNumber: `E-date-${seq}`, displayName: "Bad Date", joinedOn,
+      })).rejects.toThrow(/KINTAI_INVALID_INPUT/);
+    },
+  );
+
+  it("refuses a nameless employee, who nobody could pick out of an approval queue", async () => {
+    const hr = appUi(`acct-admin-blank-${seq}`, true);
+
+    await expect(() => hr.createEmployee({
+      employeeNumber: `E-blank-${seq}`, displayName: "   ", joinedOn: "2026-04-01",
+    })).rejects.toThrow(/KINTAI_INVALID_INPUT/);
+    await expect(() => hr.createEmployee({
+      employeeNumber: "", displayName: "No Number", joinedOn: "2026-04-01",
+    })).rejects.toThrow(/KINTAI_INVALID_INPUT/);
+  });
+
+  it("refuses an oversized field rather than writing it into the shared store", async () => {
+    const hr = appUi(`acct-admin-long-${seq}`, true);
+
+    await expect(() => hr.createEmployee({
+      employeeNumber: `E-long-${seq}`, displayName: "x".repeat(201), joinedOn: "2026-04-01",
+    })).rejects.toThrow(/KINTAI_INVALID_INPUT/);
+  });
+
+  // The UNIQUE index is the authority; this is about the message HR reads when they hit it. An
+  // uncoded SQLite failure is a 500 in the iframe and tells them nothing.
+  it("refuses a duplicate employee number in a sentence, not a constraint violation", async () => {
+    const hr = appUi(`acct-admin-dup-${seq}`, true);
+    const number = `E-dup-${seq}`;
+    await hr.createEmployee({ employeeNumber: number, displayName: "First", joinedOn: "2026-04-01" });
+
+    await expect(() => hr.createEmployee({
+      employeeNumber: number, displayName: "Second", joinedOn: "2026-04-01",
+    })).rejects.toThrow(/KINTAI_INVALID_INPUT.*already belongs/);
+  });
+
+  // A designated approver is one of only three ways an employee can ever have anything approved.
+  // Pointing it at a record that does not exist builds exactly the silently-unusable employee the
+  // roster exists to expose.
+  it("refuses a designated approver who does not exist", async () => {
+    const hr = appUi(`acct-admin-noapprover-${seq}`, true);
+
+    await expect(() => hr.createEmployee({
+      employeeNumber: `E-ghost-${seq}`, displayName: "Ghost Boss", joinedOn: "2026-04-01",
+      designatedApproverId: 999_999,
+    })).rejects.toThrow(/KINTAI_NOT_FOUND/);
+  });
+
+  it("refuses to link an account to an employee who does not exist", async () => {
+    const hr = appUi(`acct-admin-linkghost-${seq}`, true);
+
+    await expect(() => hr.linkAccount(`acct-ghost-${seq}`, 999_999))
+      .rejects.toThrow(/KINTAI_NOT_FOUND/);
+    // And refused before anything was written: the account still resolves to nobody.
+    expect(await store.resolveAccount(`acct-ghost-${seq}`, Date.now())).toBeNull();
+  });
+
+  it("refuses a blank account code", async () => {
+    const hr = appUi(`acct-admin-blankcode-${seq}`, true);
+    const id = await employee("Waiting");
+
+    await expect(() => hr.linkAccount("   ", id)).rejects.toThrow(/KINTAI_INVALID_INPUT/);
+  });
+
+  // A self-edge looks like progress and grants nothing: self-approval is refused outright by
+  // `actOnSubmission`, so the employee would stay unable to file with a reporting line on screen.
+  it("refuses a reporting line from an employee to themselves", async () => {
+    const hr = appUi(`acct-admin-self-${seq}`, true);
+    const id = await employee("Loner");
+
+    await expect(() => hr.setReportingLine(id, id)).rejects.toThrow(/KINTAI_INVALID_INPUT/);
+    expect((await store.listReportingLines()).filter((row) => row.employee_id === id)).toEqual([]);
+  });
+
+  it("refuses a reporting line naming an employee or a manager who does not exist", async () => {
+    const hr = appUi(`acct-admin-orgghost-${seq}`, true);
+    const id = await employee("Real");
+
+    await expect(() => hr.setReportingLine(id, 999_999)).rejects.toThrow(/KINTAI_NOT_FOUND/);
+    await expect(() => hr.setReportingLine(999_999, id)).rejects.toThrow(/KINTAI_NOT_FOUND/);
+  });
+
+  // Validation runs ahead of the mutation AND ahead of its audit entry, so a refused call leaves
+  // no trace suggesting something happened.
+  it("writes no audit entry for a call it refused", async () => {
+    const hr = appUi(`acct-admin-noaudit-${seq}`, true);
+    const before = (await store.auditEntries()).length;
+
+    await expect(() => hr.createEmployee({
+      employeeNumber: `E-refused-${seq}`, displayName: "Refused", joinedOn: "2026-02-31",
+    })).rejects.toThrow(/KINTAI_INVALID_INPUT/);
+
+    expect((await store.auditEntries()).length).toBe(before);
+  });
+});
+
 describe("the audit trail", () => {
   // src/store/audit.ts promises to record "account linking, org edges, exemptions, route
   // configuration and period locks". Before part 1 nothing in the runtime called `appendAudit` at

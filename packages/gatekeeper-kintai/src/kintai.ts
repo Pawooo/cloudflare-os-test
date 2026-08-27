@@ -32,6 +32,9 @@ import type { ActPreview, SubmissionRow } from "./store/submissions.js";
 import type { KintaiStore } from "./store/kintai-store.js";
 import { UnlinkedAccountError } from "./store/employees.js";
 import { AdminKintaiApi, ViewerKintaiApi } from "./admin-api.js";
+import {
+  assertMinutes, assertText, assertWorkDate, InvalidInputError, LIMITS,
+} from "./input.js";
 import TYPES_CODE from "./types.txt";
 import APP_HTML from "./generated/app.txt";
 
@@ -103,87 +106,9 @@ export class GatekeeperVendor
   }
 }
 
-/**
- * Rejects malformed input at the facet, the untrusted boundary.
- *
- * A raw SQLite CHECK violation would surface as an uncoded error the RPC boundary can only turn
- * into a 500, and most of these values reach no CHECK at all: `Date.parse("banana")` is `NaN` and
- * `periodOf("banana")` is `"banana"`, so junk dates sail past the exemption, approver-reachability
- * and period-lock queries and persist. Coded, like `SubmissionNotFoundError`, because a malformed
- * argument is an ordinary client mistake.
- */
-export class InvalidInputError extends Error {
-  readonly code = "KINTAI_INVALID_INPUT";
-  constructor(detail: string) {
-    super(`KINTAI_INVALID_INPUT: ${detail}`);
-  }
-}
-
-const WORK_DATE = /^\d{4}-\d{2}-\d{2}$/;
-
-/**
- * A real JST calendar date in `YYYY-MM-DD` form.
- *
- * The round-trip is not redundant with the pattern: "2026-02-31" and "2026-13-01" both match it,
- * and `Date.parse` silently rolls them over into March and January rather than failing.
- */
-function assertWorkDate(label: string, value: string): void {
-  if (typeof value !== "string" || !WORK_DATE.test(value)) {
-    throw new InvalidInputError(`${label} must be a calendar date in YYYY-MM-DD form.`);
-  }
-  const parsed = new Date(`${value}T00:00:00Z`);
-  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) {
-    throw new InvalidInputError(`${label} is not a real calendar date: ${value}.`);
-  }
-}
-
-/** Minutes are whole and never negative; the schema's CHECKs are the backstop, not the message. */
-function assertMinutes(label: string, value: number): void {
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
-    throw new InvalidInputError(`${label} must be a whole number of minutes, and not negative.`);
-  }
-}
-
-/**
- * Size limits on everything a caller can write into the store.
- *
- * The store is ONE Durable Object holding every employee's payroll record, and the code calling
- * this facet is a Gadget the employee can rewrite at will. Nothing downstream bounds these: the
- * schema's CHECK constraints cover value ranges, never lengths, so an unbounded string or array is
- * a way for any one employee to consume storage every other employee depends on. A single call
- * capped here is worth roughly 100 KB rather than however much the caller felt like sending.
- *
- * The numbers are chosen to sit far above any honest use and far below anything that hurts:
- *
- *  - 200 allocation entries — a day split across 200 distinct projects is already implausible.
- *  - 64 characters of project code — an accounting code, not prose.
- *  - 500 characters of note, per entry — a line of explanation for one project line.
- *  - 2,000 characters of overtime reason — a paragraph or two, which is what an approver reads.
- *  - 2,000 characters of approval comment — the same, from the other side.
- *
- * These are facet-level input validation, alongside `assertWorkDate`/`assertMinutes`, because this
- * is the untrusted boundary. They are NOT a rate limit: nothing here stops a caller making the
- * same bounded call a million times, which stays an open item for the store layer.
- */
-const LIMITS = {
-  allocationEntries: 200,
-  projectCode: 64,
-  note: 500,
-  reason: 2_000,
-  comment: 2_000,
-} as const;
-
-/** A caller-supplied string that lands in the shared store: must be a string, and bounded. */
-function assertText(label: string, value: string, maxLength: number): void {
-  if (typeof value !== "string") {
-    throw new InvalidInputError(`${label} must be a string.`);
-  }
-  if (value.length > maxLength) {
-    throw new InvalidInputError(
-      `${label} must be at most ${maxLength} characters (received ${value.length}).`,
-    );
-  }
-}
+// Re-exported: this module was where input validation lived before `input.ts` split it out so
+// the HR admin API could share it (see that file), and callers still read the error from here.
+export { InvalidInputError };
 
 type KintaiProps = { accountId: string };
 

@@ -1,9 +1,13 @@
 import { RpcTarget } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
-import type { EmployeeId, KintaiIdentity } from "./types.js";
-import type { EmployeeRow, NewEmployee } from "./store/employees.js";
+import type { EmployeeId, KintaiIdentity, RosterEntry } from "./types.js";
+import type { NewEmployee } from "./store/employees.js";
+import { EmployeeNotFoundError } from "./store/employees.js";
 import type { ReportingLineRow } from "./store/org.js";
 import type { KintaiStore } from "./store/kintai-store.js";
+import {
+  assertEmployeeId, assertRequiredText, assertText, assertWorkDate, InvalidInputError, LIMITS,
+} from "./input.js";
 
 /**
  * The HR admin surface, served to the management app at `/gatekeepers/kintai`.
@@ -45,13 +49,28 @@ export interface KintaiAdminApi {
    */
   whoAmI(): Promise<KintaiIdentity>;
 
-  /** The whole roster. Admin only — this is the company's headcount. */
-  listEmployees(): Promise<EmployeeRow[]>;
+  /**
+   * The whole roster, with the computed columns HR reads it for. Admin only — this is the
+   * company's headcount.
+   *
+   * It returns `RosterEntry` rather than the raw `employees` row because the question HR actually
+   * asks of a roster is "who can use this system?", and no column answers it: an employee is
+   * usable only once an account resolves to them AND somebody could approve what they file. Both
+   * are computed per read, from the same functions the runtime enforces with.
+   *
+   * Folded into this one method rather than exposed as a per-employee `hasReachableApprover`,
+   * which was the alternative. Three reasons. A roster of 200 would otherwise be 200 further RPCs
+   * to answer a question every row asks. The two facts belong to the same instant, and separate
+   * calls would let a link land between them and render a row that was never true. And a
+   * per-employee probe invites a caller to assemble its own verdict about who is approvable —
+   * exactly the second implementation `hasReachableApprover`'s own comment warns about.
+   */
+  listEmployees(): Promise<RosterEntry[]>;
 
   /** Every reporting edge, closed windows included. Admin only — this is the org chart. */
   listReportingLines(): Promise<ReportingLineRow[]>;
 
-  /** Create an employee record. Admin only. */
+  /** Create an employee record. Admin only, and validated — see `AdminKintaiApi.createEmployee`. */
   createEmployee(input: NewEmployee): Promise<EmployeeId>;
 
   /**
@@ -122,8 +141,17 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
     return identify(this.#store, this.#accountId);
   }
 
-  async listEmployees(): Promise<EmployeeRow[]> {
-    return this.#store.listEmployees();
+  /**
+   * The roster, computed at one instant.
+   *
+   * `Date.now()` is read here and passed down, so every row is judged as of the same moment — a
+   * roster whose rows disagreed about what time it is could show a manager edge as live in one row
+   * and expired in the next. It is a server clock, never a caller-supplied one: `at` decides which
+   * links and which org edges are in force, so accepting it as an argument would let a caller ask
+   * what the roster looked like under a reporting line they no longer have.
+   */
+  async listEmployees(): Promise<RosterEntry[]> {
+    return this.#store.listRoster(Date.now());
   }
 
   async listReportingLines(): Promise<ReportingLineRow[]> {
@@ -153,6 +181,7 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
    */
   async createEmployee(input: NewEmployee): Promise<EmployeeId> {
     const now = Date.now();
+    await this.#assertNewEmployee(input);
     const actorEmployeeId = await this.#actor(now);
     const employeeId = await this.#store.createEmployee(input);
     await this.#store.appendAudit({
@@ -182,6 +211,9 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
    */
   async linkAccount(accountId: string, employeeId: EmployeeId): Promise<void> {
     const now = Date.now();
+    assertRequiredText("account code", accountId, LIMITS.accountId);
+    assertEmployeeId("employee", employeeId);
+    await this.#assertEmployeeExists(employeeId);
     const linkedBy = await this.#actor(now);
     // Read before the write, so the entry records what this account resolved to beforehand. For
     // the operation that grants identity, "who was this before" is the question an auditor asks
@@ -205,12 +237,86 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
    */
   async setReportingLine(employeeId: EmployeeId, managerId: EmployeeId): Promise<void> {
     const now = Date.now();
+    assertEmployeeId("employee", employeeId);
+    assertEmployeeId("manager", managerId);
+    // Refused rather than written, because a self-edge can never authorise anything: self-approval
+    // is rejected outright by `actOnSubmission`, and `hasReachableApprover` therefore filters
+    // self-edges out when deciding whether an employee is approvable at all. Writing one would
+    // hand HR a reporting line that looks like progress, leave the roster still showing the
+    // employee as unable to file, and give no clue why. This is an input check standing in front
+    // of that rule, not a second copy of it — the rule itself stays where it is enforced.
+    if (employeeId === managerId) {
+      throw new InvalidInputError(
+        "an employee cannot report to themselves: nobody may approve their own submissions, so " +
+        "the line would grant no authority.",
+      );
+    }
+    await this.#assertEmployeeExists(employeeId);
+    await this.#assertEmployeeExists(managerId);
     const actorEmployeeId = await this.#actor(now);
     const edgeId = await this.#store.setReportingLine(employeeId, managerId, now);
     await this.#store.appendAudit({
       at: now, actorEmployeeId, action: "set_reporting_line", entity: "org_edges",
       entityId: edgeId, after: { employeeId, managerId, validFrom: now },
     });
+  }
+
+  /**
+   * Reject a `NewEmployee` that the schema would accept but HR could not live with.
+   *
+   * `@validateRpc()` already rejects anything of the wrong TYPE, which is why nothing here
+   * re-checks that a string is a string. What it cannot see is meaning, and until part 2 these
+   * values came from other worker code rather than from a form:
+   *
+   *  - `joinedOn` reaches a TEXT column with no CHECK, and every downstream reader treats a work
+   *    date as parseable. `assertWorkDate` is the SAME check the session facet applies to every
+   *    other date in this package, imported rather than rewritten: it is the one that catches
+   *    "2026-02-31", which the regex alone accepts and `Date.parse` silently rolls into March.
+   *  - `displayName` is NOT NULL but has no CHECK against emptiness, and it is what every approver
+   *    sees in their queue. A blank one is a row HR cannot recognise afterwards.
+   *  - the text fields are bounded, because this all lands in the one Durable Object that holds
+   *    every employee's payroll record.
+   *  - `designatedApproverId` is one of only three ways an employee can ever have a submission
+   *    approved, so pointing it at a record that does not exist creates precisely the silently
+   *    unusable employee this screen exists to make visible. The foreign key would refuse it
+   *    anyway; this refuses it in a sentence.
+   *
+   * Duplicate employee numbers are NOT checked here. That constraint lives in the schema and is
+   * translated where it fires, in `store/employees.ts`'s `createEmployee` — checking first would
+   * be a second opinion that a concurrent call could invalidate between the read and the write.
+   */
+  async #assertNewEmployee(input: NewEmployee): Promise<void> {
+    assertRequiredText("employee number", input.employeeNumber, LIMITS.employeeNumber);
+    assertRequiredText("name", input.displayName, LIMITS.displayName);
+    if (input.department !== undefined) {
+      assertText("department", input.department, LIMITS.department);
+    }
+    if (input.employmentType !== undefined) {
+      assertText("employment type", input.employmentType, LIMITS.employmentType);
+    }
+    assertWorkDate("joined on", input.joinedOn);
+    if (input.designatedApproverId !== undefined) {
+      assertEmployeeId("designated approver", input.designatedApproverId);
+      await this.#assertEmployeeExists(input.designatedApproverId);
+    }
+  }
+
+  /**
+   * Refuse an employee id that names no record, with a coded error rather than a foreign key.
+   *
+   * The foreign keys are real and enforced (workerd runs SQLite with them on — a link to a missing
+   * employee raises `FOREIGN KEY constraint failed`), so this is not what keeps the data honest.
+   * It is what turns "500" into a sentence HR can act on, ahead of the write.
+   *
+   * There is no check-then-write race behind it: nothing in this package ever deletes an employee
+   * row — revocation closes an account link and departure sets a status — so a record that exists
+   * at the check still exists at the write. If a delete is ever added, this becomes advisory and
+   * the foreign key stays the guard.
+   */
+  async #assertEmployeeExists(employeeId: EmployeeId): Promise<void> {
+    if (!await this.#store.employeeExists(employeeId)) {
+      throw new EmployeeNotFoundError(employeeId);
+    }
   }
 
   /**

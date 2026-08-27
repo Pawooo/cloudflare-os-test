@@ -6,10 +6,11 @@ import {
   type AllocationEntry, type AllocationRow, type Reconciliation,
 } from "./allocations.js";
 import {
-  createEmployee, employeeProfile, grantExemption, isExempt, linkAccount, listEmployees,
-  openAccountLink, resolveAccount, unlinkAccount,
+  createEmployee, employeeExists, employeeProfile, grantExemption, isExempt, linkAccount,
+  listEmployees, openAccountLink, resolveAccount, unlinkAccount,
   type AccountLinkRow, type EmployeeProfile, type EmployeeRow, type NewEmployee,
 } from "./employees.js";
+import { listRoster } from "./roster.js";
 import {
   assertApproverReachable, hasAuthorityOver, hasReachableApprover, listReportingLines, managersAt,
   setDelegate, setReportingLine,
@@ -32,7 +33,7 @@ import {
 } from "../routes.js";
 import { assertWritable, isLocked, lockPeriod, periodLock, type PeriodLock } from "./periods.js";
 import { appendAudit, auditEntries, type AuditEntry, type AuditRow } from "./audit.js";
-import type { EmployeeId, SubmissionState } from "../types.js";
+import type { EmployeeId, RosterEntry, SubmissionState } from "../types.js";
 
 @validateRpc()
 export class KintaiStore extends DurableObject<Cloudflare.Env> {
@@ -71,6 +72,16 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
   /** The whole roster, departed employees included. See `listEmployees`. */
   async listEmployees(): Promise<EmployeeRow[]> {
     return listEmployees(this.sql);
+  }
+
+  /** The roster with the two computed onboarding columns, as of `at`. See `listRoster`. */
+  async listRoster(at: number): Promise<RosterEntry[]> {
+    return listRoster(this.sql, at);
+  }
+
+  /** Whether an employee record exists. Departed employees still exist. */
+  async employeeExists(employeeId: EmployeeId): Promise<boolean> {
+    return employeeExists(this.sql, employeeId);
   }
 
   async linkAccount(
