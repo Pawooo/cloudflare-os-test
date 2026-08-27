@@ -2,6 +2,7 @@ import { DurableObject, RpcTarget } from "cloudflare:workers";
 import type {
   ActionDescription, ActionKind, ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
+import { applyStagedApprovalsSchema } from "../src/kintai.js";
 import type { KintaiGatekeeper, KintaiSession } from "../src/kintai.js";
 
 export { default } from "../src/worker.js";
@@ -274,5 +275,56 @@ export class KintaiFacetHost extends DurableObject<Cloudflare.Env> {
   setShares(observerIds: string[]): void {
     this.#queueState.shares.clear();
     for (const id of observerIds) this.#queueState.shares.add(id);
+  }
+
+  /**
+   * Build a PRE-UPGRADE `staged_approvals` table, run the real migration over it, and report what
+   * survived.
+   *
+   * The only way to test the migration at all. A live facet runs it in its constructor, so by the
+   * time any test can reach that facet the table is already migrated and its legacy shape — no
+   * `staged_after_event_id`, no unique index, and therefore duplicate open rows — is unreachable
+   * through every public surface. So the shape is built here, in this host's OWN storage (the
+   * facets keep theirs separately, so nothing else is disturbed), and handed to the same exported
+   * function the constructor calls.
+   *
+   * Ids are given explicitly because the migration's tie-break is `MIN(id)`, which is the thing
+   * under test.
+   */
+  migrateLegacyStaged(
+    rows: { id: number; submissionId: number; actorId: number; action: string; state: string }[],
+  ): { id: number; state: string; action: string; staged_after_event_id: number | null;
+       error: string | null }[] {
+    const sql = this.ctx.storage.sql;
+    sql.exec(`DROP TABLE IF EXISTS staged_approvals`);
+    // Verbatim the table as it stood before this change: no marker column, no index.
+    sql.exec(`CREATE TABLE staged_approvals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      submission_id INTEGER NOT NULL,
+      actor_employee_id INTEGER NOT NULL,
+      action TEXT NOT NULL CHECK (action IN ('approve', 'reject', 'return')),
+      comment TEXT,
+      staged_at INTEGER NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('pending', 'applying', 'applied', 'failed')),
+      error TEXT
+    ) STRICT`);
+    for (const row of rows) {
+      sql.exec(
+        `INSERT INTO staged_approvals
+           (id, submission_id, actor_employee_id, action, comment, staged_at, state, error)
+         VALUES (?, ?, ?, ?, NULL, 0, ?, NULL)`,
+        row.id, row.submissionId, row.actorId, row.action, row.state,
+      );
+    }
+
+    applyStagedApprovalsSchema(sql);
+
+    return sql
+      .exec<{ id: number; state: string; action: string; staged_after_event_id: number | null;
+              error: string | null }>(
+        `SELECT id, state, action, staged_after_event_id, error
+         FROM staged_approvals ORDER BY id`,
+      )
+      .toArray();
   }
 }

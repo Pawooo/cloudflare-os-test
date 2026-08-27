@@ -710,6 +710,37 @@ describe("a decision cannot be applied twice concurrently", () => {
     expect(after.state).toBe("pending");
     expect(after.current_step).toBe(1);
   });
+
+  it("is failed rather than returned to pending, so deciding again is not a dead end", async () => {
+    // Staleness is the ONE refusal that can never become retryable: the marker is monotonic, so
+    // the comparison that failed will fail identically forever. Returned to `pending` it composed
+    // with staging's dedupe into a dead end with a success-shaped exit — the identical retry
+    // deduplicated onto the unappliable row and RESOLVED, a different decision was refused as a
+    // conflict, and the session has no discard.
+    const { bossAAccount, bossB, submissionId } = await twoStepUnderTwoManagers("STALE-4");
+    await sessionFor(bossAAccount).actOnSubmission(submissionId, "approve");
+    await store.actOnSubmission({
+      submissionId, actorId: bossB, action: "approve", now: Date.now(),
+    });
+    await expect(() => overseerFor(bossAAccount).applyAction(1))
+      .rejects.toThrow(/KINTAI_STALE_DECISION/);
+
+    // Terminal: it still refuses, and with the reason recorded on the row rather than as an
+    // in-flight or unknown outcome. (`applying` refuses `rejectAction` too, so it is unclearable.)
+    await expect(() => overseerFor(bossAAccount).applyAction(1))
+      .rejects.toThrow(/KINTAI_STALE_DECISION/);
+
+    // `failed` is outside the open-decision index, so the manager can decide again IMMEDIATELY on
+    // the submission as it now stands — this is what the error's own advice tells them to do.
+    await sessionFor(bossAAccount).actOnSubmission(submissionId, "approve");
+    expect((await host.readQueue()).actions).toHaveLength(2);
+    await overseerFor(bossAAccount).applyAction(2);
+    expect((await store.getSubmission(submissionId)).state).toBe("approved");
+    expect(await store.approvalEvents(submissionId)).toHaveLength(2);
+
+    // ...and the dead decision is still clearable the ordinary way.
+    expect(await overseerFor(bossAAccount).rejectAction(1)).toBeUndefined();
+  });
 });
 
 // ------------------------------------------------------------------------------------------------
@@ -848,6 +879,29 @@ describe("staging the same decision twice", () => {
     expect((await host.readQueue()).actions).toHaveLength(50);
   });
 
+  it("treats an omitted comment and an empty one as the same decision", async () => {
+    // The comment is part of the decision because the approver confirms it — but "" and omitted
+    // are the same absence, and everything downstream already renders and stores them alike. A
+    // natural-language caller that passes one on the first call and the other on its retry is not
+    // changing its mind, and must not be told it has a conflict.
+    const { bossAccount, worker, submissionId } = await pendingUnderManager();
+    const session = sessionFor(bossAccount);
+
+    await session.actOnSubmission(submissionId, "approve");
+    await expect(session.actOnSubmission(submissionId, "approve", "")).resolves.toBeUndefined();
+
+    // ...and in the other order, on a second submission.
+    const second = await store.submitOvertime({
+      employeeId: worker, requestedFor: "2026-08-11", minutes: 45, reason: "second",
+      now: Date.now(), department: null, employmentType: null,
+    });
+    await session.actOnSubmission(second, "approve", "");
+    await expect(session.actOnSubmission(second, "approve")).resolves.toBeUndefined();
+
+    // One decision each, not four.
+    expect((await host.readQueue()).actions).toHaveLength(2);
+  });
+
   it("keeps two managers' decisions on the same submission apart", async () => {
     // The index is per (submission, actor). Two approvers deciding on one submission are two
     // decisions, and neither may swallow the other.
@@ -857,6 +911,34 @@ describe("staging the same decision twice", () => {
     await sessionFor(bossBAccount).actOnSubmission(submissionId, "approve");
 
     expect((await host.readQueue()).actions).toHaveLength(2);
+  });
+});
+
+describe("the one-way migration from a pre-index facet", () => {
+  it("sweeps interrupted rows BEFORE collapsing duplicates, not after", async () => {
+    // The collapse counts `applying` as open and keeps `MIN(id)`, so run before the sweep it can
+    // rank a row as the survivor that the sweep is about to declare dead — deleting a decision a
+    // human had already confirmed and which may have reached the store, in favour of an older
+    // `pending` one that then has a NULL marker and so skips the staleness guard as well. That is
+    // the double sign-off this whole change exists to prevent, reintroduced by its own migration.
+    const migrated = await host.migrateLegacyStaged([
+      // Confirmed and interrupted mid-apply, alongside an older pending decision for the same pair.
+      { id: 10, submissionId: 1, actorId: 5, action: "approve", state: "pending" },
+      { id: 11, submissionId: 1, actorId: 5, action: "approve", state: "applying" },
+      // A genuine legacy duplicate: two open decisions, which the index would refuse to be created
+      // over. The older survives.
+      { id: 20, submissionId: 2, actorId: 6, action: "approve", state: "pending" },
+      { id: 21, submissionId: 2, actorId: 6, action: "reject", state: "pending" },
+    ]);
+
+    expect(migrated.map((row) => [row.id, row.state])).toEqual([
+      [10, "pending"], [11, "failed"], [20, "pending"],
+    ]);
+    // #11 survived as terminal, carrying the never-replay reason — not deleted for being younger.
+    expect(migrated.find((row) => row.id === 11)!.error)
+      .toMatch(/KINTAI_APPLY_OUTCOME_UNKNOWN/);
+    // Every legacy row is read at apply time as "staged before the guard existed".
+    expect(migrated.every((row) => row.staged_after_event_id === null)).toBe(true);
   });
 });
 

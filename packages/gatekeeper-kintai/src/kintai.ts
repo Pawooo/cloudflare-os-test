@@ -370,6 +370,30 @@ function isDomainRefusal(err: unknown): boolean {
   return err instanceof Error && /^KINTAI_[A-Z_]+:/.test(err.message);
 }
 
+/**
+ * Was this refusal the staleness guard specifically?
+ *
+ * THE ONE DOMAIN REFUSAL THAT IS NOT RETRYABLE, and so the one exception to "a clean refusal goes
+ * back to `pending`". Every other refusal describes something that can change back — an account is
+ * re-linked, a reporting line is restored — so a retry can succeed and the Overseer offers one. A
+ * stale decision cannot: the marker is `MAX(approval_events.id)`, which is monotonic, so the
+ * comparison that failed will fail identically forever.
+ *
+ * Left `pending` it is worse than merely stuck, because it composes with staging's dedupe: the
+ * identical decision re-issued would deduplicate onto the unappliable row and return SUCCESS
+ * without queueing anything, a different one would be refused with `KINTAI_DECISION_CONFLICT`, and
+ * the session has no discard — so an agent following this error's own advice to decide again finds
+ * both routes closed and its retry silently doing nothing. Failing the row is what reopens them:
+ * `failed` is outside `staged_approvals_open`, so the manager can stage a fresh decision on the
+ * same submission immediately, and `rejectAction` still clears it.
+ *
+ * Matched on the message for the same reason `isDomainRefusal` is — `code` does not survive the
+ * RPC boundary, so every error in this package repeats its code in its text.
+ */
+function isStaleRefusal(err: unknown): boolean {
+  return err instanceof Error && /^KINTAI_STALE_DECISION:/.test(err.message);
+}
+
 /** Minutes as a human reads them: `45m`, `2h`, `1h 30m`. */
 function formatDuration(minutes: number): string {
   const hours = Math.floor(minutes / 60);
@@ -932,6 +956,13 @@ export class KintaiSession extends RpcTarget {
     submissionId: number, action: ApprovalAction, comment?: string,
   ): Promise<void> {
     if (comment !== undefined) assertText("comment", comment, LIMITS.comment);
+    // An empty comment is no comment. Everything downstream already treats them alike — the
+    // description renders both as an empty quote and `approval_events.comment` stores NULL for
+    // either — but staging compares comments to decide retry-versus-conflict, and without this the
+    // one difference that is not a difference would make a re-issue a `KINTAI_DECISION_CONFLICT`.
+    // A natural-language caller that omits the comment on one call and passes "" on the next is
+    // not changing its decision.
+    if (comment === "") comment = undefined;
     const now = Date.now();
     const actorId = await this.#requireEmployee(now);
 
@@ -944,6 +975,15 @@ export class KintaiSession extends RpcTarget {
     // that was recorded, not a second decision. Returning without queueing again is the whole
     // point — two entries would be two confirmations, and on a multi-step route those land as
     // approvals at two different steps from one manager's single intent.
+    //
+    // KNOWN RACE, accepted. Returning here says "your decision is queued", which is read off the
+    // ROW rather than off the queue — and the caller that inserted that row is, at this instant,
+    // still awaiting `submitAction` below. If that submission is refused, that caller discards the
+    // row and throws, and this one has already returned success for a decision that no longer
+    // exists anywhere. It is bounded: it needs a concurrent identical call AND a refusing queue,
+    // and the other caller does surface the error. The alternative is holding a lock across an
+    // outgoing RPC, which is how the double-apply bug happened — a synchronous claim plus a narrow
+    // accepted window beats a gate held open across an await.
     if (deduped) return;
     try {
       await this.#approvalQueue.submitAction(
@@ -975,6 +1015,98 @@ type StagedRow = {
   staged_after_event_id: number | null;
 };
 
+/** Whether a table already has a column, for the one-way migrations below. */
+function hasColumn(sql: SqlStorage, table: string, column: string): boolean {
+  return sql
+    .exec<{ name: string }>(`PRAGMA table_info(${table})`)
+    .toArray()
+    .some((row) => row.name === column);
+}
+
+/**
+ * The staging table, its one-way migrations, and the index that makes staging idempotent.
+ *
+ * Exported so the migration ORDER can be tested against a legacy table, which is the only way to
+ * reach it: a live facet runs this in its constructor, so by the time any test can see the table
+ * it is already migrated. `KintaiFacetHost.migrateLegacyStaged` in the test worker builds the
+ * pre-upgrade shape in its own storage and calls this.
+ *
+ * THE ORDER OF THE FOUR STATEMENTS IS THE WHOLE POINT and must not be rearranged:
+ *
+ *  1. create the table
+ *  2. add `staged_after_event_id` if this facet predates it
+ *  3. SWEEP interrupted rows, `applying` -> `failed`
+ *  4. COLLAPSE duplicate open rows, then create the index over the open states
+ *
+ * 3 before 4 specifically. The collapse counts `applying` as open and keeps `MIN(id)`, so run the
+ * other way round it can rank a row as the survivor that the sweep is about to declare dead: given
+ * a legacy `#10 pending` and `#11 applying`, it would delete `#11` — a decision a human had ALREADY
+ * confirmed and which may have reached the store — and keep `#10`, which then has no `applying` row
+ * left for the sweep to find and a NULL staleness marker that makes the apply-time guard skip it
+ * too. That is the double sign-off this whole mechanism exists to prevent, reintroduced by its own
+ * migration. Swept first, `#11` is `failed` (terminal, never replayed) and `#10` is simply the
+ * oldest open row, which is what "keep the oldest" is supposed to mean.
+ */
+export function applyStagedApprovalsSchema(sql: SqlStorage): void {
+  sql.exec(`CREATE TABLE IF NOT EXISTS staged_approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    submission_id INTEGER NOT NULL,
+    actor_employee_id INTEGER NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('approve', 'reject', 'return')),
+    comment TEXT,
+    staged_at INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'applying', 'applied', 'failed')),
+    error TEXT,
+    staged_after_event_id INTEGER
+  ) STRICT`);
+  // Facets created before the staleness guard existed have the table without that column. Added
+  // nullable, which is the only thing ADD COLUMN can do without a default, and NULL is read as
+  // "staged before the guard" rather than as a marker value — see `applyAction`.
+  if (!hasColumn(sql, "staged_approvals", "staged_after_event_id")) {
+    sql.exec(`ALTER TABLE staged_approvals ADD COLUMN staged_after_event_id INTEGER`);
+  }
+
+  // A fresh instance means a fresh activation, so a row still marked `applying` belonged to an
+  // interrupted one: the decision had already been sent to the store and may or may not have
+  // landed. It must never be replayed — applying twice is not harmless, because on a multi-step
+  // route the replay would be counted at the step the first apply advanced the submission to.
+  //
+  // FIRST, before the collapse below. See this function's header.
+  sql.exec(
+    `UPDATE staged_approvals SET state = 'failed', error = ? WHERE state = 'applying'`,
+    APPLY_OUTCOME_UNKNOWN,
+  );
+
+  // A facet that predates the index may hold rows the index would reject, and CREATE UNIQUE INDEX
+  // fails outright on those — which would make the constructor throw on every activation and brick
+  // the facet. So the duplicates are collapsed first, keeping the OLDEST open decision for each
+  // pair: it is the one that was staged first and the one the approver is most likely already
+  // looking at. This runs once, on the first activation after the upgrade, and is a no-op
+  // afterwards because the index then makes duplicates impossible.
+  sql.exec(
+    `DELETE FROM staged_approvals
+     WHERE state IN ('pending', 'applying') AND id NOT IN (
+       SELECT MIN(id) FROM staged_approvals
+       WHERE state IN ('pending', 'applying')
+       GROUP BY submission_id, actor_employee_id
+     )`,
+  );
+
+  // ONE open decision per (submission, actor). This index is the dedupe mechanism, not a
+  // convenience on top of one: `#stage` is synchronous SQLite with no `await` in it, so an INSERT
+  // that the index rejects cannot have interleaved with the one that beat it — the same property
+  // the apply-time claim relies on. An application-level "is there already one?" check would be a
+  // second answer to a question the index already answers, and the kind that drifts.
+  //
+  // `applying` is in scope as well as `pending`: a decision that is mid-apply must not admit a
+  // second one for the same submission and actor. `applied` and `failed` are out, so a settled
+  // decision never blocks deciding again — which is what lets a manager re-decide immediately
+  // after a stale decision is failed at apply.
+  sql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS staged_approvals_open
+    ON staged_approvals(submission_id, actor_employee_id)
+    WHERE state IN ('pending', 'applying')`);
+}
+
 /**
  * The account's ambient Gatekeeper, installed by the Overseer as a facet under itself.
  *
@@ -1003,50 +1135,7 @@ export class KintaiGatekeeper
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
     this.#sql = ctx.storage.sql;
-    this.#sql.exec(`CREATE TABLE IF NOT EXISTS staged_approvals (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      submission_id INTEGER NOT NULL,
-      actor_employee_id INTEGER NOT NULL,
-      action TEXT NOT NULL CHECK (action IN ('approve', 'reject', 'return')),
-      comment TEXT,
-      staged_at INTEGER NOT NULL,
-      state TEXT NOT NULL CHECK (state IN ('pending', 'applying', 'applied', 'failed')),
-      error TEXT,
-      staged_after_event_id INTEGER
-    ) STRICT`);
-    // Facets created before the staleness guard existed have the table without that column. Added
-    // nullable, which is the only thing ADD COLUMN can do without a default, and NULL is read as
-    // "staged before the guard" rather than as a marker value — see `applyAction`.
-    if (!this.#hasColumn("staged_approvals", "staged_after_event_id")) {
-      this.#sql.exec(`ALTER TABLE staged_approvals ADD COLUMN staged_after_event_id INTEGER`);
-    }
-    // ONE open decision per (submission, actor). This index is the dedupe mechanism, not a
-    // convenience on top of one: `#stage` is synchronous SQLite with no `await` in it, so an
-    // INSERT that the index rejects cannot have interleaved with the one that beat it — the same
-    // property the apply-time claim relies on. An application-level "is there already one?" check
-    // would be a second answer to a question the index already answers, and the kind that drifts.
-    //
-    // `applying` is in scope as well as `pending`: a decision that is mid-apply must not admit a
-    // second one for the same submission and actor. `applied` and `failed` are out, so a settled
-    // decision never blocks deciding again.
-    //
-    // A facet that predates the index may hold rows it would reject, and CREATE UNIQUE INDEX fails
-    // outright on those — which would make this constructor throw on every activation and brick
-    // the facet. So the duplicates are collapsed first, keeping the OLDEST open decision for each
-    // pair: it is the one that was staged first and the one the approver is most likely already
-    // looking at. This runs once, on the first activation after the upgrade, and is a no-op
-    // afterwards because the index then makes duplicates impossible.
-    this.#sql.exec(
-      `DELETE FROM staged_approvals
-       WHERE state IN ('pending', 'applying') AND id NOT IN (
-         SELECT MIN(id) FROM staged_approvals
-         WHERE state IN ('pending', 'applying')
-         GROUP BY submission_id, actor_employee_id
-       )`,
-    );
-    this.#sql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS staged_approvals_open
-      ON staged_approvals(submission_id, actor_employee_id)
-      WHERE state IN ('pending', 'applying')`);
+    applyStagedApprovalsSchema(this.#sql);
     // The collaborators the Overseer has told this facet about. Recorded, not merely accepted,
     // because `listPendingApprovals` has to name them: it returns other employees' payroll records
     // and the Overseer needs to know who must not see them. Opaque ids chosen by the Overseer —
@@ -1054,27 +1143,11 @@ export class KintaiGatekeeper
     this.#sql.exec(`CREATE TABLE IF NOT EXISTS observers (
       id TEXT PRIMARY KEY
     ) STRICT`);
-    // A fresh instance means a fresh activation, so a row still marked `applying` belonged to an
-    // interrupted one: the decision had already been sent to the store and may or may not have
-    // landed. It must never be replayed — applying twice is not harmless, because on a multi-step
-    // route the replay would be counted at the step the first apply advanced the submission to.
-    this.#sql.exec(
-      `UPDATE staged_approvals SET state = 'failed', error = ? WHERE state = 'applying'`,
-      APPLY_OUTCOME_UNKNOWN,
-    );
   }
 
   /** The one shared store, named "" — the same instance every facet reaches. */
   #store(): DurableObjectStub<KintaiStore> {
     return this.ctx.exports.KintaiStore.getByName("");
-  }
-
-  /** Whether a table already has a column, for the one-way migrations in the constructor. */
-  #hasColumn(table: string, column: string): boolean {
-    return this.#sql
-      .exec<{ name: string }>(`PRAGMA table_info(${table})`)
-      .toArray()
-      .some((row) => row.name === column);
   }
 
   #staged(id: number): StagedRow | undefined {
@@ -1156,8 +1229,12 @@ export class KintaiGatekeeper
       // Unreachable: `staged_approvals_open` is the only constraint an ON CONFLICT DO NOTHING can
       // trip here, and it matches exactly this query. Refusing is still the safe direction if it
       // ever happens — the harm this whole mechanism exists to prevent is staging a duplicate.
+      //
+      // Its own code, NOT `KINTAI_DECISION_CONFLICT`: this is a broken invariant (someone added a
+      // second unique constraint to this table, most likely), and a log aggregator must be able to
+      // tell it from the ordinary refusal that a manager sees when they change their mind.
       throw new Error(
-        "KINTAI_DECISION_CONFLICT: this decision could not be staged, and no decision awaiting " +
+        "KINTAI_STAGING_INVARIANT: this decision could not be staged, and no decision awaiting " +
         "confirmation explains why. Nothing was recorded.",
       );
     }
@@ -1365,6 +1442,15 @@ export class KintaiGatekeeper
       });
     } catch (err) {
       if (isDomainRefusal(err)) {
+        if (isStaleRefusal(err)) {
+          // Terminal, and deliberately so — see `isStaleRefusal`. Nothing landed here either (the
+          // guard is checked before the write), so this is not `APPLY_OUTCOME_UNKNOWN`: the row
+          // carries the refusal's own text, which names what happened and tells the reader to
+          // decide again. It records WHY this one cannot be retried when every sibling can.
+          this.#setState(action, "failed", (err as Error).message);
+          this.#prune();
+          throw err;
+        }
         // Refused by the authority prologue, before any write. Nothing landed, so the row goes
         // back to `pending`: the Overseer tells the user the action failed and offers a retry,
         // which must be able to succeed once whatever caused the refusal is resolved.
