@@ -395,12 +395,16 @@ describe("authority is settled before anything is staged", () => {
     const rejected = await file("2026-07-04", "rejected");
     const withdrawn = await file("2026-07-05", "withdrawn");
     const returned = await file("2026-07-06", "returned");
+    const approved = await file("2026-07-07", "approved");
     await store.actOnSubmission({ submissionId: rejected, actorId: boss, action: "reject", now });
     await store.withdrawSubmission(withdrawn, worker);
     await store.actOnSubmission({ submissionId: returned, actorId: boss, action: "return", now });
+    await store.actOnSubmission({ submissionId: approved, actorId: boss, action: "approve", now });
+    // Every state the machine has, so the sweep cannot miss one.
+    expect((await store.getSubmission(approved)).state).toBe("approved");
 
     const stranger = sessionFor(strangerAccount);
-    for (const id of [pending, rejected, withdrawn, returned]) {
+    for (const id of [pending, rejected, withdrawn, returned, approved]) {
       await expect(() => stranger.actOnSubmission(id, "approve"))
         .rejects.toThrow(/KINTAI_NOT_AUTHORIZED/);
       await expect(() => stranger.actOnSubmission(id, "approve"))
@@ -634,5 +638,61 @@ describe("the approval queue read still protects other employees' records", () =
     await host.setShares(["late"]);
 
     await expect(() => session.listPendingApprovals()).rejects.toThrow(/OBSERVATION_EXCLUDED/);
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// Concurrency. `applyAction` awaits an RPC before it claims the row, and a Durable Object's input
+// gate is OPEN across an await — so two calls can both read `pending`, both pass the `applying`
+// guard, and both proceed. This is not theoretical: `overseer.ts`'s `approveAction` checks state
+// synchronously, then awaits `#getClientProfile()` before calling `applyPendingAction`, and only
+// marks the record approved after `applyAction` returns. Two clicks race. The Overseer builds a
+// single-flight drainer for the AUTO-approval path and says so at `overseer.ts:4207`, but Kintai's
+// action is never auto-approvable, so the manual path is the only one that reaches us and it has
+// no such guard.
+//
+// The harm is exactly the one the claim machinery exists to prevent: on a multi-step route the
+// replay is counted at the step the first apply advanced to.
+describe("a decision cannot be applied twice concurrently", () => {
+  it("admits one caller and refuses the other, leaving one approval event", async () => {
+    const { employeeId: boss, accountId: bossAccount } = await linkedEmployee("race-boss");
+    const { employeeId: worker } = await linkedEmployee("race-worker");
+    await store.setReportingLine(worker, boss, 0);
+    // TWO steps, so a replay is not merely refused by the state machine but actively harmful:
+    // the first apply advances to step 1, and a second would satisfy step 1 and approve outright.
+    // Scoped to a department, and the submission is filed under it: this store is shared by every
+    // test in the package and `resolveRoute` breaks a specificity tie by lowest id, so a catch-all
+    // route created by an earlier test would otherwise win and this would silently become a
+    // one-step route — which would test nothing, because the state machine alone refuses a replay
+    // on a one-step route.
+    await store.createRoute({
+      name: `race-route-${seq}`,
+      department: "RACE",
+      steps: [
+        { rule: "any_of", approverKind: "manager", approverEmployeeId: null },
+        { rule: "any_of", approverKind: "manager", approverEmployeeId: null },
+      ],
+    });
+    const submissionId = await store.submitOvertime({
+      employeeId: worker, requestedFor: "2026-07-30", minutes: 60, reason: "race",
+      now: Date.now(), department: "RACE", employmentType: null,
+    });
+    // Guard the guard: prove the two-step route is the one that was snapshotted.
+    expect(JSON.parse((await store.getSubmission(submissionId)).route_snapshot).steps)
+      .toHaveLength(2);
+    await sessionFor(bossAccount).actOnSubmission(submissionId, "approve");
+
+    const overseer = overseerFor(bossAccount);
+    const results = await Promise.allSettled([overseer.applyAction(1), overseer.applyAction(1)]);
+
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    const refused = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
+    expect(String(refused.reason)).toMatch(/KINTAI_ACTION_IN_FLIGHT/);
+
+    // The decision was recorded once, and the submission advanced exactly one step.
+    expect(await store.approvalEvents(submissionId)).toHaveLength(1);
+    const after = await store.getSubmission(submissionId);
+    expect(after.state).toBe("pending");
+    expect(after.current_step).toBe(1);
   });
 });

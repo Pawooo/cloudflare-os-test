@@ -311,6 +311,13 @@ const APPLY_OUTCOME_UNKNOWN =
  * exactly this reason (see `UnlinkedAccountError`'s own comment). The message is the only place a
  * caller can read the code from.
  *
+ * The safety of this rests on a second property, which holds today and must keep holding: NOTHING
+ * in `actOnSubmission` after the `INSERT INTO approval_events` throws at all. Every `KINTAI_`-coded
+ * error it can raise comes from the prologue, before any write. If a future change adds a
+ * `KINTAI_`-prefixed throw AFTER the insert, this function would classify a write that DID land as
+ * a clean refusal, return the row to `pending`, and invite a retry that double-applies it — the
+ * dangerous direction, and the one the claim machinery exists to prevent.
+ *
  * KNOWN FRAGILITY, so the next person meets it here rather than in production: the match is
  * anchored at the start of the message. If anything in the RPC path ever starts prefixing error
  * messages — a wrapper, a new capnweb version, an added "Error calling X:" — then every domain
@@ -805,12 +812,24 @@ export class KintaiSession extends RpcTarget {
    * is the safe reading, and it preserves the original intent exactly — nobody but the account
    * owner sees another employee's payroll record.
    *
-   * ACCEPTED RESIDUAL RISK, recorded rather than hidden: lockdown also used to stop the Gadget
-   * performing any action after this read, which blocked exfiltrating the data through some other
-   * gatekeeper (an email, a Slack post). Re-enabling actions is not a side effect but the entire
-   * point — approving IS an action — and `prohibitAllSharing` is workspace-wide with no
-   * per-gatekeeper form, so the two cannot be separated. The remaining mitigation is that any such
-   * action is itself queued for the same human, with a description saying what is being sent.
+   * TWO ACCEPTED RESIDUAL RISKS, recorded rather than hidden. Both follow from dropping a
+   * workspace-wide, permanent flag for a per-observation one, and neither can be avoided while
+   * keeping the approver flow, because approving IS an action and `prohibitAllSharing` has no
+   * per-gatekeeper form.
+   *
+   *  1. Exfiltration through another gatekeeper. Lockdown used to stop the Gadget performing ANY
+   *     action after this read, which blocked forwarding the data by email or Slack. Mitigated
+   *     only by those actions themselves being queued for the same human, with a description
+   *     saying what is being sent.
+   *
+   *  2. Sharing AFTER the read. `prohibitAllSharing` was permanent and also blocked all future
+   *     sharing — `addCollaborator`, `createShareLink`, `newShareLinkKey` and non-owner `open` all
+   *     throw once it is set — so data read on an unshared Gadget could never reach anyone. This
+   *     flag is evaluated per observation, against the observers recorded AT THAT INSTANT. Read
+   *     the queue while unshared and nothing is named; share the Gadget afterwards and the new
+   *     collaborator sees whatever it already rendered from that read. Later calls do start
+   *     failing, but what is already on the page is not retracted, and `addObserver` accepts
+   *     everyone (see `KintaiVerifier`).
    */
   async listPendingApprovals(): Promise<SubmissionRow[]> {
     const now = Date.now();
@@ -1143,15 +1162,37 @@ export class KintaiGatekeeper
     if (row.state === "applying") throw new ActionInFlightError(action);
     if (row.state === "failed") throw new Error(row.error ?? APPLY_OUTCOME_UNKNOWN);
 
+    // Claimed BEFORE THE FIRST AWAIT, not merely before the store call. A Durable Object's input
+    // gate is OPEN across an await, so a claim taken after `resolveAccount` would let two
+    // concurrent callers both read `pending`, both pass the guard above, and both apply — and on a
+    // multi-step route the second is counted at the step the first advanced to, which is precisely
+    // the harm this machinery exists to prevent. The guards above and this write run in one
+    // synchronous run-to-completion block, so the second caller sees `applying` and is refused.
+    //
+    // Reachable from the real Overseer: `approveAction` checks state synchronously, awaits
+    // `#getClientProfile()`, and only marks the record approved after `applyAction` returns, so two
+    // clicks race. Its single-flight drainer guards the auto-approval path only, and Kintai's
+    // action is never auto-approvable.
+    //
+    // It also means an activation that dies anywhere from here on leaves an `applying` row for the
+    // constructor to sweep to a terminal `failed`. In the narrow window before the store call that
+    // is pessimistic — nothing had been sent — but it errs toward "a human re-decides" rather than
+    // toward replaying a write that may have landed.
+    this.#setState(action, "applying");
+
     const now = Date.now();
     const store = this.#store();
-    const employeeId = await store.resolveAccount(this.ctx.props.accountId, now);
-    if (employeeId === null) throw new UnlinkedAccountError();
-    if (employeeId !== row.actor_employee_id) throw new StaleActorError();
+    try {
+      const employeeId = await store.resolveAccount(this.ctx.props.accountId, now);
+      if (employeeId === null) throw new UnlinkedAccountError();
+      if (employeeId !== row.actor_employee_id) throw new StaleActorError();
+    } catch (err) {
+      // Nothing has been sent to the store, so the decision is untouched and must stay retryable —
+      // a revoked account can be re-linked, and the Overseer offers a retry.
+      this.#setState(action, "pending");
+      throw err;
+    }
 
-    // Claimed BEFORE the call goes out, so an activation that dies mid-flight leaves evidence the
-    // constructor can find rather than a row that looks safe to replay.
-    this.#setState(action, "applying");
     try {
       await store.actOnSubmission({
         submissionId: row.submission_id,

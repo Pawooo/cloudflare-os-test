@@ -240,12 +240,18 @@ export interface KintaiSession {
    *
    * SHARING: this is the only method that returns other people's records, so it is treated as
    * strictly private. The call FAILS outright if this Gadget is currently shared with anyone — the
-   * data is refused rather than shown. Sharing the Gadget later will make this method start
-   * failing. If a Gadget needs to be shareable, do not call this; everything else here is the
-   * caller's own data and stays shareable.
+   * data is refused rather than shown. If a Gadget needs to be shareable, do not call this;
+   * everything else here is the caller's own data and stays shareable.
    *
-   * Calling this does NOT restrict what the Gadget may do afterwards: deciding on a submission it
-   * returned still works, which is the point of it.
+   * Two limits worth knowing, because neither is what you might assume:
+   *
+   *  - Calling this does NOT restrict what the Gadget may do afterwards. Deciding on a submission
+   *    it returned still works, which is the point of it.
+   *  - The check happens per call, against who has access AT THAT MOMENT. Reading the queue on an
+   *    unshared Gadget and sharing it afterwards is NOT prevented: later calls will start failing,
+   *    but anything this Gadget already rendered from the earlier read stays visible to the new
+   *    collaborator. If you display other people's submissions, do not leave them on screen in a
+   *    Gadget that may later be shared.
    */
   listPendingApprovals(): Promise<SubmissionRow[]>;
 

@@ -387,10 +387,17 @@ type ActAuthority = {
  *  1. Self-approval first, ahead of everything else: nobody signs off their own overtime, in any
  *     state, under any route.
  *  2. Authority BEFORE state, matching `withdrawSubmission` and `resubmit`.
- *     `InvalidTransitionError` names the state it refused, so checking state first would turn
- *     this into an oracle: a Gadget could walk the id space and read back, for every submission in
- *     the company, whether it exists, whether it belongs to the caller, and its exact state.
- *     Nothing about a submission is disclosed until the caller has proven they may act on it.
+ *     `InvalidTransitionError` names the state it refused, so checking state first would let a
+ *     Gadget walk the id space and read back the exact state of every submission in the company.
+ *     Ordering authority first closes that: a caller who cannot act learns only that they cannot.
+ *
+ *     Precisely what stays closed, and what does not. EXISTENCE is enumerable and always was —
+ *     `getSubmission` is statement 1 and throws `KINTAI_NOT_FOUND`, so a caller can discover which
+ *     ids exist. That is deliberate: an id that does not exist has no state and no owner to leak,
+ *     and refusing to distinguish it would mean answering `KINTAI_NOT_AUTHORIZED` for typos. What
+ *     is closed is everything that follows — the state, and whose submission it is. The one
+ *     exception is the caller's OWN submissions, which answer `KINTAI_SELF_APPROVAL`; that
+ *     discloses only what they may already read through `listMySubmissions`.
  *  3. Only then, with authority established, is the state safe to name.
  *
  * A row with no step at its current index is unactionable by anyone — `assertSatisfiable` rejects
