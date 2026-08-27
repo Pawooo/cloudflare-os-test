@@ -299,7 +299,11 @@ function AccountCard({ identity, admin }: { identity: KintaiIdentity; admin: boo
       <p className="text-sm text-kumo-default" data-testid="linked">
         {identity.linked ? (
           <>
-            Linked to employee <span data-testid="employee-id">{identity.employeeId}</span>.
+            {/* The id, not a name: `whoAmI` is the one method a non-admin may call, and it answers
+                from `account_links` alone — the roster that holds display names is admin-only. The
+                number is still what HR asks for when someone needs help. */}
+            You’re set up — this account is employee record{" "}
+            <span data-testid="employee-id">{identity.employeeId}</span>.
           </>
         ) : admin ? (
           "Not linked to an employee record yet, so your changes are recorded without a name" +
@@ -666,11 +670,28 @@ function CreateEmployeeForm({
 }
 
 /**
- * One form, with its message directly beneath its own submit button.
+ * One form, with its message directly beneath its own button.
  *
  * Every failure this screen can show belongs to one action, and putting it here is the point: a
  * refused link and a refused reporting line are different problems with different fixes, and a
  * shared banner at the top of the page would make the reader work out which one they are reading.
+ *
+ * THE BUTTON IS `type="button"`, AND THAT IS LOAD-BEARING. The Workshop hosts this app in an
+ * iframe with `sandbox="allow-scripts allow-modals"` — no `allow-forms` (see
+ * `SandboxedGatekeeperApp.tsx`). Chrome does not merely block the resulting navigation there: it
+ * blocks form submission outright, so the `submit` event never fires at all. A `type="submit"`
+ * button, `form.requestSubmit()` and the implicit Enter-key submission are all silently inert,
+ * with no error anywhere — the button simply does nothing, which is how this shipped once and was
+ * only caught by clicking it in a real browser.
+ *
+ * So every action runs from an explicit `onClick`, and Enter is handled here rather than left to
+ * the browser. `onSubmit` is kept because it costs nothing and is the correct behaviour if a host
+ * ever does allow forms; with no submit button in the form it cannot fire twice.
+ *
+ * The `<form>` element itself stays. It is what groups the fields for assistive technology, and
+ * `required` still marks the fields even though nothing will pop a native bubble. Emptiness is NOT
+ * re-checked here: the API's own messages are written for a person ("Employee number is
+ * required."), and a second copy of that rule in the browser is how the two drift apart.
  */
 function FormCard({
   title, hint, disabled, disabledHint, busy, notice, action, submitLabel, onSubmit, children,
@@ -700,7 +721,15 @@ function FormCard({
         className="flex flex-col gap-4 border-t border-kumo-line px-4 py-4"
         onSubmit={(event) => {
           event.preventDefault();
-          void onSubmit();
+          if (!busy) void onSubmit();
+        }}
+        // Enter in a field is how anybody types a code and moves on, and the sandbox took the
+        // browser's version of that away along with submission.
+        onKeyDown={(event) => {
+          if (event.key !== "Enter" || event.shiftKey) return;
+          if ((event.target as HTMLElement).tagName === "TEXTAREA") return;
+          event.preventDefault();
+          if (!busy) void onSubmit();
         }}
       >
         <p className="text-xs leading-5 text-kumo-subtle">{hint}</p>
@@ -711,10 +740,13 @@ function FormCard({
             <div className="grid gap-4 sm:grid-cols-2">{children}</div>
             <div className="flex flex-wrap items-center gap-3">
               <button
-                type="submit"
+                // Never "submit": see this component's comment. The host sandbox omits
+                // `allow-forms`, so a submit button in this iframe does nothing at all.
+                type="button"
                 data-action={action}
                 disabled={busy}
                 className="press inline-flex h-9 items-center rounded-lg bg-kumo-brand px-3.5 text-sm font-medium text-white hover:bg-kumo-brand-hover disabled:opacity-50"
+                onClick={() => void onSubmit()}
               >
                 {busy ? "Saving…" : submitLabel}
               </button>

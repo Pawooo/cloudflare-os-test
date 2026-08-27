@@ -352,6 +352,73 @@ describe("AdminPage", () => {
     });
   });
 
+  // The Workshop hosts this app with `sandbox="allow-scripts allow-modals"`. Chrome blocks form
+  // submission outright there — no `submit` event, no error, the button simply does nothing — so
+  // every one of these actions has to work without it. Verified by clicking in a real browser
+  // against `pnpm run-local`; these pin it so it cannot come back.
+  describe("working inside a sandbox that forbids forms", () => {
+    it("runs every action from a plain button, never from form submission", async () => {
+      await render(<AdminPage api={adminApi({}, [TANAKA, STRANDED])} />);
+
+      const buttons = [
+        ...container!.querySelectorAll<HTMLButtonElement>("button[data-action]"),
+      ];
+      expect(buttons.length).toBeGreaterThan(0);
+      for (const button of buttons) {
+        expect(button.type, `${button.dataset.action} must not rely on form submission`)
+          .toBe("button");
+      }
+    });
+
+    it("acts on the button press itself, with no submit event anywhere", async () => {
+      const api = adminApi({}, [TANAKA, STRANDED]);
+      await render(<AdminPage api={api} />);
+      let submitted = false;
+      for (const form of container!.querySelectorAll("form")) {
+        form.addEventListener("submit", () => { submitted = true; });
+      }
+
+      await type('[name="accountId"]', "acct-abc");
+      await choose('[data-form="link-account"] [name="employeeId"]', "3");
+      await submit("link-account");
+
+      expect(api.linkAccount).toHaveBeenCalledWith("acct-abc", 3);
+      expect(submitted).toBe(false);
+    });
+
+    // Typing a code and pressing Enter is what anybody does, and the sandbox took the browser's
+    // implicit submission away along with the rest.
+    it("acts on Enter in a field", async () => {
+      const api = adminApi({}, [TANAKA, STRANDED]);
+      await render(<AdminPage api={api} />);
+
+      await type('[name="accountId"]', "acct-enter");
+      await choose('[data-form="link-account"] [name="employeeId"]', "3");
+      await pressEnter('[name="accountId"]');
+
+      expect(api.linkAccount).toHaveBeenCalledWith("acct-enter", 3);
+    });
+
+    it("does not fire a second time while the first call is still running", async () => {
+      let release: (() => void) | undefined;
+      const api = adminApi({
+        linkAccount: vi.fn<KintaiAdminClient["linkAccount"]>(
+          () => new Promise((resolve) => { release = () => resolve(); }),
+        ),
+      }, [TANAKA, STRANDED]);
+      await render(<AdminPage api={api} />);
+
+      await type('[name="accountId"]', "acct-abc");
+      await choose('[data-form="link-account"] [name="employeeId"]', "3");
+      await submit("link-account");
+      await pressEnter('[name="accountId"]');
+      await submit("link-account");
+
+      expect(api.linkAccount).toHaveBeenCalledTimes(1);
+      await act(async () => release!());
+    });
+  });
+
   describe("what a failed form says", () => {
     // Every coded error must arrive as a sentence, next to the form that produced it.
     it("turns an invalid-input code into the sentence behind it", async () => {
@@ -486,11 +553,22 @@ describe("AdminPage", () => {
     await act(async () => element.click());
   }
 
+  /**
+   * Press a form's button, which is what a person does — never `form.submit()`.
+   *
+   * The distinction is the whole of the bug this replaced: the Workshop's iframe sandbox omits
+   * `allow-forms`, so submission never happens there. A test that dispatched a submit event would
+   * have passed against a page nobody could actually use. See "runs from the button" below.
+   */
   async function submit(action: string): Promise<void> {
-    const button = field<HTMLButtonElement>(`button[data-action="${action}"]`);
-    const form = button.closest("form")!;
+    await click(`button[data-action="${action}"]`);
+  }
+
+  /** Enter in a text field, which the sandbox also takes away along with submission. */
+  async function pressEnter(selector: string): Promise<void> {
+    const element = field<HTMLElement>(selector);
     await act(async () => {
-      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      element.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
     });
   }
 
