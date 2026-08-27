@@ -1,7 +1,7 @@
 import type { ApprovalAction, EmployeeId, SubmissionState } from "../types.js";
 import { NoRouteError, resolveRoute, type RouteSnapshot, type RouteStep } from "../routes.js";
 import { assertApproverReachable, hasAuthorityOver, managersAt } from "./org.js";
-import { designatedApproverOf, isExempt } from "./employees.js";
+import { designatedApproverOf, employeeLabel, isExempt } from "./employees.js";
 
 // The state machine, and the three invariants it exists to hold:
 //
@@ -32,11 +32,16 @@ export type NewSubmission = {
   createdBy?: EmployeeId;
 };
 
-export type ActInput = {
+/** The question "may this actor act on this submission right now?", and nothing else. */
+export type ActCheck = {
   submissionId: number;
   actorId: EmployeeId;
-  action: ApprovalAction;
   now: number;
+};
+
+/** Acting on a submission is the authority question (`ActCheck`) plus the decision itself. */
+export type ActInput = ActCheck & {
+  action: ApprovalAction;
   comment?: string;
 };
 
@@ -357,31 +362,102 @@ function authorize(
   throw new NotAuthorizedError();
 }
 
-export function actOnSubmission(sql: SqlStorage, input: ActInput): SubmissionState {
+/** Everything `checkMayAct` established, so its caller never has to re-derive any of it. */
+type ActAuthority = {
+  submission: SubmissionRow;
+  snapshot: RouteSnapshot;
+  step: RouteStep;
+  /** The org edge that granted authority, or null for a pinned step or the root fallback. */
+  authorizingEdge: number | null;
+};
+
+/**
+ * THE authority prologue for acting on a submission. There is exactly one of these, deliberately.
+ *
+ * `actOnSubmission` (the write) and `previewAct` (the stage-time probe, run before an approval is
+ * queued for a human to confirm) both call this. They are not two checks kept in agreement — they
+ * are one check called twice, because this project has already shipped a real bug from copies of
+ * "who may approve" drifting apart: `authorize`, `requiredApprovers`, `hasReachableApprover` and
+ * `pendingApprovalsFor` all answer a version of it, and one of them silently disagreed for weeks,
+ * letting a designated approver sign for an employee who already had a manager. A probe written
+ * separately from the write is exactly how that happens again.
+ *
+ * The ORDER here is itself load-bearing and must not be rearranged:
+ *
+ *  1. Self-approval first, ahead of everything else: nobody signs off their own overtime, in any
+ *     state, under any route.
+ *  2. Authority BEFORE state, matching `withdrawSubmission` and `resubmit`.
+ *     `InvalidTransitionError` names the state it refused, so checking state first would turn
+ *     this into an oracle: a Gadget could walk the id space and read back, for every submission in
+ *     the company, whether it exists, whether it belongs to the caller, and its exact state.
+ *     Nothing about a submission is disclosed until the caller has proven they may act on it.
+ *  3. Only then, with authority established, is the state safe to name.
+ *
+ * A row with no step at its current index is unactionable by anyone — `assertSatisfiable` rejects
+ * step-less routes at submit time and `current_step` only ever advances into range, so this is
+ * unreachable for well-formed data. "You are not an approver for this step" is literally true of
+ * it, and fails closed without disclosing anything, so the corrupt row reports that rather than
+ * its own state.
+ */
+function checkMayAct(sql: SqlStorage, input: ActCheck): ActAuthority {
   const submission = getSubmission(sql, input.submissionId);
-  // First, ahead of everything else: nobody signs off their own overtime, in any state, under any
-  // route.
   if (input.actorId === submission.employee_id) throw new SelfApprovalError();
 
   const snapshot = JSON.parse(submission.route_snapshot) as RouteSnapshot;
   const step = snapshot.steps[submission.current_step];
-
-  // Authority BEFORE state, matching `withdrawSubmission` and `resubmit`. `InvalidTransitionError`
-  // names the state it refused, so checking state first would turn this method into an oracle: a
-  // Gadget could walk the id space and read back, for every submission in the company, whether it
-  // exists, whether it belongs to the caller, and its exact state. Nothing about a submission is
-  // disclosed until the caller has proven they may act on it.
-  //
-  // A row with no step at its current index is unactionable by anyone — `assertSatisfiable` rejects
-  // step-less routes at submit time and `current_step` only ever advances into range, so this is
-  // unreachable for well-formed data. "You are not an approver for this step" is literally true of
-  // it, and fails closed without disclosing anything, so the corrupt row reports that rather than
-  // its own state.
   if (!step) throw new NotAuthorizedError();
+
   const authorizingEdge = authorize(sql, submission, step, input.actorId, input.now);
 
-  // Only now, with authority established, is the state safe to name.
   if (submission.state !== "pending") throw new InvalidTransitionError(submission.state);
+
+  return { submission, snapshot, step, authorizingEdge };
+}
+
+/**
+ * What an approver reads before confirming a decision. Display only — nothing here is ever used to
+ * decide anything, and it exists at all only because a human is about to be asked a question.
+ */
+export type ActPreview = {
+  /** Whose overtime this is. Server-derived from the submission, never from a caller. */
+  employeeName: string;
+  employeeNumber: string;
+  /** Who is deciding. Server-derived from the acting capability, never from a caller. */
+  actorName: string;
+  requestedFor: string;
+  minutes: number;
+  reason: string;
+  /** 1-based, for display: "step 2 of 3". */
+  stepNumber: number;
+  stepCount: number;
+};
+
+/**
+ * Run the authority prologue WITHOUT writing, and report what an approver needs to see.
+ *
+ * This is how a decision can be staged for human confirmation without a second implementation of
+ * "who may approve": it and `actOnSubmission` share `checkMayAct`, so they cannot disagree. It
+ * writes nothing, and it returns nothing at all to a caller who has not already proven they may
+ * act — so it discloses no more than `actOnSubmission` itself always has.
+ */
+export function previewAct(sql: SqlStorage, input: ActCheck): ActPreview {
+  const { submission, snapshot } = checkMayAct(sql, input);
+  const employee = employeeLabel(sql, submission.employee_id);
+  const actor = employeeLabel(sql, input.actorId);
+  return {
+    employeeName: employee.display_name,
+    employeeNumber: employee.employee_number,
+    actorName: actor.display_name,
+    requestedFor: submission.requested_for,
+    minutes: submission.minutes,
+    reason: submission.reason,
+    stepNumber: submission.current_step + 1,
+    stepCount: snapshot.steps.length,
+  };
+}
+
+export function actOnSubmission(sql: SqlStorage, input: ActInput): SubmissionState {
+  const { submission, snapshot, step, authorizingEdge } = checkMayAct(sql, input);
 
   sql.exec(
     `INSERT INTO approval_events

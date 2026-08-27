@@ -187,22 +187,31 @@ describe("Gatekeeper<KintaiSession>", () => {
       .toContain(`export interface ${description.tsType}`);
   });
 
-  it("has no auto-approvable actions and no catalog", async () => {
+  it("keeps its one action out of auto-approval, and has no catalog", async () => {
     const { accountId } = await linkedEmployee("catalogued");
 
+    // Empty permanently: `actOnSubmission` carries an `actionKind` so a policy engine can see what
+    // it is, but a kind listed here is one a user may pre-approve, and approving somebody else's
+    // pay must never be pre-approvable.
     expect(await facetFor(accountId).getAutoApprovableActions()).toEqual([]);
     // Called unconditionally by the Overseer on every ambient capsule; returning null is how a
     // gatekeeper says "nothing to index", and a missing method would log a failure on every chat.
     expect(await host.getAgentCatalog(accountId, `protocol-${accountId}-${seq}`)).toBeNull();
   });
 
-  it("refuses the action callbacks, because it never submits an action", async () => {
+  it("implements the action callbacks it now needs, and refuses only revert", async () => {
+    // These used to refuse outright, because Kintai submitted nothing. It now queues exactly one
+    // action — a manager's decision on somebody else's overtime — so they are live protocol
+    // surface. Staged rows live in THIS facet's own storage, so an id it never issued is simply
+    // unknown to it; `approval-queue.test.ts` covers the full stage/apply/reject cycle.
     const { accountId } = await linkedEmployee("actionless");
     const facet = facetFor(accountId);
 
-    await expect(() => facet.applyAction(1)).rejects.toThrow(/submits no actions/);
-    await expect(() => facet.rejectAction(1)).rejects.toThrow(/submits no actions/);
-    await expect(() => facet.revertAction(1)).rejects.toThrow(/submits no actions/);
+    await expect(() => facet.applyAction(1)).rejects.toThrow(/KINTAI_UNKNOWN_ACTION/);
+    // Cleanup is idempotent by contract: an id this facet never issued needs no cleaning up.
+    expect(await facet.rejectAction(1)).toBeUndefined();
+    // Never implemented, and every action description says so with `implementsRevert: false`.
+    await expect(() => facet.revertAction(1)).rejects.toThrow(/KINTAI_REVERT_UNSUPPORTED/);
   });
 });
 
@@ -259,7 +268,8 @@ describe("observation authorization", () => {
       "Kintai approval queue",
     ]);
     for (const observation of observations) expect(observation.description).toBeTruthy();
-    // Kintai submits nothing to the approval queue; see the facet's action callbacks.
+    // Reads are observations, never actions: the one action Kintai submits comes from
+    // `actOnSubmission`, which none of these four calls reaches.
     expect(actions).toEqual([]);
   });
 

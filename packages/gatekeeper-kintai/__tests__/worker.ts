@@ -1,6 +1,6 @@
 import { DurableObject, RpcTarget } from "cloudflare:workers";
 import type {
-  ActionDescription, ObservationDescription,
+  ActionDescription, ActionKind, ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type { KintaiGatekeeper, KintaiSession } from "../src/kintai.js";
 
@@ -15,7 +15,18 @@ export { KintaiStore } from "../src/store/kintai-store.js";
 /** What the test-side queue recorded, read back through `KintaiFacetHost.readQueue()`. */
 export type QueueLog = {
   observations: { title: string; description: string; prohibitAllSharing: boolean }[];
-  actions: { action: number; title: string }[];
+  actions: {
+    action: number;
+    title: string;
+    description: string;
+    // Recorded as definite values, never as `undefined`: an action that leaves `implementsRevert`
+    // off is asserting it cannot be reverted, and a test must be able to tell that apart from
+    // "the harness dropped the field". Same reasoning as `prohibitAllSharing` above.
+    implementsRevert: boolean;
+    awaitDecision: boolean;
+    autoApprovable: boolean;
+    actionKind: ActionKind | null;
+  }[];
 };
 
 /**
@@ -26,11 +37,24 @@ export type QueueLog = {
  * accompanied by a call.
  */
 class TestApprovalQueue extends RpcTarget {
-  constructor(private readonly state: { log: QueueLog; denyObservations: boolean }) {
+  constructor(
+    private readonly state: {
+      log: QueueLog; denyObservations: boolean; denyActions: boolean;
+    },
+  ) {
     super();
   }
 
+  /**
+   * Set once an observation marked `prohibitAllSharing` is authorized, and never cleared — exactly
+   * as the real Overseer does (`overseer.ts` `authorizeObservation` puts `prohibitAllSharing` into
+   * workspace storage). One instance of this class lives for the life of one session, which is the
+   * scope the real flag has: per gadget.
+   */
+  #prohibitAllSharing = false;
+
   async authorizeObservation(description: ObservationDescription): Promise<void> {
+    if (description.prohibitAllSharing) this.#prohibitAllSharing = true;
     this.state.log.observations.push({
       title: description.title,
       description: description.description,
@@ -42,7 +66,36 @@ class TestApprovalQueue extends RpcTarget {
   }
 
   async submitAction(action: number, description: ActionDescription): Promise<void> {
-    this.state.log.actions.push({ action, title: description.title });
+    // Faithful to the real Overseer, which refuses EVERY action once the workspace has observed
+    // data marked `prohibitAllSharing`:
+    //
+    //   if (this.storage.prohibitAllSharing.get()) {
+    //     throw new Error("This workspace has observed sensitive data. To prevent leaks, the
+    //       workspace is prohibited from performing actions.");
+    //   }
+    //
+    // Modelled here rather than left out, because it is load-bearing for Kintai specifically:
+    // `listPendingApprovals()` is marked `prohibitAllSharing`, and it is the only way a Gadget can
+    // learn a submission id it may act on. See the lockdown suite in `approval-queue.test.ts`.
+    // Thrown before the action is recorded, as the real one is.
+    if (this.#prohibitAllSharing) {
+      throw new Error(
+        "WORKSPACE_LOCKED_DOWN: this workspace has observed sensitive data. To prevent leaks, " +
+        "the workspace is prohibited from performing actions.",
+      );
+    }
+    this.state.log.actions.push({
+      action,
+      title: description.title,
+      description: description.description,
+      implementsRevert: description.implementsRevert === true,
+      awaitDecision: description.awaitDecision === true,
+      autoApprovable: description.autoApprovable === true,
+      actionKind: description.actionKind ?? null,
+    });
+    // A refusing queue proves the gatekeeper actually gates on submitAction, rather than merely
+    // calling it and proceeding — and that a refused submission leaves nothing staged behind.
+    if (this.state.denyActions) throw new Error("ACTION_DENIED: test queue refused.");
   }
 
   async bindHook(): Promise<void> {
@@ -71,6 +124,7 @@ export class KintaiFacetHost extends DurableObject<Cloudflare.Env> {
   readonly #queueState = {
     log: { observations: [], actions: [] } as QueueLog,
     denyObservations: false,
+    denyActions: false,
   };
 
   /** One live session per facet name, as a Gadget holds one session for as long as it runs. */
@@ -174,10 +228,11 @@ export class KintaiFacetHost extends DurableObject<Cloudflare.Env> {
     };
   }
 
-  /** Clear the recorded calls and choose whether the queue permits or refuses observations. */
-  resetQueue(denyObservations = false): void {
+  /** Clear the recorded calls and choose whether the queue permits or refuses each call kind. */
+  resetQueue(denyObservations = false, denyActions = false): void {
     this.#queueState.log.observations.length = 0;
     this.#queueState.log.actions.length = 0;
     this.#queueState.denyObservations = denyObservations;
+    this.#queueState.denyActions = denyActions;
   }
 }

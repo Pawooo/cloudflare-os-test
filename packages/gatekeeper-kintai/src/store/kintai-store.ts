@@ -21,8 +21,9 @@ import {
 import { createSite, matchSite, type NewSite } from "./sites.js";
 import {
   actOnSubmission, approvalEvents, getSubmission, listSubmissionsFor, pendingApprovalsFor,
-  resubmit, submitOvertime, withdrawSubmission,
-  type ActInput, type ApprovalEventRow, type NewSubmission, type SubmissionRow,
+  previewAct, resubmit, submitOvertime, withdrawSubmission,
+  type ActCheck, type ActInput, type ActPreview, type ApprovalEventRow, type NewSubmission,
+  type SubmissionRow,
 } from "./submissions.js";
 import {
   createRoute, resolveRoute,
@@ -195,6 +196,19 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
 
   async actOnSubmission(input: ActInput): Promise<SubmissionState> {
     return actOnSubmission(this.sql, input);
+  }
+
+  /**
+   * Run the authority prologue of `actOnSubmission` WITHOUT writing anything, and report what an
+   * approver needs to read before confirming the decision.
+   *
+   * This is not a second implementation of "who may approve": it and `actOnSubmission` call the
+   * same `checkMayAct`, so they cannot drift. It exists because `KintaiSession.actOnSubmission`
+   * now queues the decision for human confirmation rather than performing it, and asking a manager
+   * to confirm something that will be refused on apply is worse than refusing it immediately.
+   */
+  async previewActOnSubmission(input: ActCheck): Promise<ActPreview> {
+    return previewAct(this.sql, input);
   }
 
   async resubmit(submissionId: number, actorId: EmployeeId, now: number): Promise<void> {

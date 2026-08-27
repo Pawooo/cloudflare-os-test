@@ -40,6 +40,31 @@ function facetFor(accountId: string) {
   }) as any;
 }
 
+/**
+ * The Overseer's side of the SAME facet: the callbacks that apply a decision a human has confirmed.
+ *
+ * `actOnSubmission` submits its decision to the approval queue instead of performing it, so a test
+ * that wants to see the decision land has to play the Overseer's part too. The queued protocol
+ * itself is covered by `approval-queue.test.ts`; this is only here so the two domain tests below
+ * can still reach the outcome they are actually about.
+ */
+function overseerFor(accountId: string) {
+  const host = env.KINTAI_FACET_HOST.getByName("overseer");
+  const name = `facet-${accountId}-${seq}`;
+  return new Proxy({} as Record<string, (...args: unknown[]) => Promise<any>>, {
+    get(_target, method) {
+      if (typeof method !== "string" || method === "then") return undefined;
+      return (...args: unknown[]) => host.callFacet(accountId, name, method, args);
+    },
+  }) as any;
+}
+
+/** The id of the decision most recently submitted to the approval queue. */
+async function lastStagedAction(): Promise<number> {
+  const { actions } = await env.KINTAI_FACET_HOST.getByName("overseer").readQueue();
+  return actions.at(-1)!.action;
+}
+
 /** An employee plus a linked account capability, the normal starting state for a Gadget caller. */
 async function linkedEmployee(tag: string, extra: Record<string, unknown> = {}) {
   const employeeId = await store.createEmployee({
@@ -308,9 +333,12 @@ describe("approvals through the facet", () => {
       .rejects.toThrow(/KINTAI_SELF_APPROVAL/);
 
     const bossFacet = facetFor(bossAccount);
-    // `actOnSubmission` returns nothing (see its comment: the signature is already shaped for the
-    // queued form), so the outcome is read back from the store rather than from the return value.
+    // `actOnSubmission` returns nothing: the decision is submitted to the approval queue, not
+    // performed, so the outcome is read back from the store once the Overseer applies it.
     expect(await bossFacet.actOnSubmission(submissionId, "approve")).toBeUndefined();
+    expect((await store.getSubmission(submissionId)).state).toBe("pending");
+
+    await overseerFor(bossAccount).applyAction(await lastStagedAction());
     expect((await store.getSubmission(submissionId)).state).toBe("approved");
   });
 });
@@ -550,8 +578,9 @@ describe("actOnSubmission discloses nothing before authority is established", ()
     const bossFacet = facetFor(bossAccount);
     await expect(() => bossFacet.actOnSubmission(rejected, "approve"))
       .rejects.toThrow(/KINTAI_INVALID_TRANSITION/);
-    // ...and the pending one still works for them.
+    // ...and the pending one still works for them, once the queued decision is applied.
     await bossFacet.actOnSubmission(pending, "approve");
+    await overseerFor(bossAccount).applyAction(await lastStagedAction());
     expect((await store.getSubmission(pending)).state).toBe("approved");
   });
 });

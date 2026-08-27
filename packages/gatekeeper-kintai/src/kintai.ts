@@ -7,6 +7,7 @@ import {
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import type {
   AccountDescription,
+  ActionDescription,
   ActionKind,
   AgentCatalog,
   ApprovalQueue,
@@ -25,7 +26,7 @@ import type {
 import type { ApprovalAction, EmployeeId, PunchKind } from "./types.js";
 import type { AllocationEntry, AllocationRow, Reconciliation } from "./store/allocations.js";
 import type { PunchLocation, PunchRow } from "./store/punches.js";
-import type { SubmissionRow } from "./store/submissions.js";
+import type { ActPreview, SubmissionRow } from "./store/submissions.js";
 import type { KintaiStore } from "./store/kintai-store.js";
 import { UnlinkedAccountError } from "./store/employees.js";
 import TYPES_CODE from "./types.txt";
@@ -182,6 +183,229 @@ function assertText(label: string, value: string, maxLength: number): void {
 
 type KintaiProps = { accountId: string };
 
+/**
+ * One approval decision, recorded in the gatekeeper's own storage and waiting for a human.
+ *
+ * Every field is server-derived. `actorId` in particular came from `resolveAccount` on the
+ * session's own capability and was never a parameter — see `KintaiSession`.
+ */
+export type StagedApproval = {
+  submissionId: number;
+  actorId: EmployeeId;
+  action: ApprovalAction;
+  comment?: string;
+};
+
+/**
+ * The narrow staging capability handed to a session: record one decision, return its id.
+ *
+ * Deliberately a pair of plain functions rather than the gatekeeper itself. `KintaiSession` is an
+ * `RpcTarget` with no storage of its own, and handing it the facet would hand it `applyAction` too
+ * — the ability to perform the very write the queue exists to gate.
+ */
+export type StageApproval = (staged: StagedApproval) => number;
+export type DiscardApproval = (stagedId: number) => void;
+
+/** How many decisions may sit unconfirmed in one facet's storage at once. */
+const MAX_PENDING_STAGED_ACTIONS = 50;
+
+/** How many settled rows to keep before the oldest are pruned. */
+const MAX_RETAINED_STAGED_ACTIONS = 100;
+
+export class UnknownActionError extends Error {
+  readonly code = "KINTAI_UNKNOWN_ACTION";
+  constructor(id: number) {
+    super(`KINTAI_UNKNOWN_ACTION: this Kintai gatekeeper has no staged action ${id}.`);
+  }
+}
+
+export class ActionInFlightError extends Error {
+  readonly code = "KINTAI_ACTION_IN_FLIGHT";
+  constructor(id: number) {
+    super(`KINTAI_ACTION_IN_FLIGHT: Kintai action ${id} is already being applied.`);
+  }
+}
+
+export class ActionAlreadyAppliedError extends Error {
+  readonly code = "KINTAI_ALREADY_APPLIED";
+  constructor(id: number) {
+    super(
+      `KINTAI_ALREADY_APPLIED: Kintai action ${id} has already been applied and can no longer be ` +
+      "rejected. An applied decision is part of the approval history; changing it means recording " +
+      "a new decision.",
+    );
+  }
+}
+
+/**
+ * Refused when the capability that staged a decision no longer names the employee it was staged
+ * for — the account was re-pointed at somebody else, which HR does on an email change.
+ *
+ * This is the identity boundary held across time: a staged row is not a licence to act as whoever
+ * it names. The facet re-derives the employee from its OWN `ctx.props.accountId` at apply time and
+ * refuses unless the two agree, so even a corrupted staging table cannot make this facet act as an
+ * employee it does not currently speak for.
+ */
+export class StaleActorError extends Error {
+  readonly code = "KINTAI_STALE_ACTOR";
+  constructor() {
+    super(
+      "KINTAI_STALE_ACTOR: this account no longer speaks for the employee who staged this " +
+      "decision, so it will not be applied on their behalf.",
+    );
+  }
+}
+
+/**
+ * Refused when one facet already holds `MAX_PENDING_STAGED_ACTIONS` unconfirmed decisions.
+ *
+ * The same reasoning as `LIMITS`: the code calling the session is a Gadget the account holder can
+ * rewrite, so "how many times may it call this?" has to have an answer somewhere.
+ */
+export class TooManyPendingActionsError extends Error {
+  readonly code = "KINTAI_TOO_MANY_PENDING_ACTIONS";
+  constructor(limit: number) {
+    super(
+      `KINTAI_TOO_MANY_PENDING_ACTIONS: ${limit} approval decisions from this account are already ` +
+      "awaiting confirmation. Wait for them to be confirmed or discarded before staging more.",
+    );
+  }
+}
+
+export class RevertUnsupportedError extends Error {
+  readonly code = "KINTAI_REVERT_UNSUPPORTED";
+  constructor() {
+    super(
+      "KINTAI_REVERT_UNSUPPORTED: an approval decision cannot be reverted automatically. It " +
+      "changed a submission's state and appended a permanent row to its approval history; " +
+      "undoing it means recording a new, compensating decision, which is a payroll judgement " +
+      "rather than a mechanical undo.",
+    );
+  }
+}
+
+/**
+ * Reported when a decision was interrupted after it had been sent to the store.
+ *
+ * Terminal, and deliberately not retryable: applying twice is NOT harmless. On a multi-step route
+ * a replayed approval would be counted at the step the first one advanced the submission to.
+ */
+const APPLY_OUTCOME_UNKNOWN =
+  "KINTAI_APPLY_OUTCOME_UNKNOWN: this decision was interrupted after it had been sent to the " +
+  "attendance record, so it may or may not have been recorded. Check the submission's approval " +
+  "history before deciding again.";
+
+/**
+ * Did the store refuse this decision outright, or might it have recorded it and been cut off?
+ *
+ * Every refusal `actOnSubmission` can raise comes from its authority prologue, before any write,
+ * and leads with its own code — `code` is a plain own property that does not survive the RPC
+ * boundary, so the message is where the code actually travels (see `UnlinkedAccountError`).
+ * Anything else reaching the caller is a transport or runtime failure that may have been cut off
+ * mid-write, and must not be replayed.
+ */
+function isDomainRefusal(err: unknown): boolean {
+  return err instanceof Error && /^KINTAI_[A-Z_]+:/.test(err.message);
+}
+
+/** Minutes as a human reads them: `45m`, `2h`, `1h 30m`. */
+function formatDuration(minutes: number): string {
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  if (hours === 0) return `${rest}m`;
+  return rest === 0 ? `${hours}h` : `${hours}h ${rest}m`;
+}
+
+/**
+ * Free text written by the employee being judged, or by the approver, quoted into the description.
+ *
+ * Blockquoted line by line rather than interpolated raw. The description is Markdown rendered to a
+ * human who is about to authorise a payment, and this is the one part of it that the party with an
+ * interest in the outcome controls: a "reason" containing its own headings, list items or bold
+ * text would otherwise render as though it were part of the surrounding, gatekeeper-authored
+ * explanation of what is about to happen.
+ */
+function quoted(text: string): string {
+  const trimmed = text.trim();
+  if (trimmed === "") return "> _(none given)_";
+  return trimmed.split("\n").map((line) => `> ${line}`).join("\n");
+}
+
+const DECISIONS = {
+  approve: {
+    verb: "Approve",
+    effect:
+      "Approving advances the submission to its next approval step, or — if this is the last " +
+      "step — marks it approved, at which point it counts as payable overtime.",
+  },
+  reject: {
+    verb: "Reject",
+    effect:
+      "Rejecting closes the submission for good. The employee cannot resubmit it; they would have " +
+      "to file a fresh request.",
+  },
+  return: {
+    verb: "Return",
+    effect:
+      "Returning sends the submission back to the employee as a draft so they can change it, and " +
+      "voids every approval collected so far — including any from other approvers.",
+  },
+} as const satisfies Record<ApprovalAction, { verb: string; effect: string }>;
+
+/**
+ * What the approver actually reads before confirming.
+ *
+ * It has to say who is deciding, for whom, how many hours, on which date, and what the decision
+ * is. "Approve action #7" is worse than no confirmation at all, because it trains people to click
+ * through — and the thing being confirmed here is a manager's sign-off on somebody else's pay.
+ */
+function describeApproval(
+  preview: ActPreview, action: ApprovalAction, comment?: string,
+): ActionDescription {
+  const decision = DECISIONS[action];
+  const duration = `${preview.minutes} minutes (${formatDuration(preview.minutes)})`;
+  const step = preview.stepCount > 1
+    ? `\n- **Approval step:** ${preview.stepNumber} of ${preview.stepCount}`
+    : "";
+  return {
+    title:
+      `${decision.verb} ${preview.employeeName}'s ${formatDuration(preview.minutes)} of ` +
+      `overtime on ${preview.requestedFor}`,
+    description:
+      `**${preview.actorName}** is recording an approval decision on **${preview.employeeName}**'s ` +
+      "overtime request. This is the manager's sign-off itself, not a draft.\n" +
+      "\n" +
+      `- **Decision:** ${action}\n` +
+      `- **Employee:** ${preview.employeeName} (${preview.employeeNumber})\n` +
+      `- **Date worked:** ${preview.requestedFor}\n` +
+      `- **Overtime claimed:** ${duration}${step}\n` +
+      "\n" +
+      "**The employee's stated reason**\n" +
+      "\n" +
+      `${quoted(preview.reason)}\n` +
+      "\n" +
+      `**${preview.actorName}'s comment**\n` +
+      "\n" +
+      `${quoted(comment ?? "")}\n` +
+      "\n" +
+      `${decision.effect}\n` +
+      "\n" +
+      "Authority is re-checked against the organisation chart at the moment this is applied, so a " +
+      "decision that is no longer yours to make will be refused rather than performed. It cannot " +
+      "be undone automatically: an applied decision appends a permanent entry to the submission's " +
+      "approval history, and reversing it means recording a new, compensating decision.",
+    // See `RevertUnsupportedError`.
+    implementsRevert: false,
+    // Kintai does not simulate. Until this is applied, every read still shows a world in which the
+    // decision did not happen, and an agent that kept working would retry or undo itself.
+    awaitDecision: true,
+    // Tagged so a policy engine can see what this is, but NEVER pre-approvable: the tag appears in
+    // no entry of `getAutoApprovableActions()`, and `autoApprovable` is left unset, which is
+    // independently sufficient ("Absent -> never auto-approvable").
+    actionKind: { tag: "kintai.actOnSubmission", label: "Decide an overtime submission" },
+  };
+}
+
 /** Describes the auto-provisioned Kintai account and its ambient singleton. */
 export function describeKintaiAccount(): AccountDescription {
   return {
@@ -320,16 +544,28 @@ export class KintaiSession extends RpcTarget {
   readonly #accountId: string;
   readonly #store: DurableObjectStub<KintaiStore>;
   readonly #approvalQueue: NativeRpcStub<ApprovalQueue>;
+  readonly #stageApproval: StageApproval;
+  readonly #discardApproval: DiscardApproval;
 
   constructor(dependencies: {
     accountId: string;
     store: DurableObjectStub<KintaiStore>;
     approvalQueue: NativeRpcStub<ApprovalQueue>;
+    /**
+     * Records one decision in the OWNING FACET's storage and returns its id. A narrow capability,
+     * not the facet: see `StageApproval`. It is a plain closure, so calling it crosses no RPC
+     * boundary — this object lives in the facet's own isolate and only a stub to it travels.
+     */
+    stageApproval: StageApproval;
+    /** Drops a staged row that was never submitted. See `actOnSubmission`. */
+    discardApproval: DiscardApproval;
   }) {
     super();
     this.#accountId = dependencies.accountId;
     this.#store = dependencies.store;
     this.#approvalQueue = dependencies.approvalQueue;
+    this.#stageApproval = dependencies.stageApproval;
+    this.#discardApproval = dependencies.discardApproval;
   }
 
   /** Releases the approval queue this session owns (it holds a `dup()`, not the caller's stub). */
@@ -533,24 +769,37 @@ export class KintaiSession extends RpcTarget {
   }
 
   /**
-   * Approve, reject or return one submission. Returns nothing.
+   * Approve, reject or return one submission — by SUBMITTING the decision for approval, not by
+   * performing it.
    *
-   * KNOWN PROTOCOL GAP, recorded here rather than hidden: this does NOT pass through the
-   * Gatekeeper's `ApprovalQueue`. `Gatekeeper.startSession` requires that "every operation
-   * performed through this session must be submitted to the approval queue" and that "side-
-   * effecting actions must not actually be performed until they are approved"
-   * (workshop-shared/src/gatekeeper.ts). This method performs a manager's approval of somebody
-   * else's pay — about as side-effecting as this package gets — directly against the store, so
-   * agent-written code can move a submission to `approved` with no human in the loop beyond the
-   * Gadget itself. Closing it means submitting an action here and doing the write in
-   * `KintaiGatekeeper.applyAction`, which is a behavioural change, not a fix, and is the
-   * recommended next task.
+   * This is a manager's sign-off on somebody else's pay, the most side-effecting thing this
+   * package does, and `Gatekeeper.startSession` requires that "side-effecting actions must not
+   * actually be performed until they are approved". So the decision is staged in the gatekeeper's
+   * own storage and submitted to the Overseer's `ApprovalQueue`; the write happens later, in
+   * `KintaiGatekeeper.applyAction`. The system is heading toward natural-language operation where
+   * a possibly prompt-injected agent would otherwise exercise approval authority unattended, and
+   * this is the control that stops that.
    *
-   * The signature is already the queued shape, so that change is additive rather than breaking:
-   * a queued action is applied later, by a different call, and cannot return the resulting state
-   * to this caller. Callers read the outcome back from `listMySubmissions()` (as the employee) or
-   * `listPendingApprovals()` (as the approver — an approved or rejected submission leaves the
-   * queue), which is the shape they will need either way.
+   * Three things are settled here, before anything is staged:
+   *
+   *  - the actor, from the capability. As everywhere else in this class, never from an argument.
+   *  - the decision itself: `@validateRpc()` refuses anything but the three literals of
+   *    `ApprovalAction` before this body runs, which matters more now than it did — an unchecked
+   *    value used to die on `approval_events`' CHECK within the same call, but a staged one would
+   *    be shown to a human as a decision and confirmed by them before failing.
+   *  - authority, via `previewActOnSubmission` — which runs the SAME check the write runs, not a
+   *    copy of it. Without a stage-time check a manager would be asked to confirm a decision that
+   *    then failed on apply; with a separately-written one, this package would have a fifth
+   *    implementation of "who may approve", which is exactly how its last real bug happened.
+   *
+   * The refusals a caller can observe are therefore unchanged by queueing: a stranger still gets a
+   * uniform `KINTAI_NOT_AUTHORIZED` in every live state, an authorized approver acting on a
+   * terminal submission still gets `KINTAI_INVALID_TRANSITION`, and self-approval is still refused
+   * first with `KINTAI_SELF_APPROVAL`.
+   *
+   * Still returns nothing, as it always did. A queued action is applied later, by a different
+   * call, and cannot return the resulting state to this caller: read the outcome back from
+   * `listMySubmissions()` (as the employee) or `listPendingApprovals()` (as the approver).
    */
   async actOnSubmission(
     submissionId: number, action: ApprovalAction, comment?: string,
@@ -558,23 +807,141 @@ export class KintaiSession extends RpcTarget {
     if (comment !== undefined) assertText("comment", comment, LIMITS.comment);
     const now = Date.now();
     const actorId = await this.#requireEmployee(now);
-    await this.#store.actOnSubmission({ submissionId, actorId, action, now, comment });
+
+    const preview = await this.#store.previewActOnSubmission({ submissionId, actorId, now });
+
+    const stagedId = this.#stageApproval({ submissionId, actorId, action, comment });
+    try {
+      await this.#approvalQueue.submitAction(stagedId, describeApproval(preview, action, comment));
+    } catch (err) {
+      // No approver will ever see this action, so nothing can ever apply it. Drop the row rather
+      // than leaving an unreachable decision sitting in the facet's storage against the cap.
+      this.#discardApproval(stagedId);
+      throw err;
+    }
   }
 }
+
+/** One decision waiting for a human, as it sits in the facet's own SQLite. */
+type StagedRow = {
+  id: number;
+  submission_id: number;
+  actor_employee_id: number;
+  action: ApprovalAction;
+  comment: string | null;
+  staged_at: number;
+  state: "pending" | "applying" | "applied" | "failed";
+  error: string | null;
+};
 
 /**
  * The account's ambient Gatekeeper, installed by the Overseer as a facet under itself.
  *
- * It holds no state of its own: everything lives in the one shared `KintaiStore`, and this class
- * exists to carry the account capability (`ctx.props.accountId`) from
- * `KintaiAccount.getSingletonGatekeeperClass` into each session it opens. The props are bound to
- * the CLASS, so whoever instantiates the facet cannot choose the accountId.
+ * The attendance record itself lives in the one shared `KintaiStore`; this class carries the
+ * account capability (`ctx.props.accountId`) from `KintaiAccount.getSingletonGatekeeperClass` into
+ * each session it opens. The props are bound to the CLASS, so whoever instantiates the facet
+ * cannot choose the accountId.
+ *
+ * It holds exactly one piece of state of its own: approval decisions that have been submitted for
+ * confirmation but not yet applied. They live HERE, in the facet's own storage, and not in the
+ * shared store, because the facet is per account — so a decision staged by one account's facet is
+ * physically unreachable from another's. That is isolation by construction; staged rows in the
+ * company-wide store would instead need an ownership check on every path, which is the kind of
+ * check somebody eventually forgets. The Overseer routes an approval back to the facet that
+ * submitted it (it resolves the facet by a stable name from the gatekeeper record id, then calls
+ * `applyAction`), and Durable Object storage outlives any one session, so the row is still here
+ * when the human gets round to deciding — hours or days later, as the interface expects.
  */
 @validateRpc()
 export class KintaiGatekeeper
   extends DurableObject<Cloudflare.Env, KintaiProps>
   implements Gatekeeper<KintaiSession>
 {
+  readonly #sql: SqlStorage;
+
+  constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
+    super(ctx, env);
+    this.#sql = ctx.storage.sql;
+    this.#sql.exec(`CREATE TABLE IF NOT EXISTS staged_approvals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      submission_id INTEGER NOT NULL,
+      actor_employee_id INTEGER NOT NULL,
+      action TEXT NOT NULL CHECK (action IN ('approve', 'reject', 'return')),
+      comment TEXT,
+      staged_at INTEGER NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('pending', 'applying', 'applied', 'failed')),
+      error TEXT
+    ) STRICT`);
+    // A fresh instance means a fresh activation, so a row still marked `applying` belonged to an
+    // interrupted one: the decision had already been sent to the store and may or may not have
+    // landed. It must never be replayed — applying twice is not harmless, because on a multi-step
+    // route the replay would be counted at the step the first apply advanced the submission to.
+    this.#sql.exec(
+      `UPDATE staged_approvals SET state = 'failed', error = ? WHERE state = 'applying'`,
+      APPLY_OUTCOME_UNKNOWN,
+    );
+  }
+
+  /** The one shared store, named "" — the same instance every facet reaches. */
+  #store(): DurableObjectStub<KintaiStore> {
+    return this.ctx.exports.KintaiStore.getByName("");
+  }
+
+  #staged(id: number): StagedRow | undefined {
+    return this.#sql
+      .exec<StagedRow>(`SELECT * FROM staged_approvals WHERE id = ?`, id)
+      .toArray()[0];
+  }
+
+  #setState(id: number, state: StagedRow["state"], error?: string): void {
+    this.#sql.exec(
+      `UPDATE staged_approvals SET state = ?, error = ? WHERE id = ?`, state, error ?? null, id,
+    );
+  }
+
+  /**
+   * Record one decision. The narrow capability behind `StageApproval` — the session gets this and
+   * `#discard`, and nothing else that touches this table.
+   */
+  #stage(staged: StagedApproval): number {
+    // Bounded for the same reason as `LIMITS`: the code calling this is a Gadget the employee can
+    // rewrite, and it can call in a loop. An unbounded staging table would let one account fill
+    // its own facet's storage and the Overseer's approval queue with decisions nobody asked for.
+    const { count } = this.#sql
+      .exec<{ count: number }>(
+        `SELECT count(*) AS count FROM staged_approvals WHERE state IN ('pending', 'applying')`,
+      )
+      .one();
+    if (count >= MAX_PENDING_STAGED_ACTIONS) {
+      throw new TooManyPendingActionsError(MAX_PENDING_STAGED_ACTIONS);
+    }
+    return this.#sql
+      .exec<{ id: number }>(
+        `INSERT INTO staged_approvals
+           (submission_id, actor_employee_id, action, comment, staged_at, state)
+         VALUES (?, ?, ?, ?, ?, 'pending') RETURNING id`,
+        staged.submissionId, staged.actorId, staged.action, staged.comment ?? null, Date.now(),
+      )
+      .one().id;
+  }
+
+  /** Drop a staged row. Only ever used on one that has not been applied. */
+  #discard(id: number): void {
+    this.#sql.exec(`DELETE FROM staged_approvals WHERE id = ? AND state != 'applied'`, id);
+  }
+
+  /** Keep the settled rows bounded; pending ones are bounded by `MAX_PENDING_STAGED_ACTIONS`. */
+  #prune(): void {
+    this.#sql.exec(
+      `DELETE FROM staged_approvals WHERE id IN (
+         SELECT id FROM staged_approvals
+         WHERE state NOT IN ('pending', 'applying')
+         ORDER BY id DESC LIMIT -1 OFFSET ?
+       )`,
+      MAX_RETAINED_STAGED_ACTIONS,
+    );
+  }
+
   /** Describes the ambient Kintai attendance binding. */
   async describe(): Promise<ResourceDescription> {
     return {
@@ -591,7 +958,15 @@ export class KintaiGatekeeper
     return TYPES_CODE;
   }
 
-  /** Kintai submits no actions to the approval queue, so none can ever be auto-approved. */
+  /**
+   * Empty, permanently. Kintai's one queued action is a manager's decision on somebody else's pay,
+   * which must never be applied without a human looking at it.
+   *
+   * The action still carries an `actionKind` so a policy engine can recognise what it is, but a
+   * kind listed here is a kind a user may pre-approve — and this one may not be. The per-action
+   * `autoApprovable` verdict is left unset as well ("Absent -> never auto-approvable"), so both
+   * gates are independently closed.
+   */
   async getAutoApprovableActions(): Promise<ActionKind[]> {
     return [];
   }
@@ -609,8 +984,15 @@ export class KintaiGatekeeper
       return new KintaiSession({
         accountId: this.ctx.props.accountId,
         // The one shared store, named "" — every facet, for every employee, reaches this instance.
-        store: this.ctx.exports.KintaiStore.getByName(""),
+        store: this.#store(),
         approvalQueue: ownedQueue,
+        // A NARROW capability, never the facet itself: handing the session `this` would hand it
+        // `applyAction`, which is precisely the write the approval queue exists to gate. These two
+        // closures are the whole of what staging needs. They cross no RPC boundary — the session
+        // object lives in this facet's isolate and only a stub to it travels — so each is a plain
+        // local call into this Durable Object's own SQLite.
+        stageApproval: (staged) => this.#stage(staged),
+        discardApproval: (stagedId) => this.#discard(stagedId),
       });
     } catch (err) {
       ownedQueue[Symbol.dispose]?.();
@@ -643,25 +1025,92 @@ export class KintaiGatekeeper
   /** Removes a collaborator; no observer state is retained. */
   async removeObserver(_id: string): Promise<void> {}
 
-  // Kintai submits nothing to the approval queue, so the Overseer never calls these back. They
-  // throw rather than silently succeeding: a call here means the protocol was violated somewhere,
-  // and that should be loud.
+  // ---------------------------------------------------------------------------------------------
+  // The Overseer's callbacks, once a human has decided about a staged approval.
 
-  /** Rejects action application because Kintai submits no actions. */
-  applyAction(_action: number): Promise<void> {
-    throw new Error("Kintai submits no actions for approval.");
+  /**
+   * The human confirmed the decision: perform it now.
+   *
+   * `store.actOnSubmission` re-runs every authority check, and that is the point rather than
+   * redundancy. Time has passed — hours or days, by design — and the organisation may have changed
+   * underneath the decision; a manager who has since lost authority over the employee must not
+   * have their stale sign-off applied. The check is the same one the stage-time probe ran, because
+   * both go through `checkMayAct`.
+   *
+   * Two identity properties hold here, both preserved from the unqueued version:
+   *
+   *  - `now` is `Date.now()`, server-side. It is not read from the staged row, so a decision does
+   *    not carry its staging clock into a world that has moved on.
+   *  - the actor is re-derived from THIS facet's own `ctx.props.accountId` and must still be the
+   *    employee the row names. A staged row is not a licence to act as whoever it says: an account
+   *    re-pointed at somebody else (`KINTAI_STALE_ACTOR`) or revoked
+   *    (`KINTAI_ACCOUNT_NOT_LINKED`) cannot spend a decision staged by its previous holder.
+   */
+  async applyAction(action: number): Promise<void> {
+    const row = this.#staged(action);
+    if (!row) throw new UnknownActionError(action);
+    // Idempotent: the Overseer may call back more than once, and a replay would be counted as a
+    // second, independent approval at whatever step the first one advanced the submission to.
+    if (row.state === "applied") return;
+    if (row.state === "applying") throw new ActionInFlightError(action);
+    if (row.state === "failed") throw new Error(row.error ?? APPLY_OUTCOME_UNKNOWN);
+
+    const now = Date.now();
+    const store = this.#store();
+    const employeeId = await store.resolveAccount(this.ctx.props.accountId, now);
+    if (employeeId === null) throw new UnlinkedAccountError();
+    if (employeeId !== row.actor_employee_id) throw new StaleActorError();
+
+    // Claimed BEFORE the call goes out, so an activation that dies mid-flight leaves evidence the
+    // constructor can find rather than a row that looks safe to replay.
+    this.#setState(action, "applying");
+    try {
+      await store.actOnSubmission({
+        submissionId: row.submission_id,
+        actorId: row.actor_employee_id,
+        action: row.action,
+        now,
+        comment: row.comment ?? undefined,
+      });
+    } catch (err) {
+      if (isDomainRefusal(err)) {
+        // Refused by the authority prologue, before any write. Nothing landed, so the row goes
+        // back to `pending`: the Overseer tells the user the action failed and offers a retry,
+        // which must be able to succeed once whatever caused the refusal is resolved.
+        this.#setState(action, "pending");
+        throw err;
+      }
+      this.#setState(action, "failed", APPLY_OUTCOME_UNKNOWN);
+      this.#prune();
+      throw new Error(APPLY_OUTCOME_UNKNOWN, { cause: err });
+    }
+    this.#setState(action, "applied");
+    this.#prune();
   }
 
-  /** Rejects action rejection because Kintai submits no actions. */
-  rejectAction(_action: number): Promise<void | { restart?: boolean }> {
-    throw new Error("Kintai submits no actions for approval.");
+  /**
+   * The human refused the decision: discard it. Nothing was ever applied, so there is nothing to
+   * undo — the submission is exactly as the employee left it.
+   */
+  async rejectAction(action: number): Promise<void | { restart?: boolean }> {
+    const row = this.#staged(action);
+    // Cleanup is idempotent by contract, and a discarded row is indistinguishable from one that
+    // never existed.
+    if (!row) return;
+    if (row.state === "applying") throw new ActionInFlightError(action);
+    if (row.state === "applied") throw new ActionAlreadyAppliedError(action);
+    this.#discard(action);
   }
 
-  /** Rejects action reversion because Kintai submits no actions. */
+  /**
+   * Refuses. `implementsRevert: false` on every description says so up front, so the UI should
+   * never offer this — see `RevertUnsupportedError` for why un-approving is a payroll decision
+   * rather than a mechanical undo.
+   */
   revertAction(
     _action: number,
   ): Promise<void | { message?: string; canRetry?: boolean; restart?: boolean }> {
-    throw new Error("Kintai submits no actions for approval.");
+    throw new RevertUnsupportedError();
   }
 }
 

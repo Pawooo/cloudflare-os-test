@@ -178,6 +178,28 @@ export type EmployeeProfile = {
   employment_type: string | null;
 };
 
+/** How an employee is named to a human. Never used for authorization — only for display. */
+export type EmployeeLabel = {
+  id: number;
+  display_name: string;
+  employee_number: string;
+};
+
+/**
+ * The human-readable identity of one employee, for describing an action to an approver.
+ *
+ * `.one()` for the same reason as `employeeProfile`: every caller reaches this with an id that
+ * came out of `resolveAccount` or out of a `submissions.employee_id` foreign key, so a missing row
+ * is corruption rather than an ordinary client mistake.
+ */
+export function employeeLabel(sql: SqlStorage, employeeId: EmployeeId): EmployeeLabel {
+  return sql
+    .exec<EmployeeLabel>(
+      `SELECT id, display_name, employee_number FROM employees WHERE id = ?`, employeeId,
+    )
+    .one();
+}
+
 /**
  * The routing attributes of one employee. `.one()` is deliberate: every caller reaches this with an
  * id that came out of `resolveAccount`, and `account_links.employee_id` has a foreign key onto

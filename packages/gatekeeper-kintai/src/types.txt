@@ -248,10 +248,24 @@ export interface KintaiSession {
   /**
    * Approve, reject, or return one submission from `listPendingApprovals()`.
    *
-   * Returns nothing: read the outcome back from `listPendingApprovals()` (an approved or rejected
-   * submission leaves your queue) or, for your own submissions, `listMySubmissions()`. `approve`
-   * on the last step approves the submission; earlier steps advance it to the next approver, and
-   * `return` sends it back to the employee as a `draft`.
+   * REQUIRES HUMAN CONFIRMATION, and does not take effect when it returns. This is a manager's
+   * sign-off on another employee's pay, so the decision is submitted to the approval queue and
+   * only performed once the account holder confirms it — which may be minutes or days later, or
+   * never. Returning without throwing means "submitted", not "done".
+   *
+   * Do NOT poll for the result or re-issue the call: the submission is unchanged until the
+   * decision is confirmed, and calling again just queues a second decision. Nothing else here
+   * simulates the pending change either, so every read still shows the submission as `pending`.
+   *
+   * Authority is checked twice: once now, so an invalid decision is refused immediately rather
+   * than put in front of a human, and again when the confirmed decision is applied — the
+   * organisation may have changed in between, and a decision that is no longer yours to make is
+   * refused at that point instead of being performed.
+   *
+   * `approve` on the last step approves the submission; earlier steps advance it to the next
+   * approver, and `return` sends it back to the employee as a `draft`. Once applied, read the
+   * outcome back from `listPendingApprovals()` (an approved or rejected submission leaves your
+   * queue) or, for your own submissions, `listMySubmissions()`.
    *
    * Nobody may act on their own submission, and naming a submission the caller is not an approver
    * for throws `KINTAI_NOT_AUTHORIZED` regardless of whether it exists in a different state.
