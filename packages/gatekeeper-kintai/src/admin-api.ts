@@ -1,6 +1,6 @@
 import { RpcTarget } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
-import type { EmployeeId, KintaiIdentity, RosterEntry } from "./types.js";
+import type { EmployeeId, KintaiIdentity, RosterEntry, WorkDatePolicy } from "./types.js";
 import type { NewEmployee } from "./store/employees.js";
 import { EmployeeNotFoundError } from "./store/employees.js";
 import type { ReportingLineRow } from "./store/org.js";
@@ -98,6 +98,23 @@ export interface KintaiAdminApi {
    * period keeps its own row rather than becoming a flag on `employees`.
    */
   grantExemption(employeeId: EmployeeId): Promise<void>;
+
+  /**
+   * Record which day this employee's punches are filed against, from now on. Admin only.
+   *
+   * Beside `grantExemption` because it is the same kind of thing: a fact about one employee that
+   * HR determines, that nobody else may assert about themselves, and that changes what their hours
+   * are worth. A site crew member on `calendar` has every overnight shift split across two dates
+   * and every one of those days flagged; the same person on `shift_start` has one day with the
+   * whole span on it. Nothing downstream can repair the difference, because it is decided at the
+   * moment each punch is recorded and written into the punch.
+   *
+   * Not retroactive, exactly as everything else on this surface is additive: changing it re-files
+   * nothing already recorded. That is why it belongs at onboarding and why it is audited — an
+   * employee whose policy was wrong for a month has a month of records that are wrong in a way
+   * only an administrative correction can fix.
+   */
+  setWorkDatePolicy(employeeId: EmployeeId, policy: WorkDatePolicy): Promise<void>;
 }
 
 // Re-exported so worker-side callers of this API read its return type from the API's own module.
@@ -315,6 +332,45 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
   }
 
   /**
+   * Record which day this employee's punches are filed against, from now on.
+   *
+   * Written as a plain UPDATE with an audit entry, rather than as a temporal period like
+   * `grantExemption`'s. The two are genuinely different: an exemption says something about a span
+   * of time that has already partly happened, so its window is the answer; a work-date policy is
+   * consulted once, at the instant a punch is recorded, and its verdict is then written into that
+   * punch's `work_date` and never revisited. The punches ARE the history of this setting, and a
+   * second history kept beside them could only ever contradict them. `audit_log` carries who
+   * changed it and what it was before, which is what an inspection asks.
+   *
+   * Setting the policy an employee is already on is allowed and is a no-op with an honest audit
+   * entry whose `before` and `after` agree. It is NOT refused the way a duplicate exemption is:
+   * that refusal exists because a second open `exemption_periods` row would leave two records
+   * claiming to be the determination, and there is only ever one row here.
+   */
+  async setWorkDatePolicy(employeeId: EmployeeId, policy: WorkDatePolicy): Promise<void> {
+    const now = Date.now();
+    assertEmployeeId("employee", employeeId);
+    // `policy` is NOT re-checked here. It is a string-literal union, which is a TYPE, and
+    // `@validateRpc()` refuses anything outside it before this body runs -- the same reason
+    // nothing on this surface re-checks that a string is a string. The schema's CHECK constraint
+    // is the backstop behind that. A third opinion here is exactly the duplicated rule this
+    // package keeps being bitten by; the refusal is pinned by a test instead.
+    await this.#assertEmployeeExists(employeeId);
+    const actorEmployeeId = await this.#actor(now);
+    // Read before the write. "What was it before" is the whole question for a setting that is not
+    // retroactive: it is what says which of this employee's existing punches were filed under a
+    // different rule, and it is unrecoverable from the row once overwritten.
+    const previous = await this.#store.workDatePolicy(employeeId);
+    await this.#store.setWorkDatePolicy(employeeId, policy);
+    await this.#store.appendAudit({
+      at: now, actorEmployeeId, action: "set_work_date_policy", entity: "employees",
+      entityId: employeeId,
+      before: { employeeId, workDatePolicy: previous },
+      after: { employeeId, workDatePolicy: policy },
+    });
+  }
+
+  /**
    * Reject a `NewEmployee` that the schema would accept but HR could not live with.
    *
    * `@validateRpc()` already rejects anything of the wrong TYPE, which is why nothing here
@@ -459,5 +515,15 @@ export class ViewerKintaiApi extends RpcTarget implements KintaiAdminApi {
    */
   grantExemption(_employeeId: EmployeeId): never {
     throw new AdminRequiredError("grantExemption");
+  }
+
+  /**
+   * Refused: which day a punch is filed against decides what an employee's night hours are worth.
+   * Reachable by the employee it describes, it would be a way to move one's own overnight hours
+   * onto a different day — and, on the other side, a way to split a colleague's shift in two and
+   * flag every day they work.
+   */
+  setWorkDatePolicy(_employeeId: EmployeeId, _policy: WorkDatePolicy): never {
+    throw new AdminRequiredError("setWorkDatePolicy");
   }
 }

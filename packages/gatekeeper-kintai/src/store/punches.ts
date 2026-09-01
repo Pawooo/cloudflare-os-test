@@ -1,4 +1,6 @@
 import type { EmployeeId, LocationSource, PunchKind, PunchSource } from "../types.js";
+import { MAX_SHIFT_MS, jstWorkDate } from "../work-date.js";
+import { workDatePolicyOf } from "./employees.js";
 import { matchSite } from "./sites.js";
 
 export type PunchLocation = {
@@ -307,4 +309,87 @@ export function dayAnomalies(
   if (inOut.duplicateOpens > 0) anomalies.push("duplicate_in");
   if (grossMs < 0) anomalies.push("negative_gross");
   return anomalies;
+}
+
+/**
+ * The work date a punch made at `now` belongs to, for this employee.
+ *
+ * THE one implementation of work-date attribution. Every punch that enters the system through the
+ * session facet gets its date from here and from nowhere else, which is the point: this package
+ * has twice shipped bugs from two copies of one rule drifting apart, and "which day is this?" is
+ * the rule that decides what a night worker is paid.
+ *
+ * Two policies, read from the employee's own record (see `WorkDatePolicy`):
+ *
+ *  - `calendar`, the default and the common case, is `jstWorkDate(now)` and nothing else. This
+ *    function must be transparent for those employees — no query, no open-shift lookup, no way for
+ *    a change here to re-file an office worker's punches.
+ *  - `shift_start` inherits the date of the shift that is open right now, so 22:00 → 06:00 lands
+ *    entirely on the start date. With no shift open it falls back to the calendar date, which is
+ *    also what a shift-start employee's first punch of the day gets.
+ *
+ * It answers a question and writes nothing, so asking it twice for the same instant gives the same
+ * answer. The caller records the punch separately, having first checked the period lock against
+ * the date this returned — see `KintaiSession.punch`, and note that the lock has to be checked
+ * against THIS date rather than today's, or a punch could land in a closed month.
+ */
+export function workDateFor(sql: SqlStorage, employeeId: EmployeeId, now: number): string {
+  if (workDatePolicyOf(sql, employeeId) === "shift_start") {
+    const openShift = openShiftWorkDate(sql, employeeId, now);
+    if (openShift !== null) return openShift;
+  }
+  return jstWorkDate(now);
+}
+
+/**
+ * The work date of the shift this employee has open at `now`, or null if they have none.
+ *
+ * Two steps, each answering a question the other cannot:
+ *
+ *  1. Which day might hold an open shift? The employee's most recent clock-in, bounded to the last
+ *     `MAX_SHIFT_MS`. That bound IS the 16-hour guard and is written only here: past it, a
+ *     forgotten clock-out stops attracting punches and the day it sits on keeps its `unpaired_in`
+ *     exactly as it always did. A shift-opening `in` is dated by the calendar (nothing was open
+ *     when it was made), so its own `work_date` is the date the shift belongs to.
+ *  2. Is that shift still open? Asked of `pairSpans` — the SAME pairing `workedMinutes` and
+ *     `dayAnomalies` use. "There is an open shift" and "this day is flagged `unpaired_in`" are one
+ *     fact, and they must not be able to disagree: a second reading of the punches here is how
+ *     attribution and the anomaly list would drift into contradicting each other.
+ *
+ * ...and one exception, which is not a third rule but the second one held open for a minute. A
+ * shift that closed less than `DUPLICATE_WINDOW_MS` ago still claims the punch. Without it a
+ * double-tapped clock-out is a silent data-quality bug: the first tap closes the shift, so the
+ * second finds nothing open, falls back to the calendar date, and lands on the NEXT day — where
+ * `recordPunch`'s duplicate suppression cannot see it, because that is keyed on (employee, work
+ * date, kind). The result is a spurious `orphan_out` on a day the employee never worked, produced
+ * by tapping a button twice. Tied to the duplicate window precisely so it reaches no further than
+ * the suppression it exists to keep reachable: past that window the punch is a real one with
+ * nothing open, and it belongs to the day it happened on exactly as it would for a `calendar`
+ * employee.
+ *
+ * Superseded punches are excluded throughout, so a corrected clock-in is read as the correction
+ * says, never as it was first entered.
+ */
+function openShiftWorkDate(sql: SqlStorage, employeeId: EmployeeId, now: number): string | null {
+  const lastIn = sql
+    .exec<{ work_date: string }>(
+      `SELECT p.work_date FROM punches p
+       WHERE p.employee_id = ? AND p.kind = 'in' AND p.occurred_at > ?
+         AND NOT EXISTS (SELECT 1 FROM punches s WHERE s.supersedes_id = p.id)
+       ORDER BY p.occurred_at DESC LIMIT 1`,
+      employeeId, now - MAX_SHIFT_MS,
+    )
+    .toArray()[0];
+  if (!lastIn) return null;
+
+  const punches = currentPunches(sql, employeeId, lastIn.work_date);
+  const { openAt } = pairSpans(punches, "in", "out");
+  if (openAt !== null) return lastIn.work_date;
+
+  // `currentPunches` is ordered by `occurred_at`, so the last row is the most recent thing known
+  // to have happened on that day — the clock-out, for a shift that closed normally.
+  const lastAt = punches[punches.length - 1]?.occurred_at;
+  if (lastAt !== undefined && now - lastAt < DUPLICATE_WINDOW_MS) return lastIn.work_date;
+
+  return null;
 }

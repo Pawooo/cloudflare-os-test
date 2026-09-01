@@ -31,6 +31,9 @@ import type { PunchLocation, PunchRow } from "./store/punches.js";
 import type { ActPreview, SubmissionRow } from "./store/submissions.js";
 import type { KintaiStore } from "./store/kintai-store.js";
 import { UnlinkedAccountError } from "./store/employees.js";
+// The store's schema module owns this: it is the same PRAGMA test, run for the same reason, and a
+// second copy of it is exactly the kind of duplication this package has been bitten by.
+import { hasColumn } from "./store/schema.js";
 import { AdminKintaiApi, ViewerKintaiApi } from "./admin-api.js";
 import {
   assertMinutes, assertText, assertWorkDate, InvalidInputError, LIMITS,
@@ -682,9 +685,19 @@ export class KintaiSession extends RpcTarget {
   ): Promise<{ punchId: number; employeeId: EmployeeId; workDate: string }> {
     const now = Date.now();
     const employeeId = await this.#requireEmployee(now);
-    const workDate = jstWorkDate(now);
+    // Which day this punch belongs to is the employee's own `work_date_policy`, read from the
+    // record their capability resolved to and never from anything the caller said. For everyone on
+    // `calendar` — the default, and everyone who existed before the policy did — this is
+    // `jstWorkDate(now)` and nothing more. For `shift_start` it is the date of the shift that is
+    // open right now, so an overnight shift stays on one day. The rule itself lives in
+    // `store/punches.ts`, where the punches it reads are; this asks for the answer.
+    const workDate = await this.#store.workDateFor(employeeId, now);
     // Period locks are enforced here, not inside the store's write functions: the amendment path
     // has to be able to write into a closed period, and it reaches the store directly.
+    //
+    // Checked against the ATTRIBUTED date, not today's: a night worker clocking out at 06:00 on
+    // the first of the month is writing into the month that just closed, and that has to be
+    // refused the same as any other write into a locked period.
     await this.#store.assertWritable(workDate);
 
     const punchId = await this.#store.recordPunch({
@@ -966,14 +979,6 @@ type StagedRow = {
    */
   staged_after_event_id: number | null;
 };
-
-/** Whether a table already has a column, for the one-way migrations below. */
-function hasColumn(sql: SqlStorage, table: string, column: string): boolean {
-  return sql
-    .exec<{ name: string }>(`PRAGMA table_info(${table})`)
-    .toArray()
-    .some((row) => row.name === column);
-}
 
 /**
  * The staging table, its one-way migrations, and the index that makes staging idempotent.
@@ -1443,7 +1448,8 @@ export class KintaiGatekeeper
   }
 }
 
-/** JST calendar date for a UTC instant. JST has no DST, so a fixed +9h offset is correct. */
-export function jstWorkDate(now: number): string {
-  return new Date(now + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
-}
+// Moved to `work-date.ts` when attribution moved into the store, which `kintai.ts` imports — the
+// function had to become a leaf or close a cycle. Re-exported so every existing importer, and the
+// table of JST boundary cases pinning it in `facet.test.ts`, are unaffected. Same reason
+// `InvalidInputError` is re-exported above.
+export { jstWorkDate } from "./work-date.js";

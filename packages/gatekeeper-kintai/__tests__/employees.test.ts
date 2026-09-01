@@ -81,11 +81,14 @@ describe("roster listing", () => {
         id: tanaka, employee_number: "E900", display_name: "Tanaka", department: "Sales",
         employment_type: "seishain", designated_approver_id: null, status: "active",
         joined_on: "2026-04-01", departed_on: null,
+        // Nobody named a policy, so the column's DEFAULT decided — and it decided the behaviour
+        // every employee had before there was a policy at all.
+        work_date_policy: "calendar",
       },
       {
         id: suzuki, employee_number: "E901", display_name: "Suzuki", department: null,
         employment_type: null, designated_approver_id: null, status: "active",
-        joined_on: "2026-04-02", departed_on: null,
+        joined_on: "2026-04-02", departed_on: null, work_date_policy: "calendar",
       },
     ]);
   });

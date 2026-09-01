@@ -3,6 +3,7 @@ import type {
   ActionDescription, ActionKind, GatekeeperUiFrame, ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { applyStagedApprovalsSchema } from "../src/kintai.js";
+import { applySchema } from "../src/store/schema.js";
 import type { KintaiGatekeeper, KintaiSession } from "../src/kintai.js";
 
 export { default } from "../src/worker.js";
@@ -309,6 +310,52 @@ export class KintaiFacetHost extends DurableObject<Cloudflare.Env> {
   setShares(observerIds: string[]): void {
     this.#queueState.shares.clear();
     for (const id of observerIds) this.#queueState.shares.add(id);
+  }
+
+  /**
+   * Build a PRE-`work_date_policy` `employees` table with rows in it, run the real schema over it,
+   * and report what each row's policy became.
+   *
+   * The only way to reach that migration. `applySchema` runs in the store's constructor, so by the
+   * time any test can see a `KintaiStore` the column is already there and the legacy shape — an
+   * `employees` table with real payroll rows and no policy column — is unreachable through every
+   * public surface. So it is built here, in this host's OWN storage, and handed to the same
+   * function the store's constructor calls. Same approach, and same reason, as
+   * `migrateLegacyStaged` below.
+   *
+   * `employees` is the table this matters most for: it cannot be recreated, because it holds the
+   * records every punch, link and submission points at.
+   */
+  migrateLegacyEmployees(names: string[]): { display_name: string; work_date_policy: string }[] {
+    const sql = this.ctx.storage.sql;
+    sql.exec(`DROP TABLE IF EXISTS employees`);
+    // Verbatim the table as it stood before this change.
+    sql.exec(`CREATE TABLE employees (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      employee_number TEXT NOT NULL UNIQUE,
+      display_name TEXT NOT NULL,
+      department TEXT,
+      employment_type TEXT,
+      designated_approver_id INTEGER REFERENCES employees(id),
+      status TEXT NOT NULL CHECK (status IN ('active', 'leave', 'departed')),
+      joined_on TEXT NOT NULL,
+      departed_on TEXT
+    ) STRICT`);
+    for (const [index, name] of names.entries()) {
+      sql.exec(
+        `INSERT INTO employees (employee_number, display_name, status, joined_on)
+         VALUES (?, ?, 'active', '2026-04-01')`,
+        `legacy-${index}`, name,
+      );
+    }
+
+    applySchema(sql);
+
+    return sql
+      .exec<{ display_name: string; work_date_policy: string }>(
+        `SELECT display_name, work_date_policy FROM employees ORDER BY id`,
+      )
+      .toArray();
   }
 
   /**

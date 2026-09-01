@@ -7,7 +7,16 @@
 // appears, and only because the caller is an approver for it in the org chart.
 //
 // Every timestamp is taken from the server clock. Work dates are JST (Asia/Tokyo, no DST) calendar
-// dates in `YYYY-MM-DD` form; a punch is attributed to the JST date it happened on.
+// dates in `YYYY-MM-DD` form. Which work date a punch is attributed to is a property of the
+// EMPLOYEE, set by HR and not readable or settable from here:
+//
+// - by default, and for everyone who does not work nights, a punch belongs to the JST date it
+//   happened on;
+// - for an employee HR has put on shift-start dating, a punch belongs to the date of the shift
+//   that is currently open, so a 22:00 -> 06:00 shift lands entirely on the date it started.
+//
+// So never assume `punch()` returns today's date. Read `workDate` off the receipt and use THAT —
+// it is the day the punch was actually filed against, and it is the argument `getDay()` wants.
 //
 // A new account is NOT usable until HR links it to an employee record. Until then `whoAmI()`
 // returns `{ linked: false, employeeId: null }` and every other method throws
@@ -116,14 +125,17 @@ export type Reconciliation = {
  * - `duplicate_in` — clocked in twice without clocking out.
  * - `negative_gross` — punches are out of order; the record needs an administrative correction.
  *
- * NIGHT SHIFTS: a shift crossing JST midnight is split across two work dates, producing
- * `unpaired_in` on the first and `orphan_out` on the second. Do NOT present either day's
- * `workedMinutes` as that day's hours — the first date currently credits ZERO for the hours worked
- * before midnight, and the second credits nothing for the hours after it, so a night worker's day
- * reads as no work at all. How overnight hours are attributed to a work date is not yet defined
- * (it is settled with 深夜割増 calculation in a later sub-project). Until it is, report the
- * anomalies and the raw punches for such a day rather than a minutes total, and say the total is
- * unavailable rather than zero.
+ * NIGHT SHIFTS depend on the employee's work-date policy, which HR sets and this session cannot
+ * see. For an employee on shift-start dating a shift crossing JST midnight is ONE work date with
+ * the whole span credited and no anomaly, and `workedMinutes` can be presented as usual.
+ *
+ * For an employee on the default calendar dating — which is everyone who does not work nights —
+ * such a shift is still split across two work dates, producing `unpaired_in` on the first and
+ * `orphan_out` on the second: the first credits ZERO for the hours before midnight and the second
+ * nothing for the hours after it, so the day reads as no work at all. You can recognise the case
+ * from the anomalies themselves. When you see that pair on consecutive days, report the anomalies
+ * and the raw punches rather than a minutes total, and say the total is unavailable rather than
+ * zero — then tell the user their work-date policy may be wrong and that HR sets it.
  *
  * `locked` means the month is closed for payroll: reads still work, writes throw
  * `KINTAI_PERIOD_LOCKED`.
@@ -168,7 +180,12 @@ export type KintaiIdentity = {
   employeeId: number | null;
 };
 
-/** Receipt for a recorded punch, including the JST work date it was attributed to. */
+/**
+ * Receipt for a recorded punch, including the JST work date it was attributed to.
+ *
+ * `workDate` is the server's answer and the only reliable one: for an employee on shift-start
+ * dating it can be yesterday. Pass it straight to `getDay()`.
+ */
 export type PunchReceipt = {
   punchId: number;
   employeeId: number;
@@ -191,13 +208,18 @@ export interface KintaiSession {
   whoAmI(): Promise<KintaiIdentity>;
 
   /**
-   * Record a clock event at the current server time, on today's JST work date.
+   * Record a clock event at the current server time.
+   *
+   * The work date it lands on is decided by the server from the employee's own work-date policy —
+   * usually today's JST date, but the open shift's date for a night worker. It is on the receipt;
+   * do not compute it yourself. There is no way to choose it, and no way to punch at another time.
    *
    * A repeat of the same kind within one minute is treated as a double-tap and returns the original
    * punch rather than creating a second one. Pass `location` only if the user has actually granted
    * geolocation; `{ source: "denied" }` records the refusal honestly.
    *
-   * Throws `KINTAI_PERIOD_LOCKED` if today's month is already closed.
+   * Throws `KINTAI_PERIOD_LOCKED` if the month the punch would land in is already closed — which,
+   * for a night worker clocking out after midnight on the first, may not be this month.
    */
   punch(kind: PunchKind, location?: PunchLocation): Promise<PunchReceipt>;
 

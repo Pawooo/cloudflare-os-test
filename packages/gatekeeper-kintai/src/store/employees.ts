@@ -1,4 +1,4 @@
-import type { EmployeeId, EmployeeRow, NewEmployee } from "../types.js";
+import type { EmployeeId, EmployeeRow, NewEmployee, WorkDatePolicy } from "../types.js";
 import { InvalidInputError } from "../input.js";
 
 // Both are declared in `types.ts` so `app/` can render one and submit the other without pulling
@@ -302,10 +302,50 @@ export function listEmployees(sql: SqlStorage): EmployeeRow[] {
   return sql
     .exec<EmployeeRow>(
       `SELECT id, employee_number, display_name, department, employment_type,
-              designated_approver_id, status, joined_on, departed_on
+              designated_approver_id, status, joined_on, departed_on, work_date_policy
        FROM employees ORDER BY id`,
     )
     .toArray();
+}
+
+/**
+ * Which day this employee's punches are filed against.
+ *
+ * The ONLY read of this column outside the roster, and the reason it is a function rather than a
+ * field on `EmployeeProfile`: `employeeProfile` answers "how is this employee's overtime routed?",
+ * and attribution is a different question asked on a different path (every punch, rather than
+ * every submission). Keeping them apart means neither read widens because the other needed a
+ * column.
+ *
+ * `.one()` for the reason `employeeProfile` gives: every caller reaches this with an id that came
+ * out of `resolveAccount`, so a missing row is corruption and not a client mistake.
+ */
+export function workDatePolicyOf(sql: SqlStorage, employeeId: EmployeeId): WorkDatePolicy {
+  return sql
+    .exec<{ work_date_policy: WorkDatePolicy }>(
+      `SELECT work_date_policy FROM employees WHERE id = ?`, employeeId,
+    )
+    .one().work_date_policy;
+}
+
+/**
+ * Record which day this employee's punches are filed against, from now on.
+ *
+ * An UPDATE, and deliberately not a temporal row like `exemption_periods`. The two look similar
+ * and are not: an exemption is a determination about a past and future period that decides whether
+ * overtime already worked bore a premium, so WHEN it started is part of the answer. Attribution is
+ * decided once, at the moment a punch is recorded, and written into that punch's `work_date`
+ * forever — the punches themselves ARE the history, so a second history of the policy would only
+ * be able to disagree with them. Changing this re-files nothing; `audit_log` records who changed
+ * it and from what.
+ *
+ * The value is not validated here. The schema's CHECK is the backstop and `assertWorkDatePolicy`
+ * at the admin boundary is the message; a check in between would be a third opinion.
+ */
+export function setWorkDatePolicy(
+  sql: SqlStorage, employeeId: EmployeeId, policy: WorkDatePolicy,
+): void {
+  sql.exec(`UPDATE employees SET work_date_policy = ? WHERE id = ?`, policy, employeeId);
 }
 
 /** How an employee is named to a human. Never used for authorization — only for display. */

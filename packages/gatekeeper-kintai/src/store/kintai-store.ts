@@ -7,7 +7,8 @@ import {
 } from "./allocations.js";
 import {
   createEmployee, employeeExists, employeeProfile, grantExemption, isExempt, linkAccount,
-  listEmployees, openAccountLink, resolveAccount, unlinkAccount,
+  listEmployees, openAccountLink, resolveAccount, setWorkDatePolicy, unlinkAccount,
+  workDatePolicyOf,
   type AccountLinkRow, type EmployeeProfile, type EmployeeRow, type NewEmployee,
 } from "./employees.js";
 import { listRoster } from "./roster.js";
@@ -17,7 +18,7 @@ import {
   type ReportingLineRow,
 } from "./org.js";
 import {
-  allPunches, correctPunch, currentPunches, dayAnomalies, recordPunch, workedMinutes,
+  allPunches, correctPunch, currentPunches, dayAnomalies, recordPunch, workDateFor, workedMinutes,
   type NewPunch, type PunchRow,
 } from "./punches.js";
 import { createSite, matchSite, type NewSite } from "./sites.js";
@@ -33,7 +34,7 @@ import {
 } from "../routes.js";
 import { assertWritable, isLocked, lockPeriod, periodLock, type PeriodLock } from "./periods.js";
 import { appendAudit, auditEntries, type AuditEntry, type AuditRow } from "./audit.js";
-import type { EmployeeId, RosterEntry, SubmissionState } from "../types.js";
+import type { EmployeeId, RosterEntry, SubmissionState, WorkDatePolicy } from "../types.js";
 
 @validateRpc()
 export class KintaiStore extends DurableObject<Cloudflare.Env> {
@@ -118,6 +119,16 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
     return isExempt(this.sql, employeeId, at);
   }
 
+  /** Which day this employee's punches are filed against. See `workDatePolicyOf`. */
+  async workDatePolicy(employeeId: EmployeeId): Promise<WorkDatePolicy> {
+    return workDatePolicyOf(this.sql, employeeId);
+  }
+
+  /** Record the policy from now on. Not retroactive. See `setWorkDatePolicy`. */
+  async setWorkDatePolicy(employeeId: EmployeeId, policy: WorkDatePolicy): Promise<void> {
+    setWorkDatePolicy(this.sql, employeeId, policy);
+  }
+
   /** Opens a reporting edge and returns its id. See `setReportingLine`. */
   async setReportingLine(
     employeeId: EmployeeId, managerId: EmployeeId, from: number, to?: number,
@@ -162,6 +173,18 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
 
   async matchSite(latitude: number, longitude: number, at: number): Promise<number | null> {
     return matchSite(this.sql, latitude, longitude, at);
+  }
+
+  /**
+   * The work date a punch made at `now` belongs to, for this employee. See `workDateFor`.
+   *
+   * Asked BEFORE `recordPunch` rather than folded into it, because the caller needs the answer for
+   * itself: `KintaiSession.punch` checks the period lock against the date the punch will land on,
+   * and for a `shift_start` employee that is not today's. Folding it into `recordPunch` would
+   * leave the lock checked against the wrong month for exactly the employees this feature is for.
+   */
+  async workDateFor(employeeId: EmployeeId, now: number): Promise<string> {
+    return workDateFor(this.sql, employeeId, now);
   }
 
   async recordPunch(input: NewPunch): Promise<number> {

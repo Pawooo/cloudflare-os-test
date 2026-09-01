@@ -58,6 +58,7 @@ const CALL_ARGS: Record<string, unknown[]> = {
   linkAccount: ["acct-victim", 1],
   setReportingLine: [1, 2],
   grantExemption: [1],
+  setWorkDatePolicy: [1, "shift_start"],
 };
 
 /**
@@ -69,7 +70,7 @@ const CALL_ARGS: Record<string, unknown[]> = {
  */
 const INTERFACE_MEMBERS = [
   "createEmployee", "grantExemption", "linkAccount", "listEmployees", "listReportingLines",
-  "setReportingLine", "whoAmI",
+  "setReportingLine", "setWorkDatePolicy", "whoAmI",
 ];
 
 /**
@@ -91,7 +92,7 @@ const RETURN_SHAPES: Record<string, string[]> = {
   listEmployees: [
     "approverReachable", "departed_on", "department", "designated_approver_id", "display_name",
     "employee_number", "employment_type", "exempt", "id", "joined_on", "linked", "managerIds",
-    "status",
+    "status", "work_date_policy",
   ],
   listReportingLines: ["employee_id", "id", "manager_id", "valid_from", "valid_to"],
 };
@@ -192,6 +193,7 @@ describe("the capability a non-admin receives", () => {
       expect(await hr.linkAccount(`acct-shape-two-${seq}`, employeeId)).toBeUndefined();
       expect(await hr.setReportingLine(managerId, employeeId)).toBeUndefined();
       expect(await hr.grantExemption(employeeId)).toBeUndefined();
+      expect(await hr.setWorkDatePolicy(employeeId, "shift_start")).toBeUndefined();
       expect(typeof await hr.createEmployee({
         employeeNumber: `E-shape-${seq}`, displayName: "Shaped", joinedOn: "2026-04-01",
       })).toBe("number");
@@ -543,6 +545,88 @@ describe("recording 管理監督者", () => {
   });
 });
 
+describe("recording an employee's work-date policy", () => {
+  it("sets it, and the roster then reports it", async () => {
+    const hr = appUi(`acct-admin-policy-${seq}`, true);
+    const crew = await employee("Night Crew");
+
+    const before = (await hr.listEmployees()).find((row: { id: number }) => row.id === crew);
+    // The default is what every employee already has, and it is not something HR had to choose.
+    expect(before).toMatchObject({ work_date_policy: "calendar" });
+
+    await hr.setWorkDatePolicy(crew, "shift_start");
+
+    const after = (await hr.listEmployees()).find((row: { id: number }) => row.id === crew);
+    expect(after).toMatchObject({ work_date_policy: "shift_start" });
+  });
+
+  it("changes what the runtime attributes the next punch to, and nothing already recorded",
+    async () => {
+      const hr = appUi(`acct-admin-policy-runtime-${seq}`, true);
+      const crew = await employee("Runtime Crew");
+      // 22:00 JST on 2026-07-03, and 06:00 JST the next morning.
+      const tenPm = Date.parse("2026-07-03T13:00:00Z");
+      const sixAm = Date.parse("2026-07-03T21:00:00Z");
+
+      await store.recordPunch({
+        employeeId: crew, workDate: await store.workDateFor(crew, tenPm), kind: "in",
+        now: tenPm, source: "gadget",
+      });
+      // On `calendar`, the clock-out is dated by the clock: a different day.
+      expect(await store.workDateFor(crew, sixAm)).toBe("2026-07-04");
+
+      await hr.setWorkDatePolicy(crew, "shift_start");
+
+      // The SAME open shift now attracts the clock-out onto its own start date...
+      expect(await store.workDateFor(crew, sixAm)).toBe("2026-07-03");
+      // ...and the punch already recorded did not move.
+      expect((await store.currentPunches(crew, "2026-07-03")).map((p) => p.kind)).toEqual(["in"]);
+    });
+
+  it("can be set back to calendar", async () => {
+    const hr = appUi(`acct-admin-policy-back-${seq}`, true);
+    const crew = await employee("Reverting Crew");
+
+    await hr.setWorkDatePolicy(crew, "shift_start");
+    await hr.setWorkDatePolicy(crew, "calendar");
+
+    expect((await hr.listEmployees()).find((row: { id: number }) => row.id === crew))
+      .toMatchObject({ work_date_policy: "calendar" });
+  });
+
+  // Refused by `@validateRpc()`, not by a check in the method body: the policy is a string-literal
+  // union, so the decorator is what enforces it and a hand-written check would be a second opinion
+  // that could drift from the type. Pinned here because "the decorator covers it" is a claim.
+  it("refuses a policy that is not one of the two", async () => {
+    const hr = appUi(`acct-admin-policy-junk-${seq}`, true);
+    const crew = await employee("Junk Crew");
+
+    await expect(() => hr.setWorkDatePolicy(crew, "whenever"))
+      .rejects.toThrow(/capnweb-validate.*setWorkDatePolicy\[1\]: expected union/);
+    // Refused before the write: the record is untouched.
+    expect((await hr.listEmployees()).find((row: { id: number }) => row.id === crew))
+      .toMatchObject({ work_date_policy: "calendar" });
+  });
+
+  it("refuses an employee who does not exist", async () => {
+    await expect(() =>
+      appUi(`acct-admin-policy-ghost-${seq}`, true).setWorkDatePolicy(999_999, "shift_start"))
+      .rejects.toThrow(/KINTAI_NOT_FOUND/);
+  });
+
+  // Which day a punch is filed against decides what a night worker's hours are worth. An employee
+  // who could set it for themselves could move their own overnight hours onto another day.
+  it("is refused to a non-administrator", async () => {
+    const crew = await employee("Self Crew");
+
+    await expect(() =>
+      appUi(`acct-nonadmin-policy-${seq}`, false).setWorkDatePolicy(crew, "shift_start"))
+      .rejects.toThrow(/KINTAI_ADMIN_REQUIRED/);
+    expect((await store.listEmployees()).find((row) => row.id === crew))
+      .toMatchObject({ work_date_policy: "calendar" });
+  });
+});
+
 describe("the audit trail", () => {
   // src/store/audit.ts promises to record "account linking, org edges, exemptions, route
   // configuration and period locks". Before part 1 nothing in the runtime called `appendAudit` at
@@ -629,6 +713,22 @@ describe("the audit trail", () => {
     expect(entry.entity_id).toEqual(expect.any(Number));
     expect(JSON.parse(entry.after!))
       .toMatchObject({ employeeId: officer, kind: "kanri_kantokusha" });
+  });
+
+  // The setting is not retroactive, so "what was it before, and from when" is the only way to
+  // tell which of an employee's existing punches were filed under a different rule.
+  it("records who changed a work-date policy, and what it was before", async () => {
+    const adminEmployee = await employee("Policy Setter");
+    const adminAccount = `acct-audit-policy-${seq}`;
+    await store.linkAccount(adminAccount, adminEmployee, Date.now());
+    const crew = await employee("Audited Crew");
+
+    await appUi(adminAccount, true).setWorkDatePolicy(crew, "shift_start");
+
+    const [entry] = await entriesFor("set_work_date_policy", crew);
+    expect(entry).toMatchObject({ entity: "employees", actor_employee_id: adminEmployee });
+    expect(JSON.parse(entry.before!)).toEqual({ employeeId: crew, workDatePolicy: "calendar" });
+    expect(JSON.parse(entry.after!)).toEqual({ employeeId: crew, workDatePolicy: "shift_start" });
   });
 
   // A real case: the first administrator acts before anybody is onboarded, so they have no

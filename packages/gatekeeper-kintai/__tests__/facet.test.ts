@@ -166,6 +166,106 @@ describe("punching through the facet", () => {
   });
 });
 
+/**
+ * The work-date policy, exercised through the facet — which is the only place it is ever read.
+ *
+ * `punch()` takes the server clock and nothing else, so an overnight shift cannot be staged by
+ * choosing a time. It is staged by SEEDING the open clock-in through the store, at a real instant
+ * three hours ago, and then punching for real. The seeded punch's work date is deliberately one
+ * that is not today whatever time the suite runs at, so the assertion says what it means on every
+ * run: the facet filed the clock-out against the OPEN SHIFT's date, not against the calendar.
+ */
+describe("which day the facet files a punch against", () => {
+  const THREE_HOURS = 3 * 60 * 60_000;
+
+  /** A work date that is never today's, so "not the calendar date" is a real assertion. */
+  function notToday(now: number): string {
+    return jstWorkDate(now - 26 * 60 * 60_000);
+  }
+
+  it("files a clock-out onto today, for a calendar employee, even mid-shift", async () => {
+    const { employeeId, accountId } = await linkedEmployee("calendar-punch");
+    const now = Date.now();
+    const shiftDate = notToday(now);
+    await store.recordPunch({
+      employeeId, workDate: shiftDate, kind: "in", now: now - THREE_HOURS, source: "gadget",
+    });
+
+    const out = await facetFor(accountId).punch("out");
+
+    // The default, and the case that must not change: the clock decides, open shift or not.
+    expect(out.workDate).toBe(jstWorkDate(Date.now()));
+    expect(out.workDate).not.toBe(shiftDate);
+  });
+
+  it("files a clock-out onto the open shift's date, for a shift_start employee", async () => {
+    const { employeeId, accountId } = await linkedEmployee("shift-start-punch");
+    await store.setWorkDatePolicy(employeeId, "shift_start");
+    const now = Date.now();
+    const shiftDate = notToday(now);
+    await store.recordPunch({
+      employeeId, workDate: shiftDate, kind: "in", now: now - THREE_HOURS, source: "gadget",
+    });
+
+    const out = await facetFor(accountId).punch("out");
+
+    expect(out.workDate).toBe(shiftDate);
+    expect(out.workDate).not.toBe(jstWorkDate(Date.now()));
+    // One day, both punches, the whole span credited and nothing flagged — the bug, fixed.
+    expect(await store.currentPunches(employeeId, shiftDate)).toHaveLength(2);
+    expect(await store.workedMinutes(employeeId, shiftDate)).toBe(180);
+    expect(await store.dayAnomalies(employeeId, shiftDate)).toEqual([]);
+  });
+
+  it("still files a first punch of the day onto today, with no shift open", async () => {
+    const { employeeId, accountId } = await linkedEmployee("shift-start-fresh");
+    await store.setWorkDatePolicy(employeeId, "shift_start");
+
+    expect((await facetFor(accountId).punch("in")).workDate).toBe(jstWorkDate(Date.now()));
+  });
+
+  it("reads the policy from the employee the capability resolves to, not from the caller",
+    async () => {
+      const { employeeId, accountId } = await linkedEmployee("policy-identity");
+      await store.setWorkDatePolicy(employeeId, "shift_start");
+      const now = Date.now();
+      const shiftDate = notToday(now);
+      await store.recordPunch({
+        employeeId, workDate: shiftDate, kind: "in", now: now - THREE_HOURS, source: "gadget",
+      });
+
+      // Every extra argument a Gadget could invent, forwarded verbatim by the host. None of them
+      // is a work date, a policy or a timestamp, because `punch` takes none — and the receipt
+      // proves the server decided.
+      const out = await facetFor(accountId)
+        .punch("out", undefined, jstWorkDate(now), "calendar", now - 999_999_999);
+
+      expect(out.workDate).toBe(shiftDate);
+      expect(out.employeeId).toBe(employeeId);
+      const punches = await store.currentPunches(employeeId, shiftDate);
+      // The recorded time is the server's, within a second of this test's own clock.
+      expect(punches[1].occurred_at).toBeGreaterThan(now - 1_000);
+    });
+
+  // The lock has to be checked against the date the punch will LAND on. Checked against today's
+  // instead, a night worker clocking out at 06:00 on the first of the month would write into the
+  // month that closed at midnight. 2026-05 is a month nothing else in this file touches.
+  it("refuses a punch that would land in a closed period, even though today is open", async () => {
+    const { employeeId, accountId } = await linkedEmployee("locked-shift");
+    await store.setWorkDatePolicy(employeeId, "shift_start");
+    const now = Date.now();
+    await store.recordPunch({
+      employeeId, workDate: "2026-05-20", kind: "in", now: now - THREE_HOURS, source: "gadget",
+    });
+    await store.lockPeriod("2026-05", employeeId, now);
+
+    await expect(() => facetFor(accountId).punch("out")).rejects.toThrow(/KINTAI_PERIOD_LOCKED/);
+    // Nothing was written anywhere: not into the closed month, and not onto today either.
+    expect(await store.currentPunches(employeeId, "2026-05-20")).toHaveLength(1);
+    expect(await store.currentPunches(employeeId, jstWorkDate(Date.now()))).toEqual([]);
+  });
+});
+
 describe("the day view", () => {
   it("surfaces punches, allocations, reconciliation, anomalies and the lock state", async () => {
     const { employeeId, accountId } = await linkedEmployee("day");

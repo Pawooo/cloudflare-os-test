@@ -10,6 +10,22 @@ export type StepRule = "any_of" | "all_of";
 export type EmployeeStatus = "active" | "leave" | "departed";
 
 /**
+ * Which day a punch belongs to, per employee.
+ *
+ * - `calendar` — the punch belongs to the JST date it happened on. The default, and what every
+ *   employee who already exists is on: office staff finish before midnight, so the clock and the
+ *   shift agree and there is nothing to decide.
+ * - `shift_start` — the punch inherits the work date of the employee's currently open shift, so a
+ *   22:00 → 06:00 site crew shift lands entirely on the date it started. Guarded by
+ *   `MAX_SHIFT_MS`; see `work-date.ts`.
+ *
+ * Per employee rather than per deployment because the company has both, and per-employee is the
+ * only scope at which either answer is right. It is NOT retroactive: changing it re-files nothing
+ * already recorded.
+ */
+export type WorkDatePolicy = "calendar" | "shift_start";
+
+/**
  * What the admin app's `whoAmI()` reports about the caller's own account.
  *
  * Declared here rather than beside the API it belongs to because `app/` imports it, and everything
@@ -67,6 +83,8 @@ export type EmployeeRow = {
   status: EmployeeStatus;
   joined_on: string;
   departed_on: string | null;
+  /** Which day this employee's punches are filed against. See `WorkDatePolicy`. */
+  work_date_policy: WorkDatePolicy;
 };
 
 /**

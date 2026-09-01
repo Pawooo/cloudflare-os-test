@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
-import type { EmployeeId, KintaiIdentity, NewEmployee, RosterEntry } from "../src/types";
+import type {
+  EmployeeId, KintaiIdentity, NewEmployee, RosterEntry, WorkDatePolicy,
+} from "../src/types";
+import { WORK_DATE_POLICIES, WORK_DATE_POLICY_LABELS } from "../src/work-date";
 import { describeFailure, isAdminRequired } from "./errors";
 
 /**
@@ -17,6 +20,7 @@ export type KintaiAdminClient = {
   linkAccount(accountId: string, employeeId: EmployeeId): Promise<void>;
   setReportingLine(employeeId: EmployeeId, managerId: EmployeeId): Promise<void>;
   grantExemption(employeeId: EmployeeId): Promise<void>;
+  setWorkDatePolicy(employeeId: EmployeeId, policy: WorkDatePolicy): Promise<void>;
 };
 
 type View =
@@ -27,7 +31,7 @@ type View =
   | { status: "admin"; identity: KintaiIdentity; roster: RosterEntry[] };
 
 /** Which form a message or a spinner belongs to. Failures must land beside what failed. */
-type FormKey = "create" | "link" | "report" | "exempt";
+type FormKey = "create" | "link" | "report" | "exempt" | "policy";
 type Notice = { kind: "ok" | "error"; text: string };
 
 /**
@@ -54,9 +58,11 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
   const [linkTarget, setLinkTarget] = useState<string>("");
   const [reportTarget, setReportTarget] = useState<string>("");
   const [exemptTarget, setExemptTarget] = useState<string>("");
+  const [policyTarget, setPolicyTarget] = useState<string>("");
   const linkCodeRef = useRef<HTMLInputElement>(null);
   const managerRef = useRef<HTMLSelectElement>(null);
   const exemptRef = useRef<HTMLSelectElement>(null);
+  const policyRef = useRef<HTMLSelectElement>(null);
   const live = useRef(true);
 
   useEffect(() => () => { live.current = false; }, []);
@@ -184,6 +190,10 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
               setExemptTarget(String(employee.id));
               reveal(exemptRef.current, "grant-exemption");
             }}
+            onSetPolicy={(employee) => {
+              setPolicyTarget(String(employee.id));
+              reveal(policyRef.current, "set-work-date-policy");
+            }}
           />
 
           <div className="flex flex-col gap-4">
@@ -225,6 +235,21 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
                 submit("exempt", "Couldn’t record that exemption.", async () => {
                   await api.grantExemption(employeeId);
                   return `${nameOf(view.roster, employeeId)} is recorded as 管理監督者 from now.`;
+                })}
+            />
+            <WorkDatePolicyForm
+              roster={view.roster}
+              employeeId={policyTarget}
+              onEmployeeId={setPolicyTarget}
+              selectRef={policyRef}
+              busy={pending === "policy"}
+              notice={notices.policy}
+              onSubmit={(employeeId, policy) =>
+                submit("policy", "Couldn’t change that work-date policy.", async () => {
+                  await api.setWorkDatePolicy(employeeId, policy);
+                  return `${nameOf(view.roster, employeeId)}: new punches will be filed ` +
+                    `${policy === "shift_start" ? "against the date their shift started" : "against the date they happen on"}.` +
+                    " Punches already recorded are unchanged.";
                 })}
             />
             <CreateEmployeeForm
@@ -358,13 +383,14 @@ function AccountCard({ identity, admin }: { identity: KintaiIdentity; admin: boo
  * the manager list, because that list is shown to explain the verdict rather than to reach it.
  */
 function Roster({
-  roster, canSetManager, onLink, onSetManager, onExempt,
+  roster, canSetManager, onLink, onSetManager, onExempt, onSetPolicy,
 }: {
   roster: RosterEntry[];
   canSetManager: boolean;
   onLink: (employee: RosterEntry) => void;
   onSetManager: (employee: RosterEntry) => void;
   onExempt: (employee: RosterEntry) => void;
+  onSetPolicy: (employee: RosterEntry) => void;
 }) {
   const names = new Map(roster.map((row) => [row.id, row.display_name]));
   const incomplete = roster.filter((row) => !isReady(row)).length;
@@ -396,6 +422,7 @@ function Roster({
               onLink={() => onLink(employee)}
               onSetManager={() => onSetManager(employee)}
               onExempt={() => onExempt(employee)}
+              onSetPolicy={() => onSetPolicy(employee)}
             />
           ))}
         </ul>
@@ -405,7 +432,7 @@ function Roster({
 }
 
 function RosterRow({
-  employee, names, canSetManager, onLink, onSetManager, onExempt,
+  employee, names, canSetManager, onLink, onSetManager, onExempt, onSetPolicy,
 }: {
   employee: RosterEntry;
   names: Map<number, string>;
@@ -413,6 +440,7 @@ function RosterRow({
   onLink: () => void;
   onSetManager: () => void;
   onExempt: () => void;
+  onSetPolicy: () => void;
 }) {
   const ready = isReady(employee);
   return (
@@ -423,6 +451,14 @@ function RosterRow({
           {[employee.employee_number, employee.department, employee.employment_type]
             .filter(Boolean).join(" · ")}
         </p>
+        {/* Shown only when it is NOT the default. A badge on every row would be noise, and the
+            thing HR needs to be able to spot is the handful of people whose punches are filed
+            somewhere other than the day they happened on. */}
+        {employee.work_date_policy === "shift_start" && (
+          <p className="truncate text-xs text-kumo-subtle" data-testid="work-date-policy">
+            夜勤 · punches filed against the shift’s start date
+          </p>
+        )}
       </div>
 
       <div className="min-w-56 flex-1">
@@ -480,6 +516,18 @@ function RosterRow({
             管理監督者
           </button>
         )}
+        {/* Always offered, unlike the two above: an employee on the wrong work-date policy is not
+            a broken row — the roster cannot tell, because both answers are legitimate — so there
+            is no "issue" for this button to appear in response to. It is the only way HR can see
+            or change the setting, so it is always reachable. */}
+        <button
+          type="button"
+          data-action="policy-for-this"
+          className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-xs font-medium text-kumo-default hover:bg-kumo-tint"
+          onClick={onSetPolicy}
+        >
+          Work dates
+        </button>
       </div>
     </li>
   );
@@ -674,6 +722,90 @@ function ExemptionForm({
           value={employeeId}
           onChange={onEmployeeId}
         />
+      </Field>
+    </FormCard>
+  );
+}
+
+/**
+ * Record which day an employee's punches are filed against.
+ *
+ * Its own form beside the exemption's, and for the same reason: this decides what a night worker's
+ * hours are worth and it is NOT retroactive, so it is a deliberate press rather than a toggle in a
+ * list. Get it wrong for a month and that month's records are wrong in a way only an
+ * administrative correction can fix — which is why the hint says so and why the confirmation names
+ * what will happen to punches from now on rather than claiming a repair.
+ *
+ * The dropdown is filled from `WORK_DATE_POLICIES`, the same list the worker's own types are built
+ * from, so the form cannot offer a value the server would refuse.
+ */
+function WorkDatePolicyForm({
+  roster, employeeId, onEmployeeId, selectRef, busy, notice, onSubmit,
+}: {
+  roster: RosterEntry[];
+  employeeId: string;
+  onEmployeeId: (value: string) => void;
+  selectRef: React.RefObject<HTMLSelectElement | null>;
+  busy: boolean;
+  notice?: Notice;
+  onSubmit: (employeeId: EmployeeId, policy: WorkDatePolicy) => Promise<boolean>;
+}) {
+  // The dropdown DERIVES from the selected employee, with a local override that is tied to the
+  // employee it was made for. Held as plain state rather than an effect, and keyed this way for a
+  // reason a test caught: the roster row's button selects an employee from OUTSIDE this component,
+  // and a dropdown holding its own independent value would then sit on `calendar` while showing a
+  // night worker's name — one press and their policy is silently reverted. Changing the selected
+  // employee retires the override automatically, because it no longer matches.
+  const [choice, setChoice] = useState<{ employeeId: string; policy: WorkDatePolicy }>();
+  const id = useId();
+
+  const selected = roster.find((row) => String(row.id) === employeeId);
+  const current = selected?.work_date_policy;
+  const policy: WorkDatePolicy =
+    choice?.employeeId === employeeId ? choice.policy : current ?? "calendar";
+
+  return (
+    <FormCard
+      title="Set which day punches are filed against"
+      hint="Office staff finish before midnight, so the calendar date is right for them and it is the default. A night shift crossing midnight has to be filed against the date it started, or it splits across two days and both get flagged. This applies to punches made from now on — it does not move anything already recorded, so set it when you onboard someone who works nights."
+      disabled={roster.length === 0}
+      disabledHint="Add an employee record first."
+      busy={busy}
+      notice={notice}
+      action="set-work-date-policy"
+      submitLabel="Set policy"
+      onSubmit={async () => {
+        if (await onSubmit(Number(employeeId), policy)) onEmployeeId("");
+      }}
+    >
+      <Field label="Employee" htmlFor={`${id}-employee`}>
+        <EmployeeSelect
+          id={`${id}-employee`}
+          name="employeeId"
+          selectRef={selectRef}
+          roster={roster}
+          value={employeeId}
+          onChange={onEmployeeId}
+        />
+      </Field>
+      <Field
+        label="Work date"
+        htmlFor={`${id}-policy`}
+        note={current ? `Currently ${WORK_DATE_POLICY_LABELS[current]}.` : undefined}
+      >
+        <select
+          id={`${id}-policy`}
+          name="policy"
+          required
+          value={policy}
+          className="h-9 w-full rounded-lg border border-kumo-line bg-kumo-control px-2 text-sm text-kumo-default outline-none focus:ring-2 focus:ring-kumo-ring"
+          onChange={(event) =>
+            setChoice({ employeeId, policy: event.currentTarget.value as WorkDatePolicy })}
+        >
+          {WORK_DATE_POLICIES.map((value) => (
+            <option key={value} value={value}>{WORK_DATE_POLICY_LABELS[value]}</option>
+          ))}
+        </select>
       </Field>
     </FormCard>
   );

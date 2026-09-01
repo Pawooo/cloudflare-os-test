@@ -45,6 +45,36 @@ describe("kintai schema", () => {
       .toEqual([...location, "punch_id"].sort());
   });
 
+  it("carries the work-date policy on the employee, defaulting to calendar", async () => {
+    const store = env.KINTAI_STORE.getByName("test-schema-policy");
+
+    expect(await store.tableColumns("employees")).toEqual([
+      "departed_on", "department", "designated_approver_id", "display_name", "employee_number",
+      "employment_type", "id", "joined_on", "status", "work_date_policy",
+    ]);
+
+    // The DEFAULT is what makes this feature safe to ship: an INSERT that says nothing about the
+    // policy — which is every existing caller — produces the behaviour that existed before it.
+    const employeeId = await store.createEmployee({
+      employeeNumber: "E-default", displayName: "Default", joinedOn: "2026-04-01",
+    });
+    expect((await store.listEmployees()).find((row) => row.id === employeeId))
+      .toMatchObject({ work_date_policy: "calendar" });
+  });
+
+  // A store created before the column existed holds real payroll records and cannot be recreated,
+  // so the column has to be added to the table in place. See `migrateLegacyEmployees`.
+  it("adds the policy column to an employees table that predates it, as calendar", async () => {
+    const host = env.KINTAI_FACET_HOST.getByName("schema-migration");
+
+    const rows = await host.migrateLegacyEmployees(["Tanaka", "Suzuki"]);
+
+    expect(rows).toEqual([
+      { display_name: "Tanaka", work_date_policy: "calendar" },
+      { display_name: "Suzuki", work_date_policy: "calendar" },
+    ]);
+  });
+
   it("is idempotent across activations", async () => {
     const first = env.KINTAI_STORE.getByName("test-idempotent");
     const before = await first.tableNames();

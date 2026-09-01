@@ -5,6 +5,14 @@
 // punches, approval_events and audit_log are append-only: corrections insert a new row rather
 // than updating an existing one. See the design doc's data model section.
 
+/** Whether `table` already has `column`. The test every ADD COLUMN below is guarded by. */
+export function hasColumn(sql: SqlStorage, table: string, column: string): boolean {
+  return sql
+    .exec<{ name: string }>(`PRAGMA table_info(${table})`)
+    .toArray()
+    .some((row) => row.name === column);
+}
+
 export function applySchema(sql: SqlStorage): void {
   sql.exec(`CREATE TABLE IF NOT EXISTS employees (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -15,8 +23,24 @@ export function applySchema(sql: SqlStorage): void {
     designated_approver_id INTEGER REFERENCES employees(id),
     status TEXT NOT NULL CHECK (status IN ('active', 'leave', 'departed')),
     joined_on TEXT NOT NULL,
-    departed_on TEXT
+    departed_on TEXT,
+    -- Which day this employee's punches are filed against. See WorkDatePolicy in types.ts.
+    -- The DEFAULT is the whole safety property of this feature: an employee record written
+    -- before the column existed, and one created by any caller that does not mention it, both
+    -- come out 'calendar' -- exactly how they behaved before there was a policy at all.
+    work_date_policy TEXT NOT NULL DEFAULT 'calendar'
+      CHECK (work_date_policy IN ('calendar', 'shift_start'))
   ) STRICT`);
+  // A store created before the policy existed has the table without that column, and `employees`
+  // holds real payroll records — it cannot be recreated. ADD COLUMN with a non-null DEFAULT is
+  // the one shape SQLite allows for a NOT NULL addition, and it backfills every existing row with
+  // 'calendar', which is the behaviour those employees already had.
+  if (!hasColumn(sql, "employees", "work_date_policy")) {
+    sql.exec(
+      `ALTER TABLE employees ADD COLUMN work_date_policy TEXT NOT NULL DEFAULT 'calendar'
+         CHECK (work_date_policy IN ('calendar', 'shift_start'))`,
+    );
+  }
 
   sql.exec(`CREATE TABLE IF NOT EXISTS account_links (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,6 +96,13 @@ export function applySchema(sql: SqlStorage): void {
   ) STRICT`);
   sql.exec(`CREATE INDEX IF NOT EXISTS punches_by_day
     ON punches(employee_id, work_date)`);
+  // Attribution asks one question of this table on every punch a `shift_start` employee makes:
+  // "when did this employee last clock in?" — bounded to the last 16 hours. `punches_by_day` is
+  // keyed on the work date, which is the answer being computed and so cannot be the way in; this
+  // index makes that lookup a range scan of at most a shift's worth of rows instead of a walk
+  // over the employee's whole punch history. See `workDateFor` in punches.ts.
+  sql.exec(`CREATE INDEX IF NOT EXISTS punches_by_time
+    ON punches(employee_id, kind, occurred_at)`);
   // At most one current correction per punch: a database constraint, not an application check,
   // because later tasks rely on currentPunches() never returning two rows that both claim to
   // supersede the same original.

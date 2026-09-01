@@ -27,6 +27,7 @@ function person(overrides: Partial<RosterEntry> & Pick<RosterEntry, "id">): Rost
     managerIds: [],
     exempt: false,
     approverReachable: false,
+    work_date_policy: "calendar",
     ...overrides,
   };
 }
@@ -55,6 +56,7 @@ function adminApi(overrides: Partial<KintaiAdminClient> = {}, roster: RosterEntr
     linkAccount: vi.fn<KintaiAdminClient["linkAccount"]>(async () => {}),
     setReportingLine: vi.fn<KintaiAdminClient["setReportingLine"]>(async () => {}),
     grantExemption: vi.fn<KintaiAdminClient["grantExemption"]>(async () => {}),
+    setWorkDatePolicy: vi.fn<KintaiAdminClient["setWorkDatePolicy"]>(async () => {}),
     ...overrides,
   };
 }
@@ -79,6 +81,9 @@ function viewerApi(overrides: Partial<KintaiAdminClient> = {}) {
     }),
     grantExemption: vi.fn<KintaiAdminClient["grantExemption"]>(async () => {
       throw REFUSED("grantExemption");
+    }),
+    setWorkDatePolicy: vi.fn<KintaiAdminClient["setWorkDatePolicy"]>(async () => {
+      throw REFUSED("setWorkDatePolicy");
     }),
     ...overrides,
   });
@@ -269,6 +274,19 @@ describe("AdminPage", () => {
       expect(row(STRANDED.id).querySelector('[data-action="manager-for-this"]')).not.toBeNull();
     });
 
+    it("marks a shift-start employee on the roster, and says nothing on a calendar one", async () => {
+      const crew = person({
+        id: 9, display_name: "Night Crew", linked: true, approverReachable: true,
+        work_date_policy: "shift_start",
+      });
+      await render(<AdminPage api={adminApi({}, [TANAKA, crew])} />);
+
+      expect(row(9).querySelector('[data-testid="work-date-policy"]')!.textContent)
+        .toContain("filed against the shift’s start date");
+      // A badge on every row would be noise: the default is what almost everybody is on.
+      expect(row(TANAKA.id).querySelector('[data-testid="work-date-policy"]')).toBeNull();
+    });
+
     it("says so plainly when there is nobody on the roster at all", async () => {
       await render(<AdminPage api={adminApi({}, [])} />);
 
@@ -394,6 +412,70 @@ describe("AdminPage", () => {
       expect(row(9).textContent).toContain("Ready · 管理監督者");
       expect(row(9).querySelector('[data-action="exempt-this"]')).toBeNull();
       expect(row(9).querySelector('[data-action="manager-for-this"]')).toBeNull();
+    });
+
+    // Not a repair like the other row buttons: both policies are legitimate, so the roster cannot
+    // tell that one is wrong. It is offered on every row because it is the only way to see or
+    // change the setting at all.
+    it("sets a night worker's work-date policy from the row, and says what changes", async () => {
+      const crew = person({
+        id: 9, display_name: "Night Crew", linked: true, approverReachable: true, managerIds: [1],
+      });
+      const api = adminApi({}, [TANAKA, crew]);
+      await render(<AdminPage api={api} />);
+
+      await click('[data-employee="9"] [data-action="policy-for-this"]');
+      await choose('[data-form="set-work-date-policy"] [name="policy"]', "shift_start");
+      await submit("set-work-date-policy");
+
+      expect(api.setWorkDatePolicy).toHaveBeenCalledWith(9, "shift_start");
+      // The confirmation says what will happen NEXT and that nothing moved — this is the setting
+      // people most need told is not retroactive.
+      expect(text('[data-testid="set-work-date-policy-notice"]')).toBe(
+        "Night Crew: new punches will be filed against the date their shift started." +
+        " Punches already recorded are unchanged.",
+      );
+      expect(api.listEmployees).toHaveBeenCalledTimes(2);
+    });
+
+    it("offers the control on every row, including one that is already ready", async () => {
+      await render(<AdminPage api={adminApi({}, [TANAKA, STRANDED])} />);
+
+      expect(row(TANAKA.id).querySelector('[data-action="policy-for-this"]')).not.toBeNull();
+      expect(row(STRANDED.id).querySelector('[data-action="policy-for-this"]')).not.toBeNull();
+    });
+
+    it("shows the employee's current policy when their row is picked", async () => {
+      const crew = person({
+        id: 9, display_name: "Night Crew", linked: true, work_date_policy: "shift_start",
+      });
+      await render(<AdminPage api={adminApi({}, [TANAKA, crew])} />);
+
+      await click('[data-employee="9"] [data-action="policy-for-this"]');
+
+      // The dropdown follows the row rather than sitting on the default, so a press without a
+      // change cannot silently move a night worker back onto calendar dating.
+      expect(field<HTMLSelectElement>('[data-form="set-work-date-policy"] [name="policy"]').value)
+        .toBe("shift_start");
+      expect(container!.textContent).toContain("Currently Shift start date (night shifts)");
+    });
+
+    it("sets it back to calendar", async () => {
+      const crew = person({
+        id: 9, display_name: "Night Crew", linked: true, work_date_policy: "shift_start",
+      });
+      const api = adminApi({}, [crew]);
+      await render(<AdminPage api={api} />);
+
+      await choose('[data-form="set-work-date-policy"] [name="employeeId"]', "9");
+      await choose('[data-form="set-work-date-policy"] [name="policy"]', "calendar");
+      await submit("set-work-date-policy");
+
+      expect(api.setWorkDatePolicy).toHaveBeenCalledWith(9, "calendar");
+      expect(text('[data-testid="set-work-date-policy-notice"]')).toBe(
+        "Night Crew: new punches will be filed against the date they happen on." +
+        " Punches already recorded are unchanged.",
+      );
     });
 
     it("clears the form after a success so the next entry starts empty", async () => {
