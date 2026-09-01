@@ -81,3 +81,15 @@ export const WORK_DATE_POLICY_LABELS: Record<WorkDatePolicy, string> = {
   calendar: "Calendar date (office staff)",
   shift_start: "Shift start date (night shifts)",
 };
+
+/**
+ * The instant a JST work date begins.
+ *
+ * The inverse of `jstWorkDate`, and the reason it exists: `Date.parse("2026-09-01")` is UTC
+ * midnight, which is 09:00 JST — mid-morning of the day it claims to start. Every window check
+ * pinned to a work date was therefore asking about the wrong nine hours, so an exemption or an
+ * org edge that began during that window read as absent for the whole day.
+ */
+export function workDateStart(workDate: string): number {
+  return Date.parse(`${workDate}T00:00:00+09:00`);
+}

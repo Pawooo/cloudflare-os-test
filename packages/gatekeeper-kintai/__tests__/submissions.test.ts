@@ -547,6 +547,61 @@ describe("provenance", () => {
   });
 });
 
+describe("who can approve is a question about now", () => {
+  it("accepts a submission from an employee whose manager was set today", async () => {
+    // Reproduces a live failure. The reporting line is created DURING the work day -- which is
+    // what happens whenever someone is onboarded, or moves team, on the day they work. The old
+    // code asked "did they have a manager at the start of the work date?", so an edge created at
+    // 16:33 could not approve that same day's overtime, and the answer never became yes: filing
+    // later did not help, because the question was pinned to the past.
+    //
+    // The admin roster meanwhile evaluates the SAME function at `Date.now()` and reported
+    // "reports to Admin - all ready". One question, two instants, two answers.
+    const seq = Date.now();
+    const late = await store.createEmployee({
+      employeeNumber: `L${seq}`, displayName: "Late", department: "CONSTRUCTION",
+      joinedOn: "2026-04-01",
+    });
+    const chief = await store.createEmployee({
+      employeeNumber: `C${seq}`, displayName: "Chief", joinedOn: "2026-04-01",
+    });
+    await singleStepRoute();
+
+    // JUL is 2026-07-03T00:00:00Z. The edge starts well after the work date began.
+    const middleOfTheDay = JUL + 16 * 3600_000;
+    await store.setReportingLine(late, chief, middleOfTheDay);
+
+    const id = await store.submitOvertime({
+      employeeId: late, requestedFor: "2026-07-03", minutes: 120,
+      reason: "manager assigned today", now: middleOfTheDay + 3600_000,
+      department: "CONSTRUCTION", employmentType: null,
+    });
+
+    expect((await store.getSubmission(id)).state).toBe("pending");
+    // And the person who can actually approve it, can.
+    expect(await store.actOnSubmission({
+      submissionId: id, actorId: chief, action: "approve", now: middleOfTheDay + 7200_000,
+    })).toBe("approved");
+  });
+
+  it("still refuses an employee who has no approver at filing time", async () => {
+    // The rule did not become "anything goes": reachability is still required, just asked about
+    // the moment the answer is needed.
+    const seq = Date.now() + 1;
+    const orphan = await store.createEmployee({
+      employeeNumber: `O${seq}`, displayName: "Orphan", department: "CONSTRUCTION",
+      joinedOn: "2026-04-01",
+    });
+    await singleStepRoute();
+
+    await expect(() => store.submitOvertime({
+      employeeId: orphan, requestedFor: "2026-07-03", minutes: 120,
+      reason: "nobody above me", now: JUL + 3600_000,
+      department: "CONSTRUCTION", employmentType: null,
+    })).rejects.toThrow(/KINTAI_NO_APPROVER/);
+  });
+});
+
 describe("a filer's own queue", () => {
   it("omits a submission the approver filed, since they can never act on it", async () => {
     await singleStepRoute();

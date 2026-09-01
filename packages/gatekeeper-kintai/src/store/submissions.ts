@@ -1,6 +1,7 @@
 import type { ApprovalAction, EmployeeId, SubmissionKind, SubmissionState } from "../types.js";
 import { NoRouteError, resolveRoute, type RouteSnapshot, type RouteStep } from "../routes.js";
 import { assertApproverReachable, hasAuthorityOver, managersAt } from "./org.js";
+import { workDateStart } from "../work-date.js";
 import { designatedApproverOf, employeeLabel, isExempt } from "./employees.js";
 
 // The state machine, and the three invariants it exists to hold:
@@ -272,14 +273,14 @@ export function assertSatisfiable(snapshot: RouteSnapshot, employeeId: EmployeeI
  * configuration changes mid-approval, in-flight submissions must not mutate under their approvers.
  */
 export function submitOvertime(sql: SqlStorage, input: NewSubmission): number {
-  // `requested_for` is a calendar date (JST work date), not an instant; it is parsed as UTC
-  // midnight of that date to evaluate both checks below against the period this request is
-  // actually about. This is deliberately the requested date, not `input.now` (the filing time) —
-  // an employee exempt on the day worked but filing later, once no longer exempt, is still filing
-  // for exempt work and must still be refused; and an employee with no approver on the day worked
-  // must not be let through just because they later happen to gain one before filing.
-  const requestedAt = Date.parse(input.requestedFor);
+  // `requested_for` is a calendar date (JST work date), not an instant. `workDateStart` rather
+  // than `Date.parse`, which yields UTC midnight — 09:00 JST, mid-morning of the day it claims to
+  // start — so anything beginning during those nine hours read as absent for the whole day.
+  const requestedAt = workDateStart(input.requestedFor);
 
+  // Exemption is asked about the DAY WORKED, not the filing time, and that is deliberate: an
+  // employee exempt when they worked but filing later, once no longer exempt, is still filing for
+  // exempt work and must still be refused. Exemption is a property of the work.
   if (isExempt(sql, input.employeeId, requestedAt)) {
     throw new ExemptEmployeeError();
   }
@@ -296,7 +297,21 @@ export function submitOvertime(sql: SqlStorage, input: NewSubmission): number {
   // employee's last reporting edge (or revoking their designated approver, if that ever becomes
   // mutable) needs this same check at that write, not only at submission time — an employee who
   // is orphaned before ever filing again would otherwise pass silently until they did.
-  assertApproverReachable(sql, input.employeeId, requestedAt);
+  //
+  // Asked at `input.now`, NOT at `requestedAt`, and unlike exemption above that is the whole
+  // point. "Who can approve this?" is a question about the org as it stands when the answer is
+  // needed, not about the day the work happened. Pinning it to the work date made a reporting
+  // line created during that day unable to approve it — reproduced live: an edge created at
+  // 16:33 JST could not approve overtime for that same date, and filing later never helped
+  // because the question stayed pinned to a moment before the edge existed. Worse, it left the
+  // submission permanently unfileable, when the obvious approver was standing right there.
+  //
+  // It also put this check into open disagreement with `listRoster`, which asks
+  // `hasReachableApprover` at `Date.now()` and so displayed "reports to Admin - all ready" for an
+  // employee this function was simultaneously refusing as having no manager. `roster.ts` states
+  // that it calls the same functions the approval path calls precisely so the two cannot drift;
+  // the `at` they passed was the drift.
+  assertApproverReachable(sql, input.employeeId, input.now);
 
   const snapshot = resolveRoute(sql, {
     department: input.department,

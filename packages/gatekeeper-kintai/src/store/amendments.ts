@@ -258,11 +258,17 @@ export function fileAmendment(sql: SqlStorage, input: NewAmendment): number {
     ? describeAddition(sql, input)
     : describeCorrection(sql, input);
 
-  // Evaluated against the day worked, not the day of filing -- an employee who had no approver on
-  // the day the punch belongs to must not be let through because they have gained one since. The
-  // same reasoning, and the same call, as `submitOvertime`.
-  const requestedAt = Date.parse(workDate);
-  assertApproverReachable(sql, input.employeeId, requestedAt);
+  // Asked at the filing instant, not against the day the punch belongs to. "Who can approve this?"
+  // is a question about the org as it stands when the answer is needed; a correction to a punch
+  // from three months ago is approved by whoever manages this employee today, because that is who
+  // exists to approve it.
+  //
+  // Pinning it to the work date is what `submitOvertime` used to do, and it was wrong there for a
+  // reason that bites harder here: it made a reporting line created during a day unable to approve
+  // that day, permanently, and it disagreed with the roster's own readiness column. Amendments
+  // reach further back than overtime ever does, so the work date is further from the org that has
+  // to act on it. Same call as `submitOvertime`, same instant, deliberately.
+  assertApproverReachable(sql, input.employeeId, input.now);
 
   // `minutes: 0` is the honest criterion, not a placeholder: an amendment has no minutes to route
   // on. A route gated on a minute threshold therefore never claims an amendment, which is right --
