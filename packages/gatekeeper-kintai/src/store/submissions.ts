@@ -1,4 +1,4 @@
-import type { ApprovalAction, EmployeeId, SubmissionState } from "../types.js";
+import type { ApprovalAction, EmployeeId, SubmissionKind, SubmissionState } from "../types.js";
 import { NoRouteError, resolveRoute, type RouteSnapshot, type RouteStep } from "../routes.js";
 import { assertApproverReachable, hasAuthorityOver, managersAt } from "./org.js";
 import { designatedApproverOf, employeeLabel, isExempt } from "./employees.js";
@@ -60,7 +60,15 @@ export type ActInput = ActCheck & {
 export type SubmissionRow = {
   id: number;
   employee_id: number;
-  kind: "overtime";
+  /**
+   * What kind of request this is. `overtime` until amendments landed; an amendment is a submission
+   * too, so that it inherits the approval stack rather than growing a second one beside it.
+   *
+   * Whatever reads a submission must not assume `overtime`. `minutes` and `calculation_inputs` are
+   * overtime's columns and carry 0 and NULL on an amendment; what an amendment asks for lives in
+   * `amendment_requests`, keyed on this row's id.
+   */
+  kind: SubmissionKind;
   requested_for: string;
   state: SubmissionState;
   submitted_at: number | null;
@@ -231,7 +239,7 @@ export function approvalEvents(sql: SqlStorage, submissionId: number): ApprovalE
  * employee themself; the amendment work closes it with `assertAmendmentSatisfiable`. Do not read
  * the list above as exhaustive until it does.
  */
-function assertSatisfiable(snapshot: RouteSnapshot, employeeId: EmployeeId): void {
+export function assertSatisfiable(snapshot: RouteSnapshot, employeeId: EmployeeId): void {
   if (snapshot.steps.length === 0) {
     throw new NoRouteError(
       `KINTAI_NO_ROUTE: approval route ${snapshot.routeId} has no approval steps, so nothing ` +

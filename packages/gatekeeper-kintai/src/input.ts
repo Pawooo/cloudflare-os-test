@@ -11,6 +11,8 @@
  * `kintai.ts` re-exports `InvalidInputError` so existing importers of it are unaffected.
  */
 
+import { PUNCH_KINDS } from "./types.js";
+
 /**
  * Rejects malformed input at the untrusted boundary.
  *
@@ -24,6 +26,23 @@ export class InvalidInputError extends Error {
   readonly code = "KINTAI_INVALID_INPUT";
   constructor(detail: string) {
     super(`KINTAI_INVALID_INPUT: ${detail}`);
+  }
+}
+
+/**
+ * A time that has not happened yet, offered as the time something happened.
+ *
+ * Separate from `InvalidInputError` because the remedy is different and worth saying: the caller
+ * is not malformed, they named the wrong instant. See `assertNotFuture` for why the bound exists
+ * at all.
+ */
+export class FutureOccurrenceError extends Error {
+  readonly code = "KINTAI_FUTURE_OCCURRENCE";
+  constructor(label: string) {
+    super(
+      `KINTAI_FUTURE_OCCURRENCE: ${label} may not be in the future. Give the time the punch ` +
+      `should have been made, not a time still to come.`,
+    );
   }
 }
 
@@ -42,6 +61,48 @@ export function assertWorkDate(label: string, value: string): void {
   const parsed = new Date(`${value}T00:00:00Z`);
   if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) {
     throw new InvalidInputError(`${label} is not a real calendar date: ${value}.`);
+  }
+}
+
+/** One of the four punch kinds; the schema's CHECKs are the backstop, not the message. */
+export function assertPunchKind(label: string, value: string): void {
+  if (!(PUNCH_KINDS as readonly string[]).includes(value)) {
+    throw new InvalidInputError(
+      `${label} must be one of ${PUNCH_KINDS.join(", ")}, and is ${JSON.stringify(value)}.`,
+    );
+  }
+}
+
+/**
+ * A punch may not be dated in the future.
+ *
+ * Its own code rather than `KINTAI_INVALID_INPUT`, because unlike a malformed date this is a
+ * well-formed value the caller can act on: they meant a time that has already passed and gave one
+ * that has not. The two cases below therefore split — a non-instant is malformed input, a future
+ * instant is a refused request.
+ *
+ * This is not hygiene. A prior review found that a future-dated punch is read as an open shift by
+ * `openShiftWorkDate` and can then cause a genuine punch arriving before it to be silently
+ * discarded by duplicate suppression. It was rated low severity ONLY because nothing in the system
+ * let a human choose a punch time. Filing an amendment is the first path that does, so the bound
+ * lands with it rather than after it.
+ *
+ * Lives here, beside `assertWorkDate`, so the store's write and any boundary that wants to refuse
+ * earlier call the same rule instead of growing a second copy that drifts.
+ */
+export function assertNotFuture(label: string, value: number, now: number): void {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new InvalidInputError(`${label} must be a finite timestamp in milliseconds.`);
+  }
+  // The reference instant is checked too, and it is not paranoia: every comparison with `NaN` is
+  // false, so a caller passing `NaN` for `now` would not be told the bound was skipped — the
+  // future value would simply be accepted. A guard that can be switched off by one bad argument
+  // is not a guard.
+  if (typeof now !== "number" || !Number.isFinite(now)) {
+    throw new InvalidInputError(`now must be a finite timestamp in milliseconds.`);
+  }
+  if (value > now) {
+    throw new FutureOccurrenceError(label);
   }
 }
 

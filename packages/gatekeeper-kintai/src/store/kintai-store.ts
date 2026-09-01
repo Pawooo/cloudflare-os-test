@@ -2,8 +2,8 @@ import { DurableObject } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import { applySchema } from "./schema.js";
 import {
-  getAmendment, pendingAmendmentForPunch,
-  type AmendmentRequest,
+  fileAmendment, getAmendment, pendingAmendmentForPunch,
+  type AmendmentRequest, type NewAmendment,
 } from "./amendments.js";
 import {
   allAllocations, currentAllocations, reconcile, setAllocations,
@@ -339,6 +339,22 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
 
   async approvalEvents(submissionId: number): Promise<ApprovalEventRow[]> {
     return approvalEvents(this.sql, submissionId);
+  }
+
+  /**
+   * File a request to change one punch, and return its submission id. See `fileAmendment`.
+   *
+   * Every refusal it can raise — a missing, borrowed or superseded target, a future occurrence, a
+   * punch the day already has, a request already in flight against the same punch — is decided
+   * inside this one call, in the same turn of the input gate as the two inserts. Splitting the
+   * checks out into their own RPCs would put a window between each answer and the write that
+   * relies on it.
+   *
+   * Authority over the employee is NOT checked here; the session decides who may file for whom and
+   * passes the outcome in `createdBy`.
+   */
+  async fileAmendment(input: NewAmendment): Promise<number> {
+    return fileAmendment(this.sql, input);
   }
 
   /** What a submission asks to change, or null if it is not an amendment. See `getAmendment`. */

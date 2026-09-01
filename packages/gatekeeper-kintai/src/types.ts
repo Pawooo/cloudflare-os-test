@@ -1,7 +1,21 @@
 export const KINTAI_VENDOR_ID = "kintai";
 
 export type EmployeeId = number;
-export type PunchKind = "in" | "out" | "break_start" | "break_end";
+
+/**
+ * The four things a punch can be, written once as values.
+ *
+ * An array with the union derived from it, for the same reason as `SUBMISSION_KINDS` below: the
+ * set has to exist at runtime as well as in the type system -- `assertPunchKind` in `input.ts`
+ * checks a caller-supplied string against it -- and a hand-written second copy of the list beside
+ * that check is exactly the shape this package has twice shipped bugs from.
+ *
+ * The `CHECK (kind IN (...))` constraints on `punches` and `amendment_requests` are a third copy
+ * and cannot be derived, because SQL text is not TypeScript. They are the database's backstop, not
+ * the check a caller ever sees; adding a punch kind means editing them too.
+ */
+export const PUNCH_KINDS = ["in", "out", "break_start", "break_end"] as const;
+export type PunchKind = (typeof PUNCH_KINDS)[number];
 
 /**
  * The two columns that are growing enumerations, written ONCE, as values.
