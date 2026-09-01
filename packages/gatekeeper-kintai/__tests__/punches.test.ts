@@ -1,5 +1,6 @@
 import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
+import { LONG_SPAN_MS, MAX_SHIFT_MS } from "../src/work-date.js";
 
 const NINE_AM = Date.parse("2026-07-03T00:00:00Z"); // 09:00 JST
 const SIX_PM = Date.parse("2026-07-03T09:00:00Z");  // 18:00 JST
@@ -264,5 +265,109 @@ describe("day anomalies", () => {
     expect(await store.dayAnomalies(employeeId, DAY)).toEqual(["negative_gross"]);
     // The clamp still applies so workedMinutes never goes negative...
     expect(await store.workedMinutes(employeeId, DAY)).toBe(0);
+  });
+});
+
+/**
+ * `long_span` is the flag for a day whose punches are perfectly well-formed and whose LENGTH is
+ * the problem — normally a clock-out that arrived hours after the employee actually left.
+ *
+ * It lives here rather than in the work-date-policy suite deliberately: `dayAnomalies` never reads
+ * `work_date_policy`, and it must not start. The same punches on the same day must carry the same
+ * flags for a night worker and an office worker; only WHICH day they land on is the policy's
+ * business. The policy suite has the shift_start half.
+ */
+describe("long_span, the flag for a day that is too long to be ordinary", () => {
+  /** Clock in at 09:00 JST and out `ms` later, all on the one work date. */
+  async function span(ms: number) {
+    await store.recordPunch({
+      employeeId, workDate: DAY, kind: "in", now: NINE_AM, source: "gadget",
+    });
+    await store.recordPunch({
+      employeeId, workDate: DAY, kind: "out", now: NINE_AM + ms, source: "gadget",
+    });
+  }
+
+  it("leaves a legitimate 12-hour rotation completely clean", async () => {
+    await span(12 * 3_600_000);
+
+    expect(await store.dayAnomalies(employeeId, DAY)).toEqual([]);
+    expect(await store.workedMinutes(employeeId, DAY)).toBe(720);
+  });
+
+  it("holds the boundary at exactly the threshold", async () => {
+    await span(LONG_SPAN_MS - 1);
+    expect(await store.dayAnomalies(employeeId, DAY)).toEqual([]);
+  });
+
+  it("flags the threshold itself", async () => {
+    await span(LONG_SPAN_MS);
+    expect(await store.dayAnomalies(employeeId, DAY)).toEqual(["long_span"]);
+  });
+
+  it("flags a fifteen-hour day and still credits every minute of it", async () => {
+    await span(15 * 3_600_000);
+
+    // The flag is a signal for a human, never a deduction: the minutes are untouched.
+    expect(await store.dayAnomalies(employeeId, DAY)).toEqual(["long_span"]);
+    expect(await store.workedMinutes(employeeId, DAY)).toBe(900);
+  });
+
+  it("stays strictly reachable below the 16-hour attribution cutoff", () => {
+    // If these ever crossed, the band `shift_start` still credits silently would be unflagged
+    // again, which is the hole this constant exists to close.
+    expect(LONG_SPAN_MS).toBeGreaterThanOrEqual(12 * 3_600_000);
+    expect(LONG_SPAN_MS).toBeLessThan(MAX_SHIFT_MS);
+  });
+
+  it("measures the paired in/out time, not the time left after breaks", async () => {
+    await store.recordPunch({
+      employeeId, workDate: DAY, kind: "in", now: NINE_AM, source: "gadget",
+    });
+    // A three-hour break inside a fifteen-hour presence. Twelve hours are credited, but the
+    // employee was clocked in for fifteen and that is what needs looking at.
+    await store.recordPunch({
+      employeeId, workDate: DAY, kind: "break_start", now: NINE_AM + 3_600_000, source: "gadget",
+    });
+    await store.recordPunch({
+      employeeId, workDate: DAY, kind: "break_end", now: NINE_AM + 4 * 3_600_000, source: "gadget",
+    });
+    await store.recordPunch({
+      employeeId, workDate: DAY, kind: "out", now: NINE_AM + 15 * 3_600_000, source: "gadget",
+    });
+
+    expect(await store.workedMinutes(employeeId, DAY)).toBe(720);
+    expect(await store.dayAnomalies(employeeId, DAY)).toEqual(["long_span"]);
+  });
+
+  it("adds up two shifts on one day rather than looking at each alone", async () => {
+    // Two clean eight-hour spans filed against the same work date: sixteen hours clocked in on one
+    // day, which nothing else here flags.
+    for (const [inAt, outAt] of [[0, 8], [9, 17]]) {
+      await store.recordPunch({
+        employeeId, workDate: DAY, kind: "in", now: NINE_AM + inAt * 3_600_000, source: "gadget",
+      });
+      await store.recordPunch({
+        employeeId, workDate: DAY, kind: "out", now: NINE_AM + outAt * 3_600_000, source: "gadget",
+      });
+    }
+
+    expect(await store.dayAnomalies(employeeId, DAY)).toEqual(["long_span"]);
+  });
+
+  it("comes last, leaving the flags a caller already knows in the order they had", async () => {
+    // A fifteen-hour span with a second clock-in inside it: the pre-existing flag stays where it
+    // was and the new one is appended.
+    await store.recordPunch({
+      employeeId, workDate: DAY, kind: "in", now: NINE_AM, source: "gadget",
+    });
+    await store.recordPunch({
+      employeeId, workDate: DAY, kind: "in", now: NINE_AM + 3_600_000, source: "gadget",
+    });
+    await store.recordPunch({
+      employeeId, workDate: DAY, kind: "out", now: NINE_AM + 15 * 3_600_000, source: "gadget",
+    });
+
+    expect(await store.dayAnomalies(employeeId, DAY)).toEqual(["duplicate_in", "long_span"]);
   });
 });

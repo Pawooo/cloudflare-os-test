@@ -738,6 +738,13 @@ function ExemptionForm({
  *
  * The dropdown is filled from `WORK_DATE_POLICIES`, the same list the worker's own types are built
  * from, so the form cannot offer a value the server would refuse.
+ *
+ * The hint warns about the mid-shift case because nothing else does and nothing refuses it.
+ * Switching a night worker off `shift_start` while they are clocked in strands that one
+ * shift: the `in` is already filed against the shift's date, the `out` lands on the calendar
+ * date, and the day splits into `unpaired_in` + `orphan_out` — the very bug the setting
+ * exists to prevent. It fails safe and it is one shift, so the server allows it (see
+ * `AdminKintaiApi.setWorkDatePolicy`); HR just has to be told, and this is where they read.
  */
 function WorkDatePolicyForm({
   roster, employeeId, onEmployeeId, selectRef, busy, notice, onSubmit,
@@ -767,7 +774,7 @@ function WorkDatePolicyForm({
   return (
     <FormCard
       title="Set which day punches are filed against"
-      hint="Office staff finish before midnight, so the calendar date is right for them and it is the default. A night shift crossing midnight has to be filed against the date it started, or it splits across two days and both get flagged. This applies to punches made from now on — it does not move anything already recorded, so set it when you onboard someone who works nights."
+      hint="Office staff finish before midnight, so the calendar date is right for them and it is the default. A night shift crossing midnight has to be filed against the date it started, or it splits across two days and both get flagged. This applies to punches made from now on — it does not move anything already recorded, so set it when you onboard someone who works nights. Do not change it while the employee is clocked in: their current shift is stranded half on each day and both halves get flagged, and only an administrative correction can tidy that up. Wait until they have clocked out."
       disabled={roster.length === 0}
       disabledHint="Add an employee record first."
       busy={busy}

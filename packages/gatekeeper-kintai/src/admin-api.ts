@@ -346,6 +346,17 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
    * entry whose `before` and `after` agree. It is NOT refused the way a duplicate exemption is:
    * that refusal exists because a second open `exemption_periods` row would leave two records
    * claiming to be the determination, and there is only ever one row here.
+   *
+   * KNOWN LIMITATION, deliberately not blocked here: changing the policy while the employee has a
+   * shift open STRANDS that shift. `shift_start` → `calendar` is the visible half — the clock-in
+   * is already filed against the shift's own date, the clock-out then lands on the calendar date,
+   * and the one shift splits across two days as `unpaired_in` + `orphan_out`, which is exactly the
+   * bug `shift_start` exists to prevent, reintroduced for one shift. It fails SAFE (it
+   * under-credits, and both days carry a flag a human must resolve), so it is not refused: this
+   * call cannot tell an urgent correction from a routine one, and blocking HR from fixing a
+   * misconfigured employee until their shift ends would be worse than a flagged day. The reverse
+   * direction heals an in-flight shift rather than stranding it. The HR form says so at the point
+   * of change; see `WorkDatePolicyForm` in `app/AdminPage.tsx`.
    */
   async setWorkDatePolicy(employeeId: EmployeeId, policy: WorkDatePolicy): Promise<void> {
     const now = Date.now();

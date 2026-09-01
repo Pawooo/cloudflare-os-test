@@ -569,16 +569,16 @@ describe("recording an employee's work-date policy", () => {
       const sixAm = Date.parse("2026-07-03T21:00:00Z");
 
       await store.recordPunch({
-        employeeId: crew, workDate: await store.workDateFor(crew, tenPm), kind: "in",
+        employeeId: crew, workDate: await store.workDateFor(crew, tenPm, "in"), kind: "in",
         now: tenPm, source: "gadget",
       });
       // On `calendar`, the clock-out is dated by the clock: a different day.
-      expect(await store.workDateFor(crew, sixAm)).toBe("2026-07-04");
+      expect(await store.workDateFor(crew, sixAm, "out")).toBe("2026-07-04");
 
       await hr.setWorkDatePolicy(crew, "shift_start");
 
       // The SAME open shift now attracts the clock-out onto its own start date...
-      expect(await store.workDateFor(crew, sixAm)).toBe("2026-07-03");
+      expect(await store.workDateFor(crew, sixAm, "out")).toBe("2026-07-03");
       // ...and the punch already recorded did not move.
       expect((await store.currentPunches(crew, "2026-07-03")).map((p) => p.kind)).toEqual(["in"]);
     });

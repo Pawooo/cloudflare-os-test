@@ -15,6 +15,13 @@
 // - for an employee HR has put on shift-start dating, a punch belongs to the date of the shift
 //   that is currently open, so a 22:00 -> 06:00 shift lands entirely on the date it started.
 //
+// Shift-start dating stops after SIXTEEN HOURS. A shift that has been open that long no longer
+// attracts punches: the next punch is filed against its own calendar date and starts a fresh
+// shift, and the abandoned day keeps its `unpaired_in` forever. That is the usual explanation when
+// a night worker's `punch()` comes back with today's date instead of the shift's, and when a past
+// day shows `unpaired_in` on someone who does not normally get one — somebody forgot to clock out.
+// It cannot be repaired from here; an administrator has to correct the record.
+//
 // So never assume `punch()` returns today's date. Read `workDate` off the receipt and use THAT —
 // it is the day the punch was actually filed against, and it is the argument `getDay()` wants.
 //
@@ -39,6 +46,8 @@
 // - `KINTAI_NO_ROUTE` / `KINTAI_NO_APPROVER` — no approval route matches, or nobody can approve.
 // - `KINTAI_NOT_FOUND` — no such submission.
 // - `KINTAI_INVALID_TRANSITION` — the submission is not in a state that allows this.
+// - `KINTAI_WORK_DATE_RACED` — two punches for this employee landed at once and the day this one
+//   belongs to changed underneath it. Nothing was recorded; see `punch()`.
 
 /** A clock event. `break_start`/`break_end` bracket unpaid time inside a shift. */
 export type PunchKind = "in" | "out" | "break_start" | "break_end";
@@ -124,10 +133,18 @@ export type Reconciliation = {
  * - `orphan_out` — clocked out with no matching clock-in.
  * - `duplicate_in` — clocked in twice without clocking out.
  * - `negative_gross` — punches are out of order; the record needs an administrative correction.
+ * - `long_span` — clock-in to clock-out totals fourteen hours or more on this day. The punches are
+ *   well-formed and the minutes are credited in full; this says the DAY is unusual. Almost always
+ *   a clock-out that was hours late, occasionally a genuine long shift. Report the total AND this
+ *   flag, and say it needs checking; never present it as an ordinary day. Applies to every
+ *   employee on either work-date policy — the flag describes the punches, not the setting.
  *
  * NIGHT SHIFTS depend on the employee's work-date policy, which HR sets and this session cannot
  * see. For an employee on shift-start dating a shift crossing JST midnight is ONE work date with
- * the whole span credited and no anomaly, and `workedMinutes` can be presented as usual.
+ * the whole span credited, and normally no anomaly — but check `anomalies` rather than assuming
+ * it is empty. A forgotten clock-out lands on that one day too: `long_span` for a very long
+ * credited day, `duplicate_in` when a second clock-in arrived before the first was closed, and
+ * `unpaired_in` once the sixteen-hour cutoff has passed and the shift was abandoned.
  *
  * For an employee on the default calendar dating — which is everyone who does not work nights —
  * such a shift is still split across two work dates, producing `unpaired_in` on the first and
@@ -220,6 +237,12 @@ export interface KintaiSession {
    *
    * Throws `KINTAI_PERIOD_LOCKED` if the month the punch would land in is already closed — which,
    * for a night worker clocking out after midnight on the first, may not be this month.
+   *
+   * Throws `KINTAI_WORK_DATE_RACED` only if two punches for the same employee are recorded at the
+   * same instant and the server could not agree twice running on which day this one belongs to.
+   * It already retried once. Nothing was written, so it is safe to call again — but tell the user
+   * rather than retrying in a loop, because a second failure means something else is punching for
+   * this employee concurrently.
    */
   punch(kind: PunchKind, location?: PunchLocation): Promise<PunchReceipt>;
 

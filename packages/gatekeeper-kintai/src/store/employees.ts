@@ -339,8 +339,11 @@ export function workDatePolicyOf(sql: SqlStorage, employeeId: EmployeeId): WorkD
  * be able to disagree with them. Changing this re-files nothing; `audit_log` records who changed
  * it and from what.
  *
- * The value is not validated here. The schema's CHECK is the backstop and `assertWorkDatePolicy`
- * at the admin boundary is the message; a check in between would be a third opinion.
+ * The value is not validated here, and there is no `assertWorkDatePolicy` anywhere to do it either
+ * — the admin boundary needs no such function. `WorkDatePolicy` is a string-literal union, so
+ * `@validateRpc()` on `AdminKintaiApi.setWorkDatePolicy` refuses anything outside it before that
+ * body runs, and the schema's CHECK is the backstop behind that. A check in between would be a
+ * third opinion.
  */
 export function setWorkDatePolicy(
   sql: SqlStorage, employeeId: EmployeeId, policy: WorkDatePolicy,

@@ -31,6 +31,10 @@ import type { PunchLocation, PunchRow } from "./store/punches.js";
 import type { ActPreview, SubmissionRow } from "./store/submissions.js";
 import type { KintaiStore } from "./store/kintai-store.js";
 import { UnlinkedAccountError } from "./store/employees.js";
+// The store decides a punch's work date under its own write gate and refuses when the answer
+// moved between the facet reading it and the write landing; `punch()` reads that refusal back
+// through this predicate, because the error class itself does not survive the RPC boundary.
+import { isWorkDateRaced } from "./store/punches.js";
 // The store's schema module owns this: it is the same PRAGMA test, run for the same reason, and a
 // second copy of it is exactly the kind of duplication this package has been bitten by.
 import { hasColumn } from "./store/schema.js";
@@ -680,18 +684,63 @@ export class KintaiSession extends RpcTarget {
     return { linked: employeeId !== null, employeeId };
   }
 
+  /**
+   * Record a clock event, at one instant, on the day the server decides it belongs to.
+   *
+   * Three RPCs into the store, and each is its own turn of that Durable Object's input gate, so
+   * the gate opens twice inside this method. Deciding the date in the first turn and writing it in
+   * the third is therefore not atomic: a concurrent `punch("out")` can close the shift in between,
+   * and the `in` that read it would be filed against a shift that no longer exists. `commitPunch`
+   * closes that — it decides the date AGAIN under the write's own gate and refuses if the answer
+   * moved — and this method's job is to arrange the three calls so that refusal can only ever
+   * happen against a date whose period lock has been checked.
+   *
+   * Hence `#attemptPunch` and hence the single retry. The lock check has to stay out here rather
+   * than move into the store: the amendment path writes into closed periods and reaches the store
+   * directly, so the store's writes cannot enforce locks for everyone. If the store refuses the
+   * date, the whole sequence is redone — a fresh `workDateFor`, a fresh `assertWritable` against
+   * whatever it now says, then the write — so the second attempt is validated exactly as carefully
+   * as the first. It runs at most twice and the second attempt's refusal is surfaced, so there is
+   * no loop here: a punch cannot spin, and a store that disagreed twice is reporting a real
+   * conflict rather than a lost race.
+   *
+   * `now` is captured once and reused across both attempts, deliberately. It is when the employee
+   * actually tapped the button, it is the `occurred_at` that gets written, and it is what makes
+   * the store's recomputation a function of the punch table alone. Re-reading the clock on the
+   * retry would move the event.
+   */
   async punch(
     kind: PunchKind, location?: PunchLocation,
   ): Promise<{ punchId: number; employeeId: EmployeeId; workDate: string }> {
     const now = Date.now();
     const employeeId = await this.#requireEmployee(now);
+    try {
+      return await this.#attemptPunch(employeeId, kind, now, location);
+    } catch (caught) {
+      if (!isWorkDateRaced(caught)) throw caught;
+      // Exactly one retry, and it is not a loop: this is the only call site of `#attemptPunch`
+      // that retries, and nothing `#attemptPunch` calls can reach `punch` again.
+      return await this.#attemptPunch(employeeId, kind, now, location);
+    }
+  }
+
+  /**
+   * One attempt at the punch: attribute, check the lock against what came back, write.
+   *
+   * Throws `WorkDateRacedError` — recognised by its message across the RPC boundary, see
+   * `isWorkDateRaced` — if the store's own recomputation disagrees with the date checked here.
+   */
+  async #attemptPunch(
+    employeeId: EmployeeId, kind: PunchKind, now: number, location?: PunchLocation,
+  ): Promise<{ punchId: number; employeeId: EmployeeId; workDate: string }> {
     // Which day this punch belongs to is the employee's own `work_date_policy`, read from the
     // record their capability resolved to and never from anything the caller said. For everyone on
     // `calendar` — the default, and everyone who existed before the policy did — this is
     // `jstWorkDate(now)` and nothing more. For `shift_start` it is the date of the shift that is
     // open right now, so an overnight shift stays on one day. The rule itself lives in
-    // `store/punches.ts`, where the punches it reads are; this asks for the answer.
-    const workDate = await this.#store.workDateFor(employeeId, now);
+    // `store/punches.ts`, where the punches it reads are; this asks for the answer. `kind` goes
+    // with it because the duplicate-window exception inside that rule is keyed on it.
+    const workDate = await this.#store.workDateFor(employeeId, now, kind);
     // Period locks are enforced here, not inside the store's write functions: the amendment path
     // has to be able to write into a closed period, and it reaches the store directly.
     //
@@ -700,7 +749,9 @@ export class KintaiSession extends RpcTarget {
     // refused the same as any other write into a locked period.
     await this.#store.assertWritable(workDate);
 
-    const punchId = await this.#store.recordPunch({
+    // `commitPunch`, not `recordPunch`: the date above was decided in a turn that has since
+    // ended, and this one refuses the write outright if it no longer holds.
+    const punchId = await this.#store.commitPunch({
       employeeId, workDate, kind, now, source: "gadget", location,
     });
     return { punchId, employeeId, workDate };

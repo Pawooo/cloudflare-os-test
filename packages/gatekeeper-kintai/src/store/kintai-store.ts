@@ -18,7 +18,8 @@ import {
   type ReportingLineRow,
 } from "./org.js";
 import {
-  allPunches, correctPunch, currentPunches, dayAnomalies, recordPunch, workDateFor, workedMinutes,
+  allPunches, commitPunch, correctPunch, currentPunches, dayAnomalies, recordPunch, workDateFor,
+  workedMinutes,
   type NewPunch, type PunchRow,
 } from "./punches.js";
 import { createSite, matchSite, type NewSite } from "./sites.js";
@@ -34,7 +35,9 @@ import {
 } from "../routes.js";
 import { assertWritable, isLocked, lockPeriod, periodLock, type PeriodLock } from "./periods.js";
 import { appendAudit, auditEntries, type AuditEntry, type AuditRow } from "./audit.js";
-import type { EmployeeId, RosterEntry, SubmissionState, WorkDatePolicy } from "../types.js";
+import type {
+  EmployeeId, PunchKind, RosterEntry, SubmissionState, WorkDatePolicy,
+} from "../types.js";
 
 @validateRpc()
 export class KintaiStore extends DurableObject<Cloudflare.Env> {
@@ -176,19 +179,41 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * The work date a punch made at `now` belongs to, for this employee. See `workDateFor`.
+   * The work date a punch of `kind` made at `now` belongs to, for this employee. See `workDateFor`.
    *
-   * Asked BEFORE `recordPunch` rather than folded into it, because the caller needs the answer for
+   * Asked BEFORE the write rather than only inside it, because the caller needs the answer for
    * itself: `KintaiSession.punch` checks the period lock against the date the punch will land on,
-   * and for a `shift_start` employee that is not today's. Folding it into `recordPunch` would
+   * and for a `shift_start` employee that is not today's. Answering it only inside the write would
    * leave the lock checked against the wrong month for exactly the employees this feature is for.
+   *
+   * This call and the write are two separate turns of this object's input gate, so the answer can
+   * be stale by the time it is used. That is what `commitPunch` exists to catch — it is the write,
+   * and it decides the date again for itself.
    */
-  async workDateFor(employeeId: EmployeeId, now: number): Promise<string> {
-    return workDateFor(this.sql, employeeId, now);
+  async workDateFor(employeeId: EmployeeId, now: number, kind: PunchKind): Promise<string> {
+    return workDateFor(this.sql, employeeId, now, kind);
   }
 
+  /**
+   * Append a punch, taking `input.workDate` on trust. The unguarded write.
+   *
+   * Correct for a caller that already knows the date for a reason of its own — the tests that seed
+   * a specific day, and the amendment path, which is writing history rather than punching a clock.
+   * Anything filing a punch AT THE CURRENT INSTANT must use `commitPunch` instead, which decides
+   * the date under this same gate rather than trusting one read a turn earlier.
+   */
   async recordPunch(input: NewPunch): Promise<number> {
     return recordPunch(this.sql, input);
+  }
+
+  /**
+   * Append a punch, recomputing its work date here and refusing if it has moved. See `commitPunch`.
+   *
+   * The atomic half of `KintaiSession.punch`: one turn of the input gate covers both deciding
+   * which day the punch belongs to and writing it there, which two separate RPCs could not.
+   */
+  async commitPunch(input: NewPunch): Promise<number> {
+    return commitPunch(this.sql, input);
   }
 
   async correctPunch(

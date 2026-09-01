@@ -346,6 +346,17 @@ describe("AdminPage", () => {
       expect(api.listEmployees).toHaveBeenCalledTimes(2);
     });
 
+    // Nothing refuses a mid-shift switch and nothing can: the server cannot tell an urgent
+    // correction from a routine one, and the shift it strands fails safe. So the warning is the
+    // whole mitigation, and it has to be in front of HR at the moment they press the button.
+    it("warns that switching mid-shift strands the shift that is open", async () => {
+      const api = adminApi({}, [TANAKA]);
+      await render(<AdminPage api={api} />);
+
+      expect(text('[data-form="set-work-date-policy"] p'))
+        .toContain("Do not change it while the employee is clocked in");
+    });
+
     it("opens a reporting line from the chosen employee to the chosen manager", async () => {
       const api = adminApi({}, [TANAKA, STRANDED]);
       await render(<AdminPage api={api} />);

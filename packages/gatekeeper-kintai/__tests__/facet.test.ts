@@ -266,6 +266,85 @@ describe("which day the facet files a punch against", () => {
   });
 });
 
+/**
+ * Finding 4: `punch()` makes three RPCs into the store, so the store's input gate opens twice
+ * between reading "is a shift open?" and writing the punch that answer decided.
+ *
+ * Concurrency here is real, not simulated. The two calls go through the same facet host the
+ * Overseer uses, each `await` inside `punch()` ends a turn of the store's gate, and the second
+ * call runs in the window that opens. There is no way to force a particular interleaving, so the
+ * assertions are written as an INVARIANT every legal ordering satisfies and the defect does not:
+ * a clock-in may be filed against a shift's date only if it was recorded while that shift was
+ * still open, i.e. before the clock-out that closed it. `punches.id` is monotonic, so "before" is
+ * a comparison and not a guess.
+ */
+describe("two punches at the same instant", () => {
+  const THREE_HOURS = 3 * 60 * 60_000;
+
+  /** A `shift_start` employee with a shift opened three hours ago on a date that is never today. */
+  async function withOpenShift(tag: string) {
+    const { employeeId, accountId } = await linkedEmployee(tag);
+    await store.setWorkDatePolicy(employeeId, "shift_start");
+    const now = Date.now();
+    const shiftDate = jstWorkDate(now - 26 * 60 * 60_000);
+    await store.recordPunch({
+      employeeId, workDate: shiftDate, kind: "in", now: now - THREE_HOURS, source: "gadget",
+    });
+    return { employeeId, accountId, shiftDate };
+  }
+
+  it("never files a clock-in against a shift a concurrent clock-out had already closed",
+    async () => {
+      const { employeeId, accountId, shiftDate } = await withOpenShift("race-in-out");
+      const facet = facetFor(accountId);
+
+      const [out, going] = await Promise.all([facet.punch("out"), facet.punch("in")]);
+
+      // The clock-out belongs to the shift it closed, whichever order they landed in.
+      expect(out.workDate).toBe(shiftDate);
+
+      const onShift = await store.currentPunches(employeeId, shiftDate);
+      const closing = onShift.find((punch) => punch.id === out.punchId)!;
+      const opening = onShift.find((punch) => punch.id === going.punchId);
+
+      if (going.workDate === shiftDate) {
+        // Legal only as "the clock-in went first": it inherited a shift that was still open. This
+        // is the ordering the defect made indistinguishable from the illegal one — an `in` decided
+        // from a shift the concurrent `out` was about to close, filed onto it afterwards and
+        // leaving `unpaired_in` and a fresh open shift on yesterday.
+        expect(opening!.id).toBeLessThan(closing.id);
+      } else {
+        // Otherwise the store refused the stale date, the facet retried against the recomputed
+        // one, and the new shift opened on the day it actually started.
+        expect(going.workDate).toBe(jstWorkDate(Date.now()));
+        expect(opening).toBeUndefined();
+        expect(await store.dayAnomalies(employeeId, shiftDate)).toEqual([]);
+        expect(await store.dayAnomalies(employeeId, going.workDate)).toEqual(["unpaired_in"]);
+      }
+
+      // Either way exactly one new punch exists per call and neither was lost or duplicated.
+      expect(out.punchId).not.toBe(going.punchId);
+    });
+
+  it("absorbs three simultaneous clock-outs into one punch", async () => {
+    const { employeeId, accountId, shiftDate } = await withOpenShift("race-triple-out");
+    const facet = facetFor(accountId);
+
+    const results = await Promise.all([
+      facet.punch("out"), facet.punch("out"), facet.punch("out"),
+    ]);
+
+    // `recordPunch`'s duplicate suppression is what makes this safe, and the compare-and-set must
+    // not have turned a benign double-tap into a refusal: all three agree, and only one row exists.
+    expect(new Set(results.map((r: { workDate: string }) => r.workDate))).toEqual(
+      new Set([shiftDate]),
+    );
+    expect(new Set(results.map((r: { punchId: number }) => r.punchId)).size).toBe(1);
+    expect(await store.currentPunches(employeeId, shiftDate)).toHaveLength(2);
+    expect(await store.dayAnomalies(employeeId, shiftDate)).toEqual([]);
+  });
+});
+
 describe("the day view", () => {
   it("surfaces punches, allocations, reconciliation, anomalies and the lock state", async () => {
     const { employeeId, accountId } = await linkedEmployee("day");
