@@ -69,6 +69,28 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
       .map((row) => row.name);
   }
 
+  /**
+   * Every submission kind the database will accept, sorted. See `SUBMISSION_KINDS`.
+   *
+   * A read of the lookup table itself rather than of the TypeScript list, so a test can see what
+   * the seed actually put there -- which is the only half of the pair a test can otherwise not
+   * observe, `@validateRpc()` having already refused anything outside the union at the boundary.
+   */
+  async submissionKinds(): Promise<string[]> {
+    return this.sql
+      .exec<{ kind: string }>(`SELECT kind FROM submission_kinds ORDER BY kind`)
+      .toArray()
+      .map((row) => row.kind);
+  }
+
+  /** Every punch source the database will accept, sorted. See `submissionKinds`. */
+  async punchSources(): Promise<string[]> {
+    return this.sql
+      .exec<{ source: string }>(`SELECT source FROM punch_sources ORDER BY source`)
+      .toArray()
+      .map((row) => row.source);
+  }
+
   async createEmployee(input: NewEmployee): Promise<EmployeeId> {
     return createEmployee(this.sql, input);
   }

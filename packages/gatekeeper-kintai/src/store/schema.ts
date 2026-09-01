@@ -1,9 +1,13 @@
 // The full kintai schema. Applied on every DO activation; every statement is IF NOT EXISTS so
-// this is idempotent. All tables are STRICT, and enum columns carry CHECK constraints, matching
-// packages/mcp-shared/src/action-store.ts.
+// this is idempotent. All tables are STRICT. An enum column whose set is FIXED carries a CHECK
+// constraint, matching packages/mcp-shared/src/action-store.ts; one that will keep GROWING is a
+// foreign key onto a seeded lookup table instead, because SQLite cannot alter a CHECK. See the
+// block at the top of applySchema.
 //
 // punches, approval_events and audit_log are append-only: corrections insert a new row rather
 // than updating an existing one. See the design doc's data model section.
+
+import { PUNCH_SOURCES, SUBMISSION_KINDS } from "../types.js";
 
 /** Whether `table` already has `column`. The test every ADD COLUMN below is guarded by. */
 export function hasColumn(sql: SqlStorage, table: string, column: string): boolean {
@@ -13,7 +17,70 @@ export function hasColumn(sql: SqlStorage, table: string, column: string): boole
     .some((row) => row.name === column);
 }
 
+/**
+ * Refuse to run against a store predating the lookup tables.
+ *
+ * Such a store still has `CHECK (kind IN ('overtime'))` and will refuse every amendment with a
+ * bare constraint failure at the first write, hours after the deploy that caused it. There is no
+ * migration: converting the column is itself a table rebuild, which is what the lookup tables
+ * exist to avoid, and there is no deployed store whose data needs preserving. So this is a dev
+ * affordance -- it turns a confusing write failure into an instruction.
+ *
+ * `submissions` alone is probed because both columns moved in one change: a store whose
+ * `submissions.kind` is a foreign key has a `punches.source` that is one too, and a store whose
+ * `kind` is still a CHECK has neither. One question answers for both.
+ *
+ * If a store with data ever needs this conversion, it is a real migration and belongs somewhere
+ * that can fail without resetting the object. `applySchema` runs in the constructor, so a throw
+ * here bricks the store on every activation rather than degrading -- acceptable for a dev store
+ * that must be reset anyway, and NOT acceptable as a general migration strategy.
+ */
+function assertSchemaCurrent(sql: SqlStorage): void {
+  const row = sql
+    .exec<{ sql: string | null }>(
+      `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'submissions'`,
+    )
+    .toArray()[0];
+  if (row?.sql && !row.sql.includes("submission_kinds")) {
+    throw new Error(
+      `KINTAI_STALE_SCHEMA: this store predates the submission_kinds lookup table and cannot ` +
+      `accept amendments. There is no migration -- delete the local Durable Object state ` +
+      `(.wrangler/state) and re-seed. See docs/resetting-the-dev-store.md.`,
+    );
+  }
+}
+
 export function applySchema(sql: SqlStorage): void {
+  // Growing enumerations live in lookup tables, not in CHECK constraints.
+  //
+  // SQLite cannot alter a CHECK, and DO SQLite enforces foreign keys immediately with an
+  // end-of-turn integrity check on top -- so widening a CHECK means rebuilding the table, which
+  // means rebuilding everything that references it. `submissions` drags `approval_events`;
+  // `punches` drags `punch_locations`, `amendment_requests` and its own `supersedes_id`. These two
+  // columns will keep growing (expenses, travel claims, imports), so they are foreign keys and
+  // adding a value is an INSERT.
+  //
+  // CHECK stays where the set is genuinely fixed: `minutes >= 0`, `json_valid(...)`, the state
+  // machine. Those are invariants, not enumerations.
+  //
+  // Created before anything that references them, because the constraint is checked at once. Get
+  // this order wrong and store creation itself fails, not some later write.
+  //
+  // The values come from `src/types.ts`, which is also where their TypeScript unions are derived
+  // from, so the seed and the type are one list and cannot disagree. `INSERT OR IGNORE` with a
+  // bound parameter per value is what makes re-running this on every activation safe.
+  sql.exec(`CREATE TABLE IF NOT EXISTS submission_kinds (kind TEXT PRIMARY KEY) STRICT`);
+  for (const kind of SUBMISSION_KINDS) {
+    sql.exec(`INSERT OR IGNORE INTO submission_kinds (kind) VALUES (?)`, kind);
+  }
+
+  sql.exec(`CREATE TABLE IF NOT EXISTS punch_sources (source TEXT PRIMARY KEY) STRICT`);
+  for (const source of PUNCH_SOURCES) {
+    sql.exec(`INSERT OR IGNORE INTO punch_sources (source) VALUES (?)`, source);
+  }
+
+  assertSchemaCurrent(sql);
+
   sql.exec(`CREATE TABLE IF NOT EXISTS employees (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     employee_number TEXT NOT NULL UNIQUE,
@@ -89,7 +156,7 @@ export function applySchema(sql: SqlStorage): void {
     kind TEXT NOT NULL CHECK (kind IN ('in', 'out', 'break_start', 'break_end')),
     occurred_at INTEGER NOT NULL,
     recorded_at INTEGER NOT NULL,
-    source TEXT NOT NULL CHECK (source IN ('gadget', 'admin', 'import')),
+    source TEXT NOT NULL REFERENCES punch_sources(source),
     supersedes_id INTEGER REFERENCES punches(id),
     amended_by INTEGER REFERENCES employees(id),
     amend_reason TEXT
@@ -167,7 +234,7 @@ export function applySchema(sql: SqlStorage): void {
   sql.exec(`CREATE TABLE IF NOT EXISTS submissions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     employee_id INTEGER NOT NULL REFERENCES employees(id),
-    kind TEXT NOT NULL CHECK (kind IN ('overtime')),
+    kind TEXT NOT NULL REFERENCES submission_kinds(kind),
     requested_for TEXT NOT NULL,
     state TEXT NOT NULL CHECK (
       state IN ('draft', 'pending', 'approved', 'rejected', 'withdrawn')),

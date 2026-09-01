@@ -20,8 +20,12 @@ describe("kintai schema", () => {
       // Location is its own table so a coordinate purge never has to touch the append-only
       // punches row. `punch_locations` sorts before `punches` ('_' < 'e').
       "punch_locations",
+      // The two growing enumerations. Lookup tables rather than CHECK constraints, so adding a
+      // value is an INSERT and never a table rebuild. See `applySchema`.
+      "punch_sources",
       "punches",
       "sites",
+      "submission_kinds",
       "submissions",
     ]);
   });
@@ -80,5 +84,90 @@ describe("kintai schema", () => {
     const before = await first.tableNames();
     const second = env.KINTAI_STORE.getByName("test-idempotent");
     expect(await second.tableNames()).toEqual(before);
+  });
+});
+
+describe("growing enumerations live in lookup tables", () => {
+  it("seeds every submission kind and punch source", async () => {
+    const store = env.KINTAI_STORE.getByName("lookup-seed");
+    await store.createEmployee({
+      employeeNumber: "E1", displayName: "Tanaka", joinedOn: "2026-04-01",
+    });
+
+    expect(await store.submissionKinds()).toEqual(["amendment", "overtime"]);
+    expect(await store.punchSources()).toEqual(["admin", "amendment", "gadget", "import"]);
+  });
+
+  // Two layers, asserted separately, because they fail differently and a reader needs to know
+  // which one caught what.
+  it("refuses an unknown punch source at the RPC boundary, before any SQL runs", async () => {
+    const store = env.KINTAI_STORE.getByName("lookup-reject");
+    const employeeId = await store.createEmployee({
+      employeeNumber: "E1", displayName: "Tanaka", joinedOn: "2026-04-01",
+    });
+
+    // `@validateRpc()` generates this from `NewPunch`, so a bad `source` never reaches the store
+    // body. This is the check that matters in production -- the lookup table is the backstop
+    // under it, not the front line.
+    // Settled by hand rather than with `.rejects`, which leaves this particular rejection
+    // duplicated as an unhandled one and makes vitest warn about false positives.
+    const refusal = await store.recordPunch({
+      employeeId, workDate: "2026-07-03", kind: "in",
+      now: Date.parse("2026-07-03T00:00:00Z"),
+      // @ts-expect-error -- the point is what happens when TypeScript is bypassed
+      source: "nonsense",
+    }).then(() => null, (error: unknown) => String(error));
+    expect(refusal).toMatch(/expected union/);
+
+    // And nothing was written on the way to being refused.
+    expect(await store.allPunches(employeeId, "2026-07-03")).toEqual([]);
+  });
+
+  it("refuses an unknown punch source in the database, with TypeScript and RPC both bypassed", async () => {
+    // The whole point of a foreign key over a CHECK is that adding a value is an INSERT. The
+    // whole point of keeping a database-level constraint at all is that it still refuses a value
+    // nobody seeded. That second claim is unreachable through `KintaiStore` -- validation refuses
+    // first, as the test above pins -- so it is probed with raw SQL. See `rejectsUnknownEnum`.
+    const host = env.KINTAI_FACET_HOST.getByName("lookup-fk-punches");
+
+    expect(await host.rejectsUnknownEnum("punches", "nonsense")).toMatch(/FOREIGN KEY/);
+  });
+
+  it("refuses an unknown submission kind in the database", async () => {
+    const host = env.KINTAI_FACET_HOST.getByName("lookup-fk-submissions");
+
+    expect(await host.rejectsUnknownEnum("submissions", "expenses")).toMatch(/FOREIGN KEY/);
+  });
+
+  it("accepts a seeded value through the same raw path", async () => {
+    // Without this the two tests above would also pass against a punches table that refused
+    // every source, which is not the property being claimed.
+    const host = env.KINTAI_FACET_HOST.getByName("lookup-fk-accepts");
+
+    expect(await host.rejectsUnknownEnum("punches", "amendment")).toBeNull();
+    expect(await host.rejectsUnknownEnum("submissions", "amendment")).toBeNull();
+  });
+
+  // A dev store created before this change keeps its old `CHECK (kind IN ('overtime'))`, because
+  // `CREATE TABLE IF NOT EXISTS` is a no-op on it, and would refuse every amendment with a bare
+  // constraint error at the first write. There is no migration; there is an instruction.
+  it("tells a developer with a pre-lookup store to reset it", async () => {
+    const host = env.KINTAI_FACET_HOST.getByName("lookup-stale");
+
+    const message = await host.detectsStaleSchema();
+
+    expect(message).toMatch(/KINTAI_STALE_SCHEMA/);
+    expect(message).toMatch(/\.wrangler\/state/);
+    expect(message).toMatch(/resetting-the-dev-store\.md/);
+  });
+
+  it("is idempotent across repeated activations", async () => {
+    const first = env.KINTAI_STORE.getByName("lookup-idempotent");
+    expect(await first.submissionKinds()).toEqual(["amendment", "overtime"]);
+    expect(await first.punchSources()).toEqual(["admin", "amendment", "gadget", "import"]);
+
+    const second = env.KINTAI_STORE.getByName("lookup-idempotent");
+    expect(await second.submissionKinds()).toEqual(["amendment", "overtime"]);
+    expect(await second.punchSources()).toEqual(["admin", "amendment", "gadget", "import"]);
   });
 });

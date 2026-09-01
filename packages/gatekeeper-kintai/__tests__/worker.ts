@@ -313,6 +313,91 @@ export class KintaiFacetHost extends DurableObject<Cloudflare.Env> {
   }
 
   /**
+   * Run the real schema over this host's own storage, then attempt a raw `INSERT` into `table`
+   * with an enum value the lookup table does not hold, and report what the database said.
+   *
+   * `KintaiStore.recordPunch` cannot express this. `@validateRpc()` generates its argument
+   * validators from `NewPunch`, so a `source` outside `PunchSource` is refused with
+   * `expected union, got string` before the method body runs -- correct layering, and pinned by
+   * its own assertion in the suite, but it means the foreign key underneath is never reached
+   * through that surface. The whole claim of the lookup tables is that the DATABASE refuses too,
+   * independently of TypeScript and of RPC validation, so the probe has to be raw SQL. Same
+   * approach, and same reason, as `migrateLegacyEmployees` below: the shape under test is
+   * unreachable through every public surface.
+   *
+   * Returns the error message, or null if the row was accepted -- a null is a failing test, not
+   * an absent one.
+   */
+  rejectsUnknownEnum(table: "punches" | "submissions", value: string): string | null {
+    const sql = this.ctx.storage.sql;
+    applySchema(sql);
+    sql.exec(
+      `INSERT OR IGNORE INTO employees (id, employee_number, display_name, status, joined_on)
+       VALUES (1, 'probe', 'Probe', 'active', '2026-04-01')`,
+    );
+
+    try {
+      if (table === "punches") {
+        sql.exec(
+          `INSERT INTO punches
+             (employee_id, work_date, kind, occurred_at, recorded_at, source)
+           VALUES (1, '2026-07-03', 'in', 0, 0, ?)`,
+          value,
+        );
+      } else {
+        sql.exec(
+          `INSERT INTO submissions
+             (employee_id, kind, requested_for, state, current_step, minutes, reason,
+              route_snapshot)
+           VALUES (1, ?, '2026-07-03', 'pending', 0, 0, 'probe', '{}')`,
+          value,
+        );
+      }
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+    return null;
+  }
+
+  /**
+   * Build a PRE-lookup-table `submissions` table, run the real schema over it, and report what
+   * `assertSchemaCurrent` said.
+   *
+   * A live store runs `applySchema` in its constructor, so by the time a test can hold a
+   * `KintaiStore` the lookup tables are already there and the stale shape is unreachable. Built
+   * here for the same reason `migrateLegacyEmployees` is.
+   *
+   * Returns the error message, or null if the schema was accepted.
+   */
+  detectsStaleSchema(): string | null {
+    const sql = this.ctx.storage.sql;
+    sql.exec(`DROP TABLE IF EXISTS submissions`);
+    // Verbatim the table as it stood before the lookup tables, minus the foreign keys onto tables
+    // this scratch storage does not have -- the CHECK on `kind` is the part under test.
+    sql.exec(`CREATE TABLE submissions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      employee_id INTEGER NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('overtime')),
+      requested_for TEXT NOT NULL,
+      state TEXT NOT NULL,
+      submitted_at INTEGER,
+      current_step INTEGER NOT NULL DEFAULT 0,
+      minutes INTEGER NOT NULL CHECK (minutes >= 0),
+      reason TEXT NOT NULL,
+      calculation_inputs TEXT,
+      route_snapshot TEXT NOT NULL,
+      created_by INTEGER
+    ) STRICT`);
+
+    try {
+      applySchema(sql);
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+    return null;
+  }
+
+  /**
    * Build a PRE-`work_date_policy` `employees` table with rows in it, run the real schema over it,
    * and report what each row's policy became.
    *

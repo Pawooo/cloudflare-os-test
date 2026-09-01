@@ -2,7 +2,30 @@ export const KINTAI_VENDOR_ID = "kintai";
 
 export type EmployeeId = number;
 export type PunchKind = "in" | "out" | "break_start" | "break_end";
-export type PunchSource = "gadget" | "admin" | "import";
+
+/**
+ * The two columns that are growing enumerations, written ONCE, as values.
+ *
+ * `submissions.kind` and `punches.source` are foreign keys onto seeded lookup tables rather than
+ * CHECK constraints (see `applySchema`), so the database needs these same strings as rows. Written
+ * as `as const` arrays with the union derived from them, so `schema.ts` seeds from the array and
+ * the type cannot drift from what the database will accept -- this package has twice shipped bugs
+ * from two copies of one rule disagreeing, and a seed list that has fallen behind its union is
+ * exactly that shape: TypeScript permits the write and the foreign key refuses it.
+ *
+ * They live in this leaf module, not beside the schema, for the reason every other type here does:
+ * `app/` is compiled by `tsconfig.app.json`, which has no worker types, and `schema.ts` takes
+ * `SqlStorage`. The dependency runs schema -> types, never the other way.
+ *
+ * Adding a value is one edit here plus an activation: the seed is `INSERT OR IGNORE`, so the new
+ * row appears on the next `applySchema` and no table is ever rebuilt.
+ */
+export const SUBMISSION_KINDS = ["overtime", "amendment"] as const;
+export type SubmissionKind = (typeof SUBMISSION_KINDS)[number];
+
+/** How a punch entered the record. See `SUBMISSION_KINDS` for why this is an array. */
+export const PUNCH_SOURCES = ["gadget", "admin", "import", "amendment"] as const;
+export type PunchSource = (typeof PUNCH_SOURCES)[number];
 export type LocationSource = "gps" | "denied" | "unavailable" | "manual";
 export type SubmissionState = "draft" | "pending" | "approved" | "rejected" | "withdrawn";
 export type ApprovalAction = "approve" | "reject" | "return";
