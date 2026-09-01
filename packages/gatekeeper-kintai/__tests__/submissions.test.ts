@@ -805,13 +805,34 @@ describe("return invalidates prior approvals", () => {
 });
 
 describe("unusable routes", () => {
-  it("reports an unmatched route by its code", async () => {
+  it("routes a department nobody configured to the seeded default", async () => {
+    // Was: `KINTAI_NO_ROUTE`. `applySchema` seeds a catch-all so a fresh store can approve
+    // anything at all; a configured route still outranks it by specificity, which
+    // `selectRoute`'s own tests pin.
     await singleStepRoute();
-    await expect(() => store.submitOvertime({
+    const id = await store.submitOvertime({
       employeeId: worker, requestedFor: "2026-07-03", minutes: 120,
-      reason: "wrong department", now: JUL,
+      reason: "no SALES route configured", now: JUL,
       department: "SALES", employmentType: null,
-    })).rejects.toThrow(/KINTAI_NO_ROUTE/);
+    });
+
+    expect((await store.getSubmission(id)).state).toBe("pending");
+    // Still a human other than the employee: the default is any_of manager, and boss is one.
+    expect(await store.actOnSubmission({
+      submissionId: id, actorId: boss, action: "approve", now: JUL + 1000,
+    })).toBe("approved");
+  });
+
+  it("still refuses an employee the default route cannot reach an approver for", async () => {
+    // The signal the old KINTAI_NO_ROUTE carried has not been lost, it moved. An orphan with no
+    // manager matches the catch-all but has nobody to satisfy it, and is refused before a
+    // submission exists rather than stranding one nobody can decide.
+    const orphan = await employee("O1");
+    await expect(() => store.submitOvertime({
+      employeeId: orphan, requestedFor: "2026-07-03", minutes: 120,
+      reason: "nobody above me", now: JUL,
+      department: null, employmentType: null,
+    })).rejects.toThrow(/KINTAI_NO_APPROVER|KINTAI_NO_ROUTE/);
   });
 
   it("refuses to create a submission against a route with no steps", async () => {

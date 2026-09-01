@@ -116,14 +116,25 @@ describe("resolveRoute", () => {
     expect(snapshot.steps[1].approverEmployeeId).toBe(director);
   });
 
-  it("throws when no route matches", async () => {
-    // Wrapped in a thunk rather than passed as an already-created promise: `.rejects` on an
-    // already-created RPC promise leaves it unhandled for a turn, which Vitest reports as an
-    // `Unhandled Rejection` block. (It does not silence workerd's `uncaught exception; source =
-    // Uncaught (in promise)` log lines — those accompany every exception crossing an RPC boundary,
-    // whichever form the assertion takes.)
-    await expect(() => store.resolveRoute({
+  it("selects nothing when there are no candidates at all", () => {
+    // The pure half of "no route". A store can no longer reach it -- `applySchema` seeds a
+    // catch-all -- but the selection rule still has to say null rather than pick arbitrarily,
+    // and `resolveRoute` still turns that into `KINTAI_NO_ROUTE`.
+    expect(selectRoute([], { department: "SALES", employmentType: null, minutes: 60 }))
+      .toBeNull();
+  });
+
+  it("falls back to the seeded default for a department nobody configured", async () => {
+    // Was: this threw `KINTAI_NO_ROUTE`. `applySchema` now seeds a catch-all, so an unconfigured
+    // department routes to the employee's manager instead of being unable to submit at all. The
+    // signal is not lost, it moved: an employee with NO manager is still refused, by
+    // `assertApproverReachable` rather than by route resolution.
+    const snapshot = await store.resolveRoute({
       department: "SALES", employmentType: null, minutes: 60,
-    })).rejects.toThrow(/KINTAI_NO_ROUTE/);
+    });
+
+    expect(snapshot.steps).toEqual([
+      { stepIndex: 0, rule: "any_of", approverKind: "manager", approverEmployeeId: null },
+    ]);
   });
 });

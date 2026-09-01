@@ -44,8 +44,10 @@ function assertSchemaCurrent(sql: SqlStorage): void {
   if (row?.sql && !row.sql.includes("submission_kinds")) {
     throw new Error(
       `KINTAI_STALE_SCHEMA: this store predates the submission_kinds lookup table and cannot ` +
-      `accept amendments. There is no migration -- delete the local Durable Object state ` +
-      `(.wrangler/state) and re-seed. See docs/resetting-the-dev-store.md.`,
+      `accept amendments. There is no migration -- delete this store's own Durable Object ` +
+      `storage (.wrangler/state/v3/do/gatekeeper-kintai-KintaiStore) and re-seed. Deleting all ` +
+      `of .wrangler/state is NOT required and costs every other gatekeeper's data. See ` +
+      `docs/resetting-the-dev-store.md.`,
     );
   }
 }
@@ -230,6 +232,41 @@ export function applySchema(sql: SqlStorage): void {
     approver_kind TEXT NOT NULL CHECK (approver_kind IN ('manager', 'employee')),
     approver_employee_id INTEGER REFERENCES employees(id)
   ) STRICT`);
+
+  // A fallback route, so a store that nobody has configured can still route an approval.
+  //
+  // Without one, `resolveRoute` finds no candidate and throws `KINTAI_NO_ROUTE`: overtime and
+  // every amendment are unreachable on a fresh store, and nothing in the admin API can create a
+  // route to fix it (`createRoute` exists on the store and has no caller outside the worker). So
+  // the choice was a store that cannot approve anything, or a default -- and a system whose first
+  // approval silently fails is worse than one whose default is written down here.
+  //
+  // Deliberately the LEAST specific route possible: no department, no employment type, no minute
+  // floor. `selectRoute` scores specificity, so ANY route an administrator configures outranks
+  // this one for the submissions it matches; this only ever decides a case nothing else claims.
+  // One step, any manager, which is the weakest rule that still requires a human other than the
+  // employee -- `checkMayAct` refuses the employee and the filer regardless of route.
+  //
+  // Seeded only when there are no routes at all, not `INSERT OR IGNORE` on a fixed id: an
+  // administrator who has configured their own routes must not have this reappear underneath them
+  // on the next activation. Once any route exists this never runs again.
+  const routeCount = sql
+    .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM approval_routes`)
+    .one().n;
+  if (routeCount === 0) {
+    const route = sql
+      .exec<{ id: number }>(
+        `INSERT INTO approval_routes (name, department, employment_type, min_minutes)
+         VALUES ('Default -- any manager', NULL, NULL, 0) RETURNING id`,
+      )
+      .one();
+    sql.exec(
+      `INSERT INTO approval_route_steps
+         (route_id, step_index, rule, approver_kind, approver_employee_id)
+       VALUES (?, 0, 'any_of', 'manager', NULL)`,
+      route.id,
+    );
+  }
 
   sql.exec(`CREATE TABLE IF NOT EXISTS submissions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

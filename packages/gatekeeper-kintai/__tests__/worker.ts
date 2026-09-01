@@ -313,6 +313,27 @@ export class KintaiFacetHost extends DurableObject<Cloudflare.Env> {
   }
 
   /**
+   * Delete a seed row, re-run `applySchema`, and report what the lookup table holds afterwards.
+   *
+   * This is the forward path the lookup tables exist for: a later version adding an enum value is
+   * an INSERT that an existing store picks up on its next activation, with no migration and no
+   * table rebuild. Reachable only from here because `applySchema` runs in the store's constructor,
+   * so a `KintaiStore` can never be observed part-way through one.
+   */
+  reseedsMissingLookupRow(): string[] {
+    const sql = this.ctx.storage.sql;
+    applySchema(sql);
+    sql.exec(`DELETE FROM punch_sources WHERE source = 'amendment'`);
+
+    applySchema(sql);
+
+    return sql
+      .exec<{ source: string }>(`SELECT source FROM punch_sources ORDER BY source`)
+      .toArray()
+      .map((row) => row.source);
+  }
+
+  /**
    * Run the real schema over this host's own storage, then attempt a raw `INSERT` into `table`
    * with an enum value the lookup table does not hold, and report what the database said.
    *

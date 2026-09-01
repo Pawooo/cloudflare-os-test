@@ -4,8 +4,9 @@ You are here because a store threw:
 
 ```
 KINTAI_STALE_SCHEMA: this store predates the submission_kinds lookup table and cannot accept
-amendments. There is no migration -- delete the local Durable Object state (.wrangler/state) and
-re-seed. See docs/resetting-the-dev-store.md.
+amendments. There is no migration -- delete this store's own Durable Object storage
+(.wrangler/state/v3/do/gatekeeper-kintai-KintaiStore) and re-seed. See
+docs/resetting-the-dev-store.md.
 ```
 
 `submissions.kind` and `punches.source` used to be `CHECK` constraints and are now foreign keys
@@ -20,15 +21,27 @@ fix is to delete it.
 
 ## Delete it
 
-From the repository root, with the dev server **stopped**:
+Miniflare partitions Durable Object storage by class, one directory per class under
+`.wrangler/state/v3/do/<worker>-<ClassName>/`. So delete **only Kintai's store**, from the
+repository root, with the dev server **stopped**:
 
 ```bash
-rm -rf .wrangler/state
+rm -rf .wrangler/state/v3/do/gatekeeper-kintai-KintaiStore
 ```
 
-That is every local Durable Object's storage, not only Kintai's — the Workshop, its gadgets and
-their accounts all live in there. There is no way to delete one object's storage on its own, and
-there is nothing in it worth keeping.
+That one directory is sufficient: `applySchema` runs only in `KintaiStore`'s constructor, so no
+other object carries the stale schema. It leaves the Workshop login, every gadget install and
+every other gatekeeper's data untouched.
+
+**Do not `rm -rf .wrangler/state`.** That is all ~50 classes at once — the Workshop backend, its
+users, every gadget account, KV, cache and R2. Doing it costs a full re-login and re-install of
+everything, and it has already happened once by following an earlier version of this file. If you
+also want to clear the Kintai gatekeeper's own capability state (rarely needed — the roster and
+punches live in the store, not here):
+
+```bash
+rm -rf .wrangler/state/v3/do/gatekeeper-kintai-KintaiGatekeeper
+```
 
 If `pnpm run-local` then fails on stale build output rather than starting:
 

@@ -1,4 +1,4 @@
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
 describe("kintai schema", () => {
@@ -157,17 +157,39 @@ describe("growing enumerations live in lookup tables", () => {
     const message = await host.detectsStaleSchema();
 
     expect(message).toMatch(/KINTAI_STALE_SCHEMA/);
-    expect(message).toMatch(/\.wrangler\/state/);
+    // Names the ONE directory to delete, not all of `.wrangler/state`. The broad instruction cost
+    // a full Workshop re-login once; the message is the only place most people will read it.
+    expect(message).toMatch(/gatekeeper-kintai-KintaiStore/);
+    expect(message).toMatch(/NOT required/);
     expect(message).toMatch(/resetting-the-dev-store\.md/);
   });
 
   it("is idempotent across repeated activations", async () => {
-    const first = env.KINTAI_STORE.getByName("lookup-idempotent");
-    expect(await first.submissionKinds()).toEqual(["amendment", "overtime"]);
-    expect(await first.punchSources()).toEqual(["admin", "amendment", "gadget", "import"]);
+    // `getByName` twice returns two stubs for ONE live instance, so a second call proves nothing
+    // about the constructor -- `applySchema` would have run once either way. `state.abort()`
+    // discards the instance while keeping its storage, so the next call genuinely re-enters the
+    // constructor against a database that is already seeded. That is the case `INSERT OR IGNORE`
+    // exists for, and it is the one that runs on every real activation.
+    const stub = env.KINTAI_STORE.getByName("lookup-idempotent");
+    expect(await stub.submissionKinds()).toEqual(["amendment", "overtime"]);
 
-    const second = env.KINTAI_STORE.getByName("lookup-idempotent");
-    expect(await second.submissionKinds()).toEqual(["amendment", "overtime"]);
-    expect(await second.punchSources()).toEqual(["admin", "amendment", "gadget", "import"]);
+    await runInDurableObject(stub, (_instance, state) => {
+      state.abort();
+    }).catch(() => {
+      // `abort()` rejects the in-flight call by design; the discard is the point.
+    });
+
+    const revived = env.KINTAI_STORE.getByName("lookup-idempotent");
+    expect(await revived.submissionKinds()).toEqual(["amendment", "overtime"]);
+    expect(await revived.punchSources()).toEqual(["admin", "amendment", "gadget", "import"]);
+  });
+
+  it("restores a seed row a later version adds, on the next activation", async () => {
+    // The forward path this design exists for: widening the enum is an INSERT, and an existing
+    // store picks it up when it next activates rather than needing a migration.
+    const host = env.KINTAI_FACET_HOST.getByName("lookup-reseed");
+    expect(await host.reseedsMissingLookupRow()).toEqual(
+      ["admin", "amendment", "gadget", "import"],
+    );
   });
 });
