@@ -39,471 +39,217 @@ Baseline entering this plan: **330 worker, 65 app.**
 
 **Created:**
 - `src/store/amendments.ts` — the amendment request record and its rules: create, read, validate, apply. One responsibility: what a correction request *is*. It does not know about RPC, sessions or authority beyond what it is handed.
-- `src/store/migrate.ts` — the table-rebuild helper. SQLite cannot alter a `CHECK` constraint, so two constraints in this plan require the twelve-step rebuild procedure. Isolated because it is dangerous and should be read on its own.
 - `__tests__/amendments.test.ts` — store-level rules.
 - `__tests__/amendment-flow.test.ts` — the loop end to end through the facet.
-- `__tests__/migrate.test.ts` — the rebuilds, against pre-change DDL.
 
 **Modified:**
-- `src/store/schema.ts` — the new table, the two CHECK rebuilds.
+- `src/store/schema.ts` — the lookup tables and their seeds, the two foreign keys, `amendment_requests`, and the stale-store guard.
 - `src/store/submissions.ts` — `checkMayAct` gains the `created_by` refusal; filing-time satisfiability gains the filer case.
 - `src/store/kintai-store.ts` — store methods for the new functions.
 - `src/kintai.ts` — session methods, and the atomic apply.
 - `src/types.ts` — re-export `AmendmentRequest` from `store/amendments.ts` if the facet needs it in a signature; the type itself lives beside the table it describes.
 - `src/input.ts` — `assertPunchKind`, `assertOccurredAt`.
 - `src/types.txt` — agent-facing docs for the new methods and refusals.
-- `__tests__/worker.ts` — legacy-DDL harness for the rebuild tests.
 
 ---
 
-## Task 1: A table-rebuild helper, and `submissions.kind` accepts `'amendment'`
+## Task 1: Lookup tables for growing enumerations
 
-**Why this is first and why it is its own task:** `submissions.kind` is `CHECK (kind IN ('overtime'))`. **SQLite cannot alter a CHECK constraint** — `ALTER TABLE` can add a column, and nothing else that matters here. Every additive migration this package has done so far (`work_date_policy`) was `ADD COLUMN`, which is why no rebuild machinery exists yet. Adding a second submission kind requires rebuilding the table, and a reviewer should be able to reject the rebuild without rejecting the feature.
+**Replaces the original Tasks 1 and 2** (a CHECK-constraint rebuild helper, applied to `submissions` and then `punches`). That approach was attempted and abandoned; the reasoning is recorded below because it is the reason this task looks the way it does. **There is no Task 2** — the numbering of Tasks 3-9 is unchanged so the cross-references in them still resolve.
+
+### Why the rebuild was abandoned
+
+Durable Object SQLite enforces foreign keys **immediately**, and SQLite cannot alter a CHECK constraint. Measured directly in workerd:
+
+- `DROP TABLE submissions` succeeds with no referencing rows and fails with one.
+- `PRAGMA defer_foreign_keys = ON` does not throw, but DO SQLite runs an **end-of-turn integrity check**: *"the Durable Object was reset and rolled back to its last known good state because the application left the database in a state where constraints were violated."* Deferring moves the failure to commit; it does not avoid it.
+- `ALTER TABLE ... RENAME` **rewrites child foreign-key clauses**. After renaming `submissions` to `submissions_old`, `approval_events` reads `REFERENCES "submissions_old"(id)` — permanently, unless the child is rebuilt too.
+
+So a rebuild cascades: `submissions` drags `approval_events` (append-only audit data), and `punches` would drag `punch_locations`, `amendment_requests`, and its own `supersedes_id` self-reference.
+
+The project owner confirmed **there is no deployed store — only a local dev store**, so no data needs to survive. That makes the cheap fix available, and the cheap fix also removes the cliff permanently rather than deferring it:
+
+**A CHECK constraint is for an invariant. A growing enumeration belongs in a lookup table.** `CHECK (minutes >= 0)`, `CHECK (json_valid(route_snapshot))` and the `state` machine are fixed sets and stay as they are. `submissions.kind` and `punches.source` will keep growing — expenses, travel claims, imports — and with a foreign key onto a lookup table, adding a value is an `INSERT`, never a rebuild.
+
+Note also how little the CHECK on `kind` was buying: it is written as a SQL **literal** (`VALUES (?, 'overtime', ...)`), never a bound parameter, so no input could ever make it wrong. `@validateRpc()` refuses bad unions at the RPC boundary, which is where caller-supplied values are actually checked.
 
 **Files:**
-- Create: `packages/gatekeeper-kintai/src/store/migrate.ts`
-- Create: `packages/gatekeeper-kintai/__tests__/migrate.test.ts`
 - Modify: `packages/gatekeeper-kintai/src/store/schema.ts`
-- Modify: `packages/gatekeeper-kintai/__tests__/worker.ts`
+- Modify: `packages/gatekeeper-kintai/__tests__/schema.test.ts`
+- Modify: `packages/gatekeeper-kintai/src/types.ts`
+- Create: `packages/gatekeeper-kintai/docs/resetting-the-dev-store.md` (or add a section to the package README if one exists — check first)
 
 **Interfaces:**
-- Produces: `tableDefinition(sql, table): string | null`, `rebuildTable(sql, spec: RebuildSpec): boolean`, where
-  `RebuildSpec = { table: string; wantedMarker: string; createSql: string; columns: string[]; indexes?: string[] }`.
-  Returns `true` if it rebuilt, `false` if the table was already current or absent.
+- Produces: tables `submission_kinds(kind TEXT PRIMARY KEY)` and `punch_sources(source TEXT PRIMARY KEY)`, seeded; `submissions.kind` and `punches.source` as foreign keys onto them; `assertSchemaCurrent(sql)` raising a clear, actionable error on a pre-lookup store.
+- `SubmissionKind = "overtime" | "amendment"` and `PunchSource = "gadget" | "admin" | "import" | "amendment"` in `src/types.ts`, and the seed lists in `schema.ts` must match them. TypeScript stays the primary check; the lookup table is the database-level backstop.
 
-- [ ] **Step 1: Write the failing test for the rebuild helper**
+- [ ] **Step 1: Write the failing tests**
 
-Add to `__tests__/worker.ts`, inside `KintaiFacetHost`, next to the existing `migrateLegacyEmployees`:
-
-```ts
-  /**
-   * Build `submissions` with its PRE-amendment CHECK, plus a referencing `approval_events` row,
-   * then run the real `applySchema` over it. The only way to reach the rebuild: `applySchema` runs
-   * in the store's constructor, so a `KintaiStore` can never be observed before it.
-   */
-  migrateLegacySubmissions(): {
-    kinds: string[];
-    events: number;
-    amendmentAccepted: boolean;
-    nonsenseRejected: boolean;
-  } {
-    const sql = this.ctx.storage.sql;
-    sql.exec(`CREATE TABLE IF NOT EXISTS employees (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, employee_number TEXT NOT NULL UNIQUE,
-      display_name TEXT NOT NULL, joined_on TEXT NOT NULL, left_on TEXT,
-      department TEXT, employment_type TEXT, designated_approver_id INTEGER
-    ) STRICT`);
-    sql.exec(
-      `INSERT INTO employees (id, employee_number, display_name, joined_on)
-       VALUES (1, 'E1', 'Legacy', '2026-04-01')`,
-    );
-    sql.exec(`CREATE TABLE IF NOT EXISTS submissions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      employee_id INTEGER NOT NULL REFERENCES employees(id),
-      kind TEXT NOT NULL CHECK (kind IN ('overtime')),
-      requested_for TEXT NOT NULL,
-      state TEXT NOT NULL CHECK (
-        state IN ('draft', 'pending', 'approved', 'rejected', 'withdrawn')),
-      submitted_at INTEGER,
-      current_step INTEGER NOT NULL DEFAULT 0,
-      minutes INTEGER NOT NULL CHECK (minutes >= 0),
-      reason TEXT NOT NULL,
-      calculation_inputs TEXT CHECK (
-        calculation_inputs IS NULL OR json_valid(calculation_inputs)),
-      route_snapshot TEXT NOT NULL CHECK (json_valid(route_snapshot)),
-      created_by INTEGER REFERENCES employees(id)
-    ) STRICT`);
-    sql.exec(`CREATE TABLE IF NOT EXISTS approval_events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      submission_id INTEGER NOT NULL REFERENCES submissions(id),
-      step_index INTEGER NOT NULL, actor_employee_id INTEGER NOT NULL REFERENCES employees(id),
-      action TEXT NOT NULL, at INTEGER NOT NULL, comment TEXT, authorizing_edge INTEGER
-    ) STRICT`);
-    sql.exec(
-      `INSERT INTO submissions
-         (id, employee_id, kind, requested_for, state, submitted_at, current_step,
-          minutes, reason, calculation_inputs, route_snapshot, created_by)
-       VALUES (7, 1, 'overtime', '2026-07-03', 'pending', 100, 0, 60, 'legacy', NULL, '{}', 1)`,
-    );
-    sql.exec(
-      `INSERT INTO approval_events
-         (submission_id, step_index, actor_employee_id, action, at)
-       VALUES (7, 0, 1, 'approve', 101)`,
-    );
-
-    applySchema(sql);
-
-    let amendmentAccepted = false;
-    try {
-      sql.exec(
-        `INSERT INTO submissions
-           (id, employee_id, kind, requested_for, state, submitted_at, current_step,
-            minutes, reason, route_snapshot)
-         VALUES (8, 1, 'amendment', '2026-07-03', 'pending', 102, 0, 0, 'fix', '{}')`,
-      );
-      amendmentAccepted = true;
-    } catch { /* left false */ }
-
-    let nonsenseRejected = false;
-    try {
-      sql.exec(
-        `INSERT INTO submissions
-           (id, employee_id, kind, requested_for, state, submitted_at, current_step,
-            minutes, reason, route_snapshot)
-         VALUES (9, 1, 'nonsense', '2026-07-03', 'pending', 103, 0, 0, 'x', '{}')`,
-      );
-    } catch { nonsenseRejected = true; }
-
-    return {
-      kinds: sql.exec<{ kind: string }>(`SELECT kind FROM submissions ORDER BY id`)
-        .toArray().map((r) => r.kind),
-      events: sql.exec<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM approval_events WHERE submission_id = 7`).one().n,
-      amendmentAccepted,
-      nonsenseRejected,
-    };
-  }
-```
-
-Create `__tests__/migrate.test.ts`:
+In `__tests__/schema.test.ts`:
 
 ```ts
-import { env } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+describe("growing enumerations live in lookup tables", () => {
+  it("seeds every submission kind and punch source", async () => {
+    const store = env.KINTAI_STORE.getByName("lookup-seed");
+    await store.createEmployee({
+      employeeNumber: "E1", displayName: "Tanaka", joinedOn: "2026-04-01",
+    });
 
-describe("submissions.kind rebuild", () => {
-  it("keeps existing rows and their approval events, and accepts amendment afterwards", async () => {
-    const host = env.KINTAI_FACET_HOST.getByName("migrate-submissions");
-    const result = await host.migrateLegacySubmissions();
+    expect(await store.submissionKinds()).toEqual(["amendment", "overtime"]);
+    expect(await store.punchSources()).toEqual(["admin", "amendment", "gadget", "import"]);
+  });
 
-    expect(result.kinds).toEqual(["overtime", "amendment"]);
-    expect(result.events).toBe(1);
-    expect(result.amendmentAccepted).toBe(true);
-    expect(result.nonsenseRejected).toBe(true);
+  it("refuses a punch whose source is not a known one", async () => {
+    const store = env.KINTAI_STORE.getByName("lookup-reject");
+    const employeeId = await store.createEmployee({
+      employeeNumber: "E1", displayName: "Tanaka", joinedOn: "2026-04-01",
+    });
+
+    await expect(store.recordPunch({
+      employeeId, workDate: "2026-07-03", kind: "in",
+      now: Date.parse("2026-07-03T00:00:00Z"),
+      // @ts-expect-error -- the point is what the DATABASE does when TypeScript is bypassed
+      source: "nonsense",
+    })).rejects.toThrow(/FOREIGN KEY/);
+  });
+
+  it("is idempotent across repeated activations", async () => {
+    // applySchema runs in the constructor; a second activation must not duplicate seed rows
+    // or fail on them. Reach the store twice and assert the lists are unchanged.
   });
 });
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+> Write the third test out fully — no `// ...` in the committed file. `store.submissionKinds()` and `store.punchSources()` are small read methods you add to `KintaiStore` in Step 3; they exist so the seed is observable from a test without reaching into storage.
+
+- [ ] **Step 2: Run and watch them fail**
 
 ```bash
-cd packages/gatekeeper-kintai && pnpm exec vitest run __tests__/migrate.test.ts
+cd packages/gatekeeper-kintai && pnpm exec vitest run __tests__/schema.test.ts
 ```
 
-Expected: FAIL — `migrateLegacySubmissions` is not a function, or once it exists, `amendmentAccepted` is `false` because the old CHECK survives `CREATE TABLE IF NOT EXISTS`.
+Expected: FAIL — `store.submissionKinds is not a function`.
 
-- [ ] **Step 3: Write `src/store/migrate.ts`**
+- [ ] **Step 3: Create and seed the lookup tables FIRST in `applySchema`**
+
+Ordering is not cosmetic. Foreign keys are enforced immediately, so a lookup table must exist and hold its rows **before** any table referencing it is created. Put this block at the very top of `applySchema`, above `employees`:
+
+```ts
+  // Growing enumerations live in lookup tables, not in CHECK constraints.
+  //
+  // SQLite cannot alter a CHECK, and DO SQLite enforces foreign keys immediately with an
+  // end-of-turn integrity check on top -- so widening a CHECK means rebuilding the table, which
+  // means rebuilding everything that references it. `submissions` drags `approval_events`;
+  // `punches` drags `punch_locations`, `amendment_requests` and its own `supersedes_id`. These two
+  // columns will keep growing (expenses, travel claims, imports), so they are foreign keys and
+  // adding a value is an INSERT.
+  //
+  // CHECK stays where the set is genuinely fixed: `minutes >= 0`, `json_valid(...)`, the state
+  // machine. Those are invariants, not enumerations.
+  //
+  // Created before anything that references them, because the constraint is checked at once.
+  sql.exec(`CREATE TABLE IF NOT EXISTS submission_kinds (kind TEXT PRIMARY KEY) STRICT`);
+  sql.exec(
+    `INSERT OR IGNORE INTO submission_kinds (kind) VALUES ('overtime'), ('amendment')`,
+  );
+
+  sql.exec(`CREATE TABLE IF NOT EXISTS punch_sources (source TEXT PRIMARY KEY) STRICT`);
+  sql.exec(
+    `INSERT OR IGNORE INTO punch_sources (source)
+     VALUES ('gadget'), ('admin'), ('import'), ('amendment')`,
+  );
+```
+
+`INSERT OR IGNORE` is what makes re-running it on every activation safe.
+
+Then change the two columns:
+
+```sql
+    kind TEXT NOT NULL REFERENCES submission_kinds(kind),
+```
+
+```sql
+    source TEXT NOT NULL REFERENCES punch_sources(source),
+```
+
+Add the two read methods to `KintaiStore`, following the one-line-delegate pattern of its neighbours, returning the sorted lists.
+
+- [ ] **Step 4: Make a stale dev store say so**
+
+An existing local store keeps its old `CHECK (kind IN ('overtime'))`, because `CREATE TABLE IF NOT EXISTS` is a no-op on it. It will refuse every amendment with a bare constraint error at the first write, which is a confusing afternoon. Detect it and say what to do:
 
 ```ts
 /**
- * Rebuilding a table to change a constraint SQLite will not let us alter.
+ * Refuse to run against a store predating the lookup tables.
  *
- * `ALTER TABLE` can add a column and rename things. It cannot change a CHECK constraint, and
- * `CREATE TABLE IF NOT EXISTS` silently keeps the old definition — so a store created before a
- * constraint widened keeps refusing values the current code considers valid, with no error at
- * deploy time and a failure only when the first new value is written.
+ * Such a store still has `CHECK (kind IN ('overtime'))` and will refuse every amendment with a
+ * bare constraint failure at the first write, hours after the deploy that caused it. There is no
+ * migration: converting the column is itself a table rebuild, which is what the lookup tables
+ * exist to avoid, and there is no deployed store whose data needs preserving. So this is a dev
+ * affordance -- it turns a confusing write failure into an instruction.
  *
- * The procedure is SQLite's documented one, minus the parts a Durable Object does not need: DO
- * SQLite gives us one implicit transaction per turn of the input gate, and `applySchema` runs
- * inside the constructor, so no other work interleaves with these statements.
- *
- * Detection is on `sqlite_master.sql` — the stored CREATE statement — searched for a marker that
- * only the current definition contains. Cheap, and it makes the rebuild idempotent: a fresh
- * database gets the current definition from `CREATE TABLE IF NOT EXISTS` and this does nothing.
+ * If a store with data ever needs this conversion, it is a real migration and belongs somewhere
+ * that can fail without resetting the object. `applySchema` runs in the constructor, so a throw
+ * here bricks the store on every activation rather than degrading -- acceptable for a dev store
+ * that must be reset anyway, and NOT acceptable as a general migration strategy.
  */
-
-export type RebuildSpec = {
-  /** The table to rebuild. */
-  table: string;
-  /** A substring present in the wanted definition and absent from every older one. */
-  wantedMarker: string;
-  /** The full `CREATE TABLE <table>_rebuilt (...)` statement, with the wanted constraints. */
-  createSql: string;
-  /** Columns to carry over, in order. Must exist in both definitions. */
-  columns: string[];
-  /** Index statements to re-issue afterwards; dropping a table drops its indexes. */
-  indexes?: string[];
-};
-
-/** The stored CREATE statement for a table, or null if it does not exist. */
-export function tableDefinition(sql: SqlStorage, table: string): string | null {
+function assertSchemaCurrent(sql: SqlStorage): void {
   const row = sql
     .exec<{ sql: string | null }>(
-      `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`, table,
+      `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'submissions'`,
     )
     .toArray()[0];
-  return row?.sql ?? null;
-}
-
-/**
- * Rebuild `spec.table` if its stored definition lacks `spec.wantedMarker`.
- *
- * Returns true if it rebuilt. Absent table returns false: `applySchema` creates it correctly a few
- * lines earlier, so there is nothing to migrate.
- */
-export function rebuildTable(sql: SqlStorage, spec: RebuildSpec): boolean {
-  const existing = tableDefinition(sql, spec.table);
-  if (existing === null) return false;
-  if (existing.includes(spec.wantedMarker)) return false;
-
-  const staging = `${spec.table}_rebuilt`;
-  const columnList = spec.columns.join(", ");
-
-  sql.exec(`DROP TABLE IF EXISTS ${staging}`);
-  sql.exec(spec.createSql);
-  sql.exec(
-    `INSERT INTO ${staging} (${columnList}) SELECT ${columnList} FROM ${spec.table}`,
-  );
-  sql.exec(`DROP TABLE ${spec.table}`);
-  sql.exec(`ALTER TABLE ${staging} RENAME TO ${spec.table}`);
-  for (const index of spec.indexes ?? []) sql.exec(index);
-  return true;
-}
-```
-
-- [ ] **Step 4: Wire it into `applySchema`**
-
-In `src/store/schema.ts`, add the import and change the `submissions` block. The `CREATE TABLE IF NOT EXISTS submissions` statement gains `'amendment'`; immediately after it, add the rebuild for stores that already exist:
-
-```ts
-import { rebuildTable } from "./migrate.js";
-```
-
-Change the `kind` line of the existing `CREATE TABLE IF NOT EXISTS submissions` to:
-
-```sql
-    kind TEXT NOT NULL CHECK (kind IN ('overtime', 'amendment')),
-```
-
-Then directly after that `sql.exec(...)` call:
-
-```ts
-  // `CREATE TABLE IF NOT EXISTS` above is a no-op on a store that already exists, so a database
-  // created before amendments keeps `CHECK (kind IN ('overtime'))` and refuses every amendment.
-  // SQLite cannot alter a CHECK, so the table is rebuilt. See `rebuildTable`.
-  rebuildTable(sql, {
-    table: "submissions",
-    wantedMarker: "'amendment'",
-    createSql: `CREATE TABLE submissions_rebuilt (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      employee_id INTEGER NOT NULL REFERENCES employees(id),
-      kind TEXT NOT NULL CHECK (kind IN ('overtime', 'amendment')),
-      requested_for TEXT NOT NULL,
-      state TEXT NOT NULL CHECK (
-        state IN ('draft', 'pending', 'approved', 'rejected', 'withdrawn')),
-      submitted_at INTEGER,
-      current_step INTEGER NOT NULL DEFAULT 0,
-      minutes INTEGER NOT NULL CHECK (minutes >= 0),
-      reason TEXT NOT NULL,
-      calculation_inputs TEXT CHECK (
-        calculation_inputs IS NULL OR json_valid(calculation_inputs)),
-      route_snapshot TEXT NOT NULL CHECK (json_valid(route_snapshot)),
-      created_by INTEGER REFERENCES employees(id)
-    ) STRICT`,
-    columns: [
-      "id", "employee_id", "kind", "requested_for", "state", "submitted_at", "current_step",
-      "minutes", "reason", "calculation_inputs", "route_snapshot", "created_by",
-    ],
-  });
-```
-
-- [ ] **Step 5: Run the test**
-
-```bash
-pnpm exec vitest run __tests__/migrate.test.ts
-```
-
-Expected: PASS. If `DROP TABLE submissions` fails because `approval_events` references it, foreign keys are enforced — do **not** reach for `PRAGMA foreign_keys`, which DO SQLite restricts. Report the failure and stop; the fallback is to widen the constraint by dropping the CHECK from `kind` entirely and relying on `@validateRpc()` plus TypeScript, which is a decision for the plan's author, not the implementer.
-
-- [ ] **Step 6: Run every gate, then commit**
-
-```bash
-pnpm exec vitest run && pnpm exec vitest run -c vitest.app.config.ts && pnpm exec tsc --noEmit && pnpm run typecheck:app
-git add -A && git commit -m "feat(kintai): let submissions carry a second kind
-
-SQLite cannot alter a CHECK constraint and CREATE TABLE IF NOT EXISTS keeps
-the old one, so a store created before amendments would refuse every one of
-them -- silently at deploy, loudly at the first write. \`rebuildTable\` runs
-SQLite's documented rebuild when the stored definition lacks a marker the
-current one has, and does nothing on a fresh database."
-```
-
----
-
-## Task 2: `punches.source` accepts `'amendment'`
-
-**Why separate:** `punches` is the append-only table every other record points at, carrying self-referencing `supersedes_id` chains and two indexes. Rebuilding it is the single riskiest operation in this plan and deserves its own reviewer gate. If Task 1's rebuild failed, stop here.
-
-**Files:**
-- Modify: `packages/gatekeeper-kintai/src/store/schema.ts`
-- Modify: `packages/gatekeeper-kintai/__tests__/worker.ts`
-- Modify: `packages/gatekeeper-kintai/__tests__/migrate.test.ts`
-
-**Interfaces:**
-- Consumes: `rebuildTable` from Task 1.
-- Produces: `punches.source` accepting `'gadget' | 'admin' | 'import' | 'amendment'`.
-
-- [ ] **Step 1: Write the failing test**
-
-Add to `KintaiFacetHost` in `__tests__/worker.ts`:
-
-```ts
-  /**
-   * Build `punches` with its PRE-amendment source CHECK, including a supersedes chain, then run
-   * the real `applySchema` over it. A rebuild must preserve the chain and rebuild both indexes.
-   */
-  migrateLegacyPunches(): {
-    ids: number[];
-    supersedes: (number | null)[];
-    amendmentAccepted: boolean;
-    nonsenseRejected: boolean;
-    indexes: string[];
-  } {
-    const sql = this.ctx.storage.sql;
-    sql.exec(`CREATE TABLE IF NOT EXISTS employees (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, employee_number TEXT NOT NULL UNIQUE,
-      display_name TEXT NOT NULL, joined_on TEXT NOT NULL, left_on TEXT,
-      department TEXT, employment_type TEXT, designated_approver_id INTEGER
-    ) STRICT`);
-    sql.exec(
-      `INSERT INTO employees (id, employee_number, display_name, joined_on)
-       VALUES (1, 'E1', 'Legacy', '2026-04-01')`,
+  if (row?.sql && !row.sql.includes("submission_kinds")) {
+    throw new Error(
+      `KINTAI_STALE_SCHEMA: this store predates the submission_kinds lookup table and cannot ` +
+      `accept amendments. There is no migration -- delete the local Durable Object state ` +
+      `(.wrangler/state) and re-seed. See docs/resetting-the-dev-store.md.`,
     );
-    sql.exec(`CREATE TABLE IF NOT EXISTS punches (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      employee_id INTEGER NOT NULL REFERENCES employees(id),
-      work_date TEXT NOT NULL,
-      kind TEXT NOT NULL CHECK (kind IN ('in', 'out', 'break_start', 'break_end')),
-      occurred_at INTEGER NOT NULL,
-      recorded_at INTEGER NOT NULL,
-      source TEXT NOT NULL CHECK (source IN ('gadget', 'admin', 'import')),
-      supersedes_id INTEGER REFERENCES punches(id),
-      amended_by INTEGER REFERENCES employees(id),
-      amend_reason TEXT
-    ) STRICT`);
-    sql.exec(
-      `INSERT INTO punches (id, employee_id, work_date, kind, occurred_at, recorded_at, source)
-       VALUES (1, 1, '2026-07-03', 'in', 100, 100, 'gadget')`,
-    );
-    sql.exec(
-      `INSERT INTO punches (id, employee_id, work_date, kind, occurred_at, recorded_at, source,
-                            supersedes_id, amended_by, amend_reason)
-       VALUES (2, 1, '2026-07-03', 'in', 90, 200, 'admin', 1, 1, 'was early')`,
-    );
-
-    applySchema(sql);
-
-    let amendmentAccepted = false;
-    try {
-      sql.exec(
-        `INSERT INTO punches (id, employee_id, work_date, kind, occurred_at, recorded_at, source)
-         VALUES (3, 1, '2026-07-03', 'out', 300, 300, 'amendment')`,
-      );
-      amendmentAccepted = true;
-    } catch { /* left false */ }
-
-    let nonsenseRejected = false;
-    try {
-      sql.exec(
-        `INSERT INTO punches (id, employee_id, work_date, kind, occurred_at, recorded_at, source)
-         VALUES (4, 1, '2026-07-03', 'out', 400, 400, 'nonsense')`,
-      );
-    } catch { nonsenseRejected = true; }
-
-    return {
-      ids: sql.exec<{ id: number }>(`SELECT id FROM punches ORDER BY id`)
-        .toArray().map((r) => r.id),
-      supersedes: sql.exec<{ supersedes_id: number | null }>(
-        `SELECT supersedes_id FROM punches ORDER BY id`).toArray().map((r) => r.supersedes_id),
-      amendmentAccepted,
-      nonsenseRejected,
-      indexes: sql.exec<{ name: string }>(
-        `SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'punches'
-           AND name NOT LIKE 'sqlite_%' ORDER BY name`).toArray().map((r) => r.name),
-    };
   }
+}
 ```
 
-Add to `__tests__/migrate.test.ts`:
+Call it immediately after the lookup-table block, before the rest of `applySchema`.
 
-```ts
-describe("punches.source rebuild", () => {
-  it("preserves the supersedes chain and rebuilds both indexes", async () => {
-    const host = env.KINTAI_FACET_HOST.getByName("migrate-punches");
-    const result = await host.migrateLegacyPunches();
+- [ ] **Step 5: Write the reset instructions**
 
-    expect(result.ids).toEqual([1, 2, 3]);
-    expect(result.supersedes).toEqual([null, 1, null]);
-    expect(result.amendmentAccepted).toBe(true);
-    expect(result.nonsenseRejected).toBe(true);
-    expect(result.indexes).toEqual(["punches_by_day", "punches_by_time"]);
-  });
-});
-```
+`docs/resetting-the-dev-store.md`: what to delete, and what to re-seed afterwards (employees, org edges, the account link, any test punches). Someone hitting `KINTAI_STALE_SCHEMA` should not have to reconstruct the procedure. Keep it short and literal — exact commands.
 
-- [ ] **Step 2: Run it and watch it fail**
+- [ ] **Step 6: Verify against a real reset**
+
+Delete the local state, start the stack, seed two employees, and confirm both a punch and an amendment-kind insert are accepted. Then confirm a **second** activation does not duplicate seed rows.
 
 ```bash
-pnpm exec vitest run __tests__/migrate.test.ts
+rm -rf .wrangler/state
+pnpm run-local --port 8799
 ```
 
-Expected: FAIL on `amendmentAccepted` being `false`.
-
-- [ ] **Step 3: Widen the CHECK and add the rebuild**
-
-In `src/store/schema.ts`, change the `source` line of `CREATE TABLE IF NOT EXISTS punches` to:
-
-```sql
-    source TEXT NOT NULL CHECK (source IN ('gadget', 'admin', 'import', 'amendment')),
-```
-
-Read the two existing `CREATE INDEX IF NOT EXISTS punches_by_day` and `punches_by_time` statements in the file and pass them to the rebuild **verbatim** — they must not drift from the ones above. Add after the index statements:
-
-```ts
-  // A punch that entered the record through an approved amendment is not one somebody tapped, and
-  // the record should say which it was. Same rebuild as `submissions`, for the same reason: the
-  // CHECK above is a no-op on an existing store. `punches` is append-only and self-referencing, so
-  // the copy carries `id` explicitly to keep `supersedes_id` pointing at the same rows.
-  rebuildTable(sql, {
-    table: "punches",
-    wantedMarker: "'amendment'",
-    createSql: `CREATE TABLE punches_rebuilt (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      employee_id INTEGER NOT NULL REFERENCES employees(id),
-      work_date TEXT NOT NULL,
-      kind TEXT NOT NULL CHECK (kind IN ('in', 'out', 'break_start', 'break_end')),
-      occurred_at INTEGER NOT NULL,
-      recorded_at INTEGER NOT NULL,
-      source TEXT NOT NULL CHECK (source IN ('gadget', 'admin', 'import', 'amendment')),
-      supersedes_id INTEGER REFERENCES punches(id),
-      amended_by INTEGER REFERENCES employees(id),
-      amend_reason TEXT
-    ) STRICT`,
-    columns: [
-      "id", "employee_id", "work_date", "kind", "occurred_at", "recorded_at", "source",
-      "supersedes_id", "amended_by", "amend_reason",
-    ],
-    indexes: [/* the two CREATE INDEX IF NOT EXISTS statements, copied verbatim */],
-  });
-```
-
-- [ ] **Step 4: Run the test and confirm the index shape is unchanged**
+Because this touches `run-local`, rebuild before committing — the dev server rewrites `src/generated/app.txt` unminified:
 
 ```bash
-pnpm exec vitest run __tests__/migrate.test.ts && pnpm exec vitest run
+rm -rf packages/gatekeeper-kintai/dist-app && cd packages/gatekeeper-kintai && pnpm run build
+git status  # app.txt unchanged, or the minified production build
 ```
 
-Expected: PASS, and all 330 prior tests still pass. `punches_by_time` is what keeps the open-shift lookup off a full scan; if it is missing after a rebuild, night-shift attribution degrades silently.
-
-- [ ] **Step 5: Run every gate, then commit**
+- [ ] **Step 7: Run every gate, then commit**
 
 ```bash
 pnpm exec vitest run && pnpm exec vitest run -c vitest.app.config.ts && pnpm exec tsc --noEmit && pnpm run typecheck:app
-git add -A && git commit -m "feat(kintai): mark punches that entered through an amendment
+git add -A && git commit -m "feat(kintai): put growing enumerations in lookup tables
 
-A punch written by an approved correction is not one somebody tapped. The
-rebuild carries \`id\` explicitly so the supersedes chain keeps pointing at the
-same rows, and re-issues both indexes, since dropping a table drops them."
+SQLite cannot alter a CHECK constraint, and DO SQLite enforces foreign keys
+immediately with an end-of-turn integrity check on top -- so widening one means
+rebuilding the table, which cascades into everything referencing it:
+submissions drags approval_events, punches drags punch_locations and its own
+supersedes_id. Measured in workerd, including that ALTER TABLE RENAME silently
+re-points child FK clauses at the renamed table.
+
+kind and source will keep growing, so they are foreign keys onto lookup tables
+and adding a value is an INSERT. CHECK stays where the set is fixed -- minutes,
+json_valid, the state machine -- because those are invariants, not enumerations.
+
+No store but the local dev one exists, so there is no data to migrate. A store
+predating this says so with an instruction instead of a bare constraint error."
 ```
 
 ---
@@ -1016,6 +762,8 @@ nothing let a human choose a punch time. This is that path."
 ## Task 5: Nobody approves what they filed
 
 **Why its own task:** this is the authority change, and it is the finding most likely to be quietly lost in a later refactor. It deserves a reviewer who is looking at nothing else.
+
+> **PARTLY DONE.** The `checkMayAct` refusal was pulled forward onto branch `fix/kintai-filed-by-approver` (commit `a944e0f`), because it does not depend on amendments and is correct on its own terms — `NewSubmission.createdBy` already lets the filer and the employee differ. That branch adds `FiledBySelfError`, the refusal, and six tests covering approve, reject, return, `previewAct`, a null `created_by`, and that self-filed overtime still reports `KINTAI_SELF_APPROVAL`. **What remains in this task is `assertAmendmentSatisfiable` only** — the filing-time route check, which needs `fileAmendment` from Task 4. Do not re-implement the refusal; verify it is present and pin it against an amendment.
 
 **Files:**
 - Modify: `packages/gatekeeper-kintai/src/store/submissions.ts`
