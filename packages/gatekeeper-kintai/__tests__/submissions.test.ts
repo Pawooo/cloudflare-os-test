@@ -547,6 +547,94 @@ describe("provenance", () => {
   });
 });
 
+describe("nobody approves what they filed", () => {
+  // `createdBy` already lets one person file for another, so "the actor is not the employee" is
+  // no longer the whole of "the actor did not originate this". These pin the other half: the hand
+  // that filed a request is never the hand that settles it.
+
+  /** An overtime submission that is Worker's, but that Boss -- Worker's approver -- filed. */
+  async function filedByBoss() {
+    return store.submitOvertime({
+      employeeId: worker, requestedFor: "2026-07-03", minutes: 120,
+      reason: "entered from the paper sheet", now: JUL,
+      department: "CONSTRUCTION", employmentType: null, createdBy: boss,
+    });
+  }
+
+  it("refuses the filer even though they are an authorised approver", async () => {
+    await singleStepRoute();
+    const id = await filedByBoss();
+
+    await expect(() => store.actOnSubmission({
+      submissionId: id, actorId: boss, action: "approve", now: JUL + 1000,
+    })).rejects.toThrow(/KINTAI_FILED_BY_APPROVER/);
+  });
+
+  it("refuses the filer's reject and return, not only their approval", async () => {
+    // `checkMayAct` gates every decision, and the conflict is the same under each verb: one
+    // person both originating a change to payroll input and disposing of it.
+    await singleStepRoute();
+    const id = await filedByBoss();
+
+    await expect(() => store.actOnSubmission({
+      submissionId: id, actorId: boss, action: "reject", now: JUL + 1000,
+    })).rejects.toThrow(/KINTAI_FILED_BY_APPROVER/);
+    await expect(() => store.actOnSubmission({
+      submissionId: id, actorId: boss, action: "return", now: JUL + 2000,
+    })).rejects.toThrow(/KINTAI_FILED_BY_APPROVER/);
+  });
+
+  it("reports the refusal from the preview exactly as from the write", async () => {
+    // `previewAct` and `actOnSubmission` are one authority check called twice, so a refusal the
+    // preview did not report would surface only after a human had been asked to confirm.
+    await singleStepRoute();
+    const id = await filedByBoss();
+
+    await expect(() => store.previewActOnSubmission({
+      submissionId: id, actorId: boss, now: JUL + 1000,
+    })).rejects.toThrow(/KINTAI_FILED_BY_APPROVER/);
+  });
+
+  it("still lets a different authorised approver decide it", async () => {
+    // A request its filer may not approve must not thereby become unapprovable.
+    await singleStepRoute();
+    await store.setReportingLine(worker, director, APR);
+    const id = await filedByBoss();
+
+    expect(await store.actOnSubmission({
+      submissionId: id, actorId: director, action: "approve", now: JUL + 1000,
+    })).toBe("approved");
+  });
+
+  it("reports self-approval, not this, when the employee filed their own", async () => {
+    // What the facet does for every overtime submission: `submitOvertime` in `src/kintai.ts`
+    // passes `createdBy: employeeId`, so both rules match and the more specific one must answer.
+    // Otherwise an employee refused their own overtime is told a third party filed it.
+    await singleStepRoute();
+    const id = await store.submitOvertime({
+      employeeId: worker, requestedFor: "2026-07-03", minutes: 120,
+      reason: "site overrun", now: JUL,
+      department: "CONSTRUCTION", employmentType: null, createdBy: worker,
+    });
+
+    await expect(() => store.actOnSubmission({
+      submissionId: id, actorId: worker, action: "approve", now: JUL + 1000,
+    })).rejects.toThrow(/KINTAI_SELF_APPROVAL/);
+  });
+
+  it("leaves a submission with no recorded filer alone", async () => {
+    // `created_by` is nullable -- rows written before it existed, and every `submitOvertime` that
+    // omits it. A null filer is nobody, and must never read as the actor.
+    await singleStepRoute();
+    const id = await submit();
+    expect((await store.getSubmission(id)).created_by).toBeNull();
+
+    expect(await store.actOnSubmission({
+      submissionId: id, actorId: boss, action: "approve", now: JUL + 1000,
+    })).toBe("approved");
+  });
+});
+
 describe("unknown submissions", () => {
   it("reports a missing submission as not found, not as a storage failure", async () => {
     await expect(() => store.getSubmission(4242)).rejects.toThrow(/KINTAI_NOT_FOUND/);

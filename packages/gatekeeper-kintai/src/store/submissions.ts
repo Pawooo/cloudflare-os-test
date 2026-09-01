@@ -5,9 +5,11 @@ import { designatedApproverOf, employeeLabel, isExempt } from "./employees.js";
 
 // The state machine, and the three invariants it exists to hold:
 //
-//   1. Self-approval is structurally impossible. It is checked before anything else and is not
-//      configurable — no route, no delegation and no state can arrange for an employee to sign off
-//      their own overtime.
+//   1. Deciding a request you originated is structurally impossible. Checked before anything else
+//      and not configurable — no route, no delegation and no state can arrange for an employee to
+//      sign off their own overtime (`SelfApprovalError`), nor for whoever filed a request to be
+//      the one who settles it (`FiledBySelfError`). Those became two people the moment
+//      `created_by` let one person file for another; before that, the first was the whole rule.
 //   2. A `return` voids every approval that came before it. An approver approved specific content;
 //      once the employee may change that content, their approval no longer describes anything.
 //   3. The route snapshot on the submission is authoritative. Steps are read from
@@ -84,6 +86,42 @@ export type ApprovalEventRow = {
 export class SelfApprovalError extends Error {
   readonly code = "KINTAI_SELF_APPROVAL";
   constructor() { super("KINTAI_SELF_APPROVAL: you cannot approve your own submission."); }
+}
+
+/**
+ * The other half of "you did not originate this": whoever filed a request does not settle it.
+ *
+ * `SelfApprovalError` was the whole rule only while the person a submission is *about* and the
+ * person who *filed* it were always the same. `NewSubmission.createdBy` already separates them —
+ * an importer, or an admin filing from a paper sheet — and a manager filing a punch correction for
+ * their own report will make it ordinary. In that shape the self-approval check passes cleanly:
+ * the manager is not the employee, and they are the employee's approver, so one person can
+ * originate a change to payroll input and authorise it in the same breath. Nothing in the trail
+ * marks it, because a filer and an approver are each unremarkable on their own; only the fact that
+ * they are the same row is the finding, and no reader is looking for that.
+ *
+ * It refuses `reject` and `return` as well as `approve`. `checkMayAct` gates all three, and the
+ * conflict does not depend on the verb — disposing of a request you raised is the same authority
+ * collapsing into one person as approving it.
+ *
+ * `created_by` is nullable, and a null must never match an actor: it records that no filer was
+ * captured (an older row, or a `submitOvertime` call that omitted it), not that the actor was one.
+ *
+ * KNOWN GAP, deliberately left: `assertSatisfiable` refuses a route step pinned to the *employee*
+ * at filing time, so such a submission never strands. It does not know about the filer, so a step
+ * pinned to somebody who then files on another's behalf produces a submission nobody can decide —
+ * discovered only when they try. Unreachable today, because the one caller that sets `createdBy`
+ * (`KintaiSession.submitOvertime`) sets it to the employee; it becomes reachable with the first
+ * filed-on-behalf path, and the filing-time check belongs there rather than here.
+ */
+export class FiledBySelfError extends Error {
+  readonly code = "KINTAI_FILED_BY_APPROVER";
+  constructor() {
+    super(
+      "KINTAI_FILED_BY_APPROVER: you filed this request, and nobody may decide a request they " +
+      "filed themselves. Someone else in its approval route must decide it.",
+    );
+  }
 }
 
 /**
@@ -436,8 +474,8 @@ type ActAuthority = {
  *
  * The ORDER here is itself load-bearing and must not be rearranged:
  *
- *  1. Self-approval first, ahead of everything else: nobody signs off their own overtime, in any
- *     state, under any route.
+ *  1. Origination first, ahead of everything else: neither the employee a submission is about nor
+ *     the person who filed it may decide it, in any state, under any route.
  *  2. Authority BEFORE state, matching `withdrawSubmission` and `resubmit`.
  *     `InvalidTransitionError` names the state it refused, so checking state first would let a
  *     Gadget walk the id space and read back the exact state of every submission in the company.
@@ -448,8 +486,10 @@ type ActAuthority = {
  *     ids exist. That is deliberate: an id that does not exist has no state and no owner to leak,
  *     and refusing to distinguish it would mean answering `KINTAI_NOT_AUTHORIZED` for typos. What
  *     is closed is everything that follows — the state, and whose submission it is. The one
- *     exception is the caller's OWN submissions, which answer `KINTAI_SELF_APPROVAL`; that
- *     discloses only what they may already read through `listMySubmissions`.
+ *     exceptions are the two the step above refuses: the caller's OWN submissions, which answer
+ *     `KINTAI_SELF_APPROVAL` and disclose only what `listMySubmissions` already shows them, and
+ *     submissions the caller filed, which answer `KINTAI_FILED_BY_APPROVER` and disclose only that
+ *     a request they themselves wrote still exists. Neither hands out anything they did not have.
  *  3. Only then, with authority established, is the state safe to name.
  *
  * A row with no step at its current index is unactionable by anyone — `assertSatisfiable` rejects
@@ -461,6 +501,11 @@ type ActAuthority = {
 function checkMayAct(sql: SqlStorage, input: ActCheck): ActAuthority {
   const submission = getSubmission(sql, input.submissionId);
   if (input.actorId === submission.employee_id) throw new SelfApprovalError();
+  // After the employee check, never before it: somebody who is both gets the more specific
+  // message. A null `created_by` is not a match — see `FiledBySelfError`.
+  if (submission.created_by !== null && input.actorId === submission.created_by) {
+    throw new FiledBySelfError();
+  }
 
   const snapshot = JSON.parse(submission.route_snapshot) as RouteSnapshot;
   const step = snapshot.steps[submission.current_step];
