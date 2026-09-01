@@ -8,6 +8,9 @@ describe("kintai schema", () => {
 
     expect(tables).toEqual([
       "account_links",
+      // What a correction request asks for, keyed one-to-one on the submission carrying its
+      // approval. Created after both `submissions` and `punches`, which it references.
+      "amendment_requests",
       "approval_events",
       "approval_route_steps",
       "approval_routes",

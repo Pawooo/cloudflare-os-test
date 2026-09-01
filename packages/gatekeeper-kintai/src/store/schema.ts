@@ -288,6 +288,37 @@ export function applySchema(sql: SqlStorage): void {
     created_by INTEGER REFERENCES employees(id)
   ) STRICT`);
 
+  // What a correction needs and overtime does not. Keyed one-to-one on the submission rather than
+  // carrying its own id: an amendment IS a submission, and a second identity for the same thing is
+  // how two rows for one fact start disagreeing.
+  //
+  // `target_punch_id` NULL means "add a punch that was never recorded" -- the forgotten clock-out,
+  // which `correctPunch` cannot express because it supersedes an existing row. Non-NULL means
+  // "that punch says the wrong time".
+  //
+  // Created after BOTH `submissions` and `punches`, because it references both and DO SQLite
+  // enforces foreign keys immediately: out of order, store construction itself fails.
+  //
+  // This is the one table in the feature that is not append-only. `applied_punch_id` goes from
+  // NULL to a value exactly once, when the approval that applies the request writes its punch --
+  // a link being completed, not history being rewritten. The punch it points at is itself
+  // append-only, and nothing else here is ever updated.
+  //
+  // `kind` keeps a CHECK rather than a lookup table: the four punch kinds are a fixed set, not a
+  // growing enumeration, and `punches.kind` is written the same way. See the block at the top.
+  sql.exec(`CREATE TABLE IF NOT EXISTS amendment_requests (
+    submission_id INTEGER PRIMARY KEY REFERENCES submissions(id),
+    target_punch_id INTEGER REFERENCES punches(id),
+    work_date TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('in', 'out', 'break_start', 'break_end')),
+    occurred_at INTEGER NOT NULL,
+    applied_punch_id INTEGER REFERENCES punches(id)
+  ) STRICT`);
+  // The uniqueness rule "one pending amendment per punch" is enforced in `amendments.ts` rather
+  // than here, because it depends on the submission's state, which lives in another table.
+  sql.exec(`CREATE INDEX IF NOT EXISTS amendment_requests_by_target
+    ON amendment_requests (target_punch_id)`);
+
   sql.exec(`CREATE TABLE IF NOT EXISTS approval_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     submission_id INTEGER NOT NULL REFERENCES submissions(id),

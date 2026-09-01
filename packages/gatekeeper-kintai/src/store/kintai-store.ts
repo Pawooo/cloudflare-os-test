@@ -2,6 +2,10 @@ import { DurableObject } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import { applySchema } from "./schema.js";
 import {
+  getAmendment, pendingAmendmentForPunch,
+  type AmendmentRequest,
+} from "./amendments.js";
+import {
   allAllocations, currentAllocations, reconcile, setAllocations,
   type AllocationEntry, type AllocationRow, type Reconciliation,
 } from "./allocations.js";
@@ -335,6 +339,22 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
 
   async approvalEvents(submissionId: number): Promise<ApprovalEventRow[]> {
     return approvalEvents(this.sql, submissionId);
+  }
+
+  /** What a submission asks to change, or null if it is not an amendment. See `getAmendment`. */
+  async getAmendment(submissionId: number): Promise<AmendmentRequest | null> {
+    return getAmendment(this.sql, submissionId);
+  }
+
+  /**
+   * The submission id of an undecided amendment against this punch, or null.
+   *
+   * The read behind "a punch may have at most one pending amendment". Exposed rather than kept
+   * private to `amendments.ts` because a caller about to offer a correction should be able to see
+   * that one is already in flight, instead of finding out by being refused.
+   */
+  async pendingAmendmentForPunch(punchId: number): Promise<number | null> {
+    return pendingAmendmentForPunch(this.sql, punchId);
   }
 
   async isLocked(workDate: string): Promise<boolean> {
