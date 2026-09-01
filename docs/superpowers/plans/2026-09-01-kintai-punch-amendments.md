@@ -31,7 +31,9 @@ pnpm exec tsc --noEmit
 pnpm run typecheck:app
 ```
 
-Baseline entering this plan: **330 worker, 65 app.**
+Baseline entering this plan: **349 worker, 65 app** — as of `dd8601e`, after Task 1, the
+origination rule and the seeded default route all merged. Re-check `git log` before trusting
+this number; several tasks have landed since the plan was written.
 
 ---
 
@@ -54,6 +56,12 @@ Baseline entering this plan: **330 worker, 65 app.**
 ---
 
 ## Task 1: Lookup tables for growing enumerations
+
+> **DONE** — merged to `main` in `b4ad4ce`. Landed with two differences from the text below:
+> `applySchema` also seeds a **default approval route** (without one, nothing could create a
+> submission on a fresh store and no API could fix it), and the reset instructions name the
+> single directory `.wrangler/state/v3/do/gatekeeper-kintai-KintaiStore` rather than all of
+> `.wrangler/state`. Later tasks should read the current `schema.ts`, not this section.
 
 **Replaces the original Tasks 1 and 2** (a CHECK-constraint rebuild helper, applied to `submissions` and then `punches`). That approach was attempted and abandoned; the reasoning is recorded below because it is the reason this task looks the way it does. **There is no Task 2** — the numbering of Tasks 3-9 is unchanged so the cross-references in them still resolve.
 
@@ -1091,7 +1099,7 @@ Attribution and amendment now interact, and the spec requires both policies exer
       employeeId: nightId, managerId, relation: "reports_to",
       validFrom: Date.parse("2026-04-01"),
     });
-    await store.setWorkDatePolicy(nightId, "shift_start", managerId, NINE_AM);
+    await store.setWorkDatePolicy(nightId, "shift_start");
 
     // 22:00 JST on DAY, no clock-out. The shift's date is DAY even though the missing
     // clock-out belongs to 06:00 the next morning.
@@ -1123,7 +1131,8 @@ Attribution and amendment now interact, and the spec requires both policies exer
 > This is the assertion most worth arguing with. An added punch takes its work date from the
 > request, so a correction never re-runs attribution — deliberate, because the request named a day
 > and re-deriving it from `occurred_at` would move the punch somewhere the approver did not agree
-> to. Confirm `setWorkDatePolicy`'s real signature on `KintaiStore` before using it.
+> to. (`KintaiStore.setWorkDatePolicy` takes two arguments; the admin-API method above it is
+> what carries the actor and the audit write.)
 
 - [ ] **Step 5: Expose on `KintaiStore`, run the tests, run every gate, commit**
 
