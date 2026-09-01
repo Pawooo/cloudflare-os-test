@@ -223,6 +223,13 @@ export function approvalEvents(sql: SqlStorage, submissionId: number): ApprovalE
  *    because they are the submitter (`SelfApprovalError`), so the submission appears in nobody's
  *    queue and can never advance. This is not exotic configuration: a 本社 escalation step pinned
  *    to a named 部長 strands that 部長's own overtime the moment they file any.
+ *
+ * A FOURTH way exists and is NOT rejected here: a step pinned to whoever FILED the submission, who
+ * is refused by `FiledBySelfError` for the same reason the submitter is. This function is not given
+ * the filer, and cannot be without deciding whether filing-on-behalf is even in play — see the
+ * KNOWN GAP on `FiledBySelfError`. Unreachable while every filing path sets `created_by` to the
+ * employee themself; the amendment work closes it with `assertAmendmentSatisfiable`. Do not read
+ * the list above as exhaustive until it does.
  */
 function assertSatisfiable(snapshot: RouteSnapshot, employeeId: EmployeeId): void {
   if (snapshot.steps.length === 0) {
@@ -485,7 +492,7 @@ type ActAuthority = {
  *     `getSubmission` is statement 1 and throws `KINTAI_NOT_FOUND`, so a caller can discover which
  *     ids exist. That is deliberate: an id that does not exist has no state and no owner to leak,
  *     and refusing to distinguish it would mean answering `KINTAI_NOT_AUTHORIZED` for typos. What
- *     is closed is everything that follows — the state, and whose submission it is. The one
+ *     is closed is everything that follows — the state, and whose submission it is. The only
  *     exceptions are the two the step above refuses: the caller's OWN submissions, which answer
  *     `KINTAI_SELF_APPROVAL` and disclose only what `listMySubmissions` already shows them, and
  *     submissions the caller filed, which answer `KINTAI_FILED_BY_APPROVER` and disclose only that
@@ -715,8 +722,14 @@ export function listSubmissionsFor(
  * function. Route snapshots are JSON on the row, so the current step cannot be evaluated in SQL;
  * SQL narrows to the pending rows and the authorisation decision happens here.
  *
- * `employee_id != ?` is not merely an optimisation: self-approval is structurally forbidden, so an
- * approver's own submissions could never belong in their queue.
+ * The two exclusions in the SQL are not optimisations. `checkMayAct` refuses an actor who is the
+ * submission's employee AND one who filed it, so in both cases the row could never be acted on by
+ * this approver and listing it would produce exactly the dead entry described above. Excluding
+ * them cannot hide anything actionable, because the refusal is unconditional: no route shape,
+ * delegation or later step makes such a row decidable by that person.
+ *
+ * `created_by` is nullable, so the filer test has to admit NULL rather than compare against it —
+ * `NULL != ?` is NULL, not true, and would silently drop every row that predates the column.
  */
 export function pendingApprovalsFor(
   sql: SqlStorage, approverId: EmployeeId, now: number,
@@ -726,8 +739,9 @@ export function pendingApprovalsFor(
       // submitted_at is caller-supplied and so is not monotonic; id breaks ties in insertion order.
       `SELECT * FROM submissions
        WHERE state = 'pending' AND employee_id != ?
+         AND (created_by IS NULL OR created_by != ?)
        ORDER BY submitted_at, id`,
-      approverId,
+      approverId, approverId,
     )
     .toArray();
 

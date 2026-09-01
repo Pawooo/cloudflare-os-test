@@ -547,6 +547,53 @@ describe("provenance", () => {
   });
 });
 
+describe("a filer's own queue", () => {
+  it("omits a submission the approver filed, since they can never act on it", async () => {
+    await singleStepRoute();
+    const id = await store.submitOvertime({
+      employeeId: worker, requestedFor: "2026-07-03", minutes: 120,
+      reason: "entered from the paper sheet", now: JUL,
+      department: "CONSTRUCTION", employmentType: null, createdBy: boss,
+    });
+
+    // Boss is the worker's manager and so the step-0 approver, but filed this one, so
+    // `checkMayAct` refuses them. A queue listing it would promise an action nobody can take.
+    await expect(() => store.actOnSubmission({
+      submissionId: id, actorId: boss, action: "approve", now: JUL + 1000,
+    })).rejects.toThrow(/KINTAI_FILED_BY_APPROVER/);
+
+    expect((await store.pendingApprovalsFor(boss, JUL + 1000)).map((r) => r.id))
+      .not.toContain(id);
+  });
+
+  it("still lists it for another approver at the same step", async () => {
+    // A second manager, so step 0 has someone other than the filer who can act. Excluding the
+    // filer must not amount to hiding the row from everyone.
+    await store.setReportingLine(worker, director, APR);
+    await singleStepRoute();
+    const id = await store.submitOvertime({
+      employeeId: worker, requestedFor: "2026-07-03", minutes: 120,
+      reason: "entered from the paper sheet", now: JUL,
+      department: "CONSTRUCTION", employmentType: null, createdBy: boss,
+    });
+
+    expect((await store.pendingApprovalsFor(director, JUL + 1000)).map((r) => r.id))
+      .toContain(id);
+    expect(await store.actOnSubmission({
+      submissionId: id, actorId: director, action: "approve", now: JUL + 1000,
+    })).toBe("approved");
+  });
+
+  it("keeps listing rows that predate the filer column", async () => {
+    await singleStepRoute();
+    const id = await submit();
+    // `created_by` is null here. `NULL != ?` is NULL rather than true, so a predicate without the
+    // IS NULL arm would silently drop every row filed before the column existed.
+    expect((await store.pendingApprovalsFor(boss, JUL + 1000)).map((r) => r.id))
+      .toContain(id);
+  });
+});
+
 describe("nobody approves what they filed", () => {
   // `createdBy` already lets one person file for another, so "the actor is not the employee" is
   // no longer the whole of "the actor did not originate this". These pin the other half: the hand
