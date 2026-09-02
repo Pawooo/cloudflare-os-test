@@ -61,6 +61,22 @@ async function fileRaw(input: {
   });
 }
 
+/**
+ * The message of a refusal, for the tests that compare two refusals against each other.
+ *
+ * `expect(...).rejects.toThrow(/regex/)` cannot express "these two say the SAME thing", which is
+ * the whole assertion where an error's job is to disclose nothing. The promise is created and
+ * awaited inside the `try`, so it is never left unhandled for a turn — see this file's header.
+ */
+async function refusal(call: () => Promise<unknown>): Promise<string> {
+  try {
+    await call();
+  } catch (err) {
+    return (err as Error).message;
+  }
+  throw new Error("expected this call to be refused, and it was not");
+}
+
 describe("the amendment record", () => {
   it("returns null for a submission that is not an amendment", async () => {
     expect(await store.getAmendment(999)).toBeNull();
@@ -197,6 +213,30 @@ describe("filing an amendment", () => {
       await expect(() => store.fileAmendment(correction(theirs)))
         .rejects.toThrow(/KINTAI_AMENDMENT_TARGET/);
       expect(await store.pendingAmendmentForPunch(theirs)).toBeNull();
+    });
+
+    it("refuses both with the SAME message, so the id space cannot be walked", async () => {
+      // The two refusals used to be distinguishable — "there is no punch with id N" versus
+      // "punch N does not belong to employee E" — which made this an oracle: anyone who can file
+      // an amendment could try ids and read back which punches exist in the whole company's
+      // record. Harmless while nothing outside these tests called `fileAmendment`; the session
+      // facet now does. The detail is useful to an administrator and dangerous to an employee, so
+      // it is gone from this path rather than reworded.
+      const other = await store.createEmployee({
+        employeeNumber: "E903", displayName: "Suzuki", joinedOn: "2026-04-01",
+      });
+      const theirs = await store.recordPunch({
+        employeeId: other, workDate: DAY, kind: "in", now: NINE_AM, source: "gadget",
+      });
+
+      // Byte-identical apart from the id the caller itself supplied, which discloses nothing it
+      // did not already know.
+      const missing = await refusal(() => store.fileAmendment(correction(theirs + 10_000)));
+      const borrowed = await refusal(() => store.fileAmendment(correction(theirs)));
+
+      expect(borrowed).toBe(missing.replace(String(theirs + 10_000), String(theirs)));
+      expect(borrowed).not.toMatch(new RegExp(`employee ${employeeId}|employee ${other}`));
+      expect(borrowed).not.toMatch(/does not exist|there is no punch|belong/);
     });
 
     it("refuses one that has already been superseded", async () => {

@@ -130,20 +130,32 @@ export type NewAddition = AmendmentFiling & {
 export type NewAmendment = NewCorrection | NewAddition;
 
 /**
- * The named punch is not one this employee can amend.
+ * The named punch is not one this employee can amend: there is no such punch, or there is and it
+ * is somebody else's.
  *
- * TASK 7 MUST COLLAPSE ITS TWO MESSAGES INTO ONE before any agent-reachable surface can file.
- * "There is no punch with id N" and "punch N does not belong to employee E" are distinguishable,
- * which makes this an oracle: a caller who can file amendments can walk the id space and learn
- * exactly which punch ids exist. Not reachable today — nothing outside this package's own tests
- * calls `fileAmendment` — which is the only reason it is recorded here rather than fixed now. The
- * detail is genuinely useful to an administrator and genuinely dangerous to an employee, so the
- * fix is one message on this path, not a cleverer one.
+ * ONE MESSAGE FOR BOTH, and the id is the only thing in it that varies — which the caller supplied
+ * and therefore already knows. It said which of the two it was until the session facet gained
+ * `requestPunchCorrection`, and that made it an oracle: a punch is named by id alone, so anybody
+ * who can file an amendment could walk the id space and read back exactly which punches exist in
+ * the whole company's record. It was recorded rather than fixed while nothing outside this
+ * package's own tests called `fileAmendment`; that condition is now gone.
+ *
+ * The distinction is genuinely useful to an administrator and genuinely dangerous to an employee,
+ * so the fix is one message on THIS path, not a cleverer one. An admin surface that wants the
+ * detail should ask its own question against `punches` rather than reading it out of a refusal
+ * meant for whoever happened to call.
+ *
+ * The constructor takes the id and writes the whole message, rather than taking a `detail` string:
+ * a caller-composed detail is how the two messages diverged in the first place, and there is now
+ * exactly one throw site in `describeCorrection` for the same reason.
  */
 export class AmendmentTargetError extends Error {
   readonly code = "KINTAI_AMENDMENT_TARGET";
-  constructor(detail: string) {
-    super(`KINTAI_AMENDMENT_TARGET: ${detail}`);
+  constructor(punchId: number) {
+    super(
+      `KINTAI_AMENDMENT_TARGET: punch ${punchId} is not one this employee can amend. Re-read the ` +
+      `day and name a punch it shows.`,
+    );
   }
 }
 
@@ -410,15 +422,15 @@ function describeCorrection(
     )
     .toArray()[0];
 
-  if (!target) {
-    throw new AmendmentTargetError(`there is no punch with id ${input.targetPunchId}.`);
-  }
-  // A punch is named by id alone, so without this an amendment is a way to reach into another
-  // person's record through a route resolved for the filer's own department.
-  if (target.employee_id !== input.employeeId) {
-    throw new AmendmentTargetError(
-      `punch ${input.targetPunchId} does not belong to employee ${input.employeeId}.`,
-    );
+  // ONE CONDITION, not two, and deliberately not two arms that happen to throw the same thing:
+  // "no such punch" and "somebody else's punch" must be indistinguishable to this caller (see
+  // `AmendmentTargetError`), and a single test cannot drift apart the way two messages did.
+  //
+  // The employee check is what stops an amendment being a way to reach into another person's
+  // record — a punch is named by id alone, and without this the correction would be filed against
+  // their punch through a route resolved for the filer's own department.
+  if (!target || target.employee_id !== input.employeeId) {
+    throw new AmendmentTargetError(input.targetPunchId);
   }
   // A superseded punch is history. An amendment must name the row that is current, or two requests
   // filed against the same original both succeed and whichever applies last silently wins.
