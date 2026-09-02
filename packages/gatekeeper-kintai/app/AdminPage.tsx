@@ -485,6 +485,17 @@ function RosterRow({
             夜勤 · punches filed against the shift’s start date
           </p>
         )}
+        {/* Here, and only here, for the same reason: a 労働基準法41条 determination is one of the
+            handful of exceptions HR has to be able to spot, and the alternative was pressing the
+            管理監督者 button to see whether it answered "already recorded". Deliberately NOT in
+            the readiness column — it is a fact about the person's overtime, not a verdict about
+            whether anybody can approve for them, and reporting it as the latter is the bug the
+            row beside this one was written to fix. */}
+        {employee.exempt && (
+          <p className="truncate text-xs text-kumo-subtle" data-testid="exempt">
+            管理監督者 · overtime bears no premium
+          </p>
+        )}
       </div>
 
       <div className="min-w-56 flex-1">
@@ -595,6 +606,8 @@ function approverReason(employee: RosterEntry, names: Map<number, string>): stri
   // which stopped counting an exemption: it exempts overtime from a premium and authorises nobody
   // to sign anything. Reported here it read as "Ready · 管理監督者" on a row whose punch
   // corrections nobody could have approved -- observed live on 2026-09-01, on the Admin record.
+  // The exemption is still on the row, as a neutral badge in the identity column beside 夜勤;
+  // what it no longer does is answer this question.
   if (employee.designated_approver_id !== null) {
     return `approver ${label(names, employee.designated_approver_id)}`;
   }

@@ -254,6 +254,9 @@ describe("AdminPage", () => {
       expect(issue.textContent).toContain("designated approver");
       expect(row(11).textContent).not.toContain("Ready");
       expect(row(11).querySelector('[data-action="approver-for-this"]')).not.toBeNull();
+      // And the determination itself is still on the row, in the identity column, where it does
+      // not depend on the row being broken to be visible.
+      expect(row(11).querySelector('[data-testid="exempt"]')).not.toBeNull();
     });
 
     it("shows an unlinked employee as incomplete for that reason too", async () => {
@@ -275,6 +278,10 @@ describe("AdminPage", () => {
       expect(row(SUZUKI.id).textContent).toContain("Ready · approver Tanaka");
       expect(text(`[data-employee="${SUZUKI.id}"] [data-testid="status"]`))
         .not.toContain("管理監督者");
+      // It IS on her row, though — on the identity line, beside the 夜勤 marker's place. The
+      // assertion above is scoped to the readiness column for exactly that reason: the two say
+      // different things, and only one of them is a verdict.
+      expect(row(SUZUKI.id).querySelector('[data-testid="exempt"]')).not.toBeNull();
       expect(row(STRANDED.id).textContent).not.toContain("Ready");
     });
 
@@ -313,6 +320,33 @@ describe("AdminPage", () => {
 
       expect(row(STRANDED.id).querySelector('[data-action="manager-for-this"]')).not.toBeNull();
     });
+
+    /**
+     * 管理監督者 is a 労働基準法41条 determination about one employee: it decides whether their
+     * overtime bears a premium. It is exactly the kind of exception HR has to be able to spot,
+     * and for a while the only way to discover an existing one from this screen was to press the
+     * 管理監督者 button and read `KINTAI_INVALID_INPUT: already recorded` back.
+     *
+     * So it is marked the way 夜勤 is: a neutral badge on the identity line, shown only when it
+     * is not the default, on a ready row and a broken one alike. Never in the readiness column —
+     * an exemption authorises nobody to sign, and the row above pins that it stays out of the
+     * verdict.
+     */
+    it("marks a 管理監督者 on the identity line, and says nothing on an ordinary employee",
+      async () => {
+        const officer = person({
+          id: 12, display_name: "Officer", linked: true, exempt: true,
+          designated_approver_id: TANAKA.id, approverReachable: true,
+        });
+        await render(<AdminPage api={adminApi({}, [TANAKA, officer])} />);
+
+        expect(row(12).querySelector('[data-testid="exempt"]')!.textContent)
+          .toContain("管理監督者");
+        // Ready, and readable as such: the badge explains the person, not the verdict.
+        expect(text('[data-employee="12"] [data-testid="status"]')).toBe("Ready · approver Tanaka");
+        // A badge on every row would be noise: almost nobody is 管理監督者.
+        expect(row(TANAKA.id).querySelector('[data-testid="exempt"]')).toBeNull();
+      });
 
     it("marks a shift-start employee on the roster, and says nothing on a calendar one", async () => {
       const crew = person({
