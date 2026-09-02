@@ -1,8 +1,15 @@
-import type { ApprovalAction, EmployeeId, SubmissionKind, SubmissionState } from "../types.js";
+import type {
+  ApprovalAction, EmployeeId, PunchKind, SubmissionKind, SubmissionState,
+} from "../types.js";
 import { NoRouteError, resolveRoute, type RouteSnapshot, type RouteStep } from "../routes.js";
 import { assertApproverReachable, hasAuthorityOver, managersAt } from "./org.js";
 import { workDateStart } from "../work-date.js";
 import { designatedApproverOf, employeeLabel, isExempt } from "./employees.js";
+// Read for the amendment half of `previewAct` only. `periods.ts` imports nothing but the
+// shared types, so this closes no cycle -- and the lock verdict has to be read HERE, in the
+// same call as the authority check, or the approver is shown a period state that had already
+// moved by the time they saw it.
+import { isLocked, periodOf } from "./periods.js";
 
 // The state machine, and the three invariants it exists to hold:
 //
@@ -601,6 +608,27 @@ export function checkMayAct(sql: SqlStorage, input: ActCheck): ActAuthority {
 }
 
 /**
+ * What one amendment asks to change, as an approver needs to see it.
+ *
+ * `currentOccurredAt` is what the target punch says NOW, read at the moment the approver is shown
+ * the question rather than copied at filing time: the whole judgement is "should this become that",
+ * and a stale left-hand side would be describing a comparison that is no longer the one being made.
+ * It is null exactly when `targetPunchId` is — the forgotten clock-out, where there is no punch to
+ * compare against and saying so is the honest answer.
+ *
+ * Read off the two tables rather than assembled from a caller's argument, like every other field
+ * of `ActPreview`.
+ */
+export type AmendmentDetail = {
+  targetPunchId: number | null;
+  /** What the punch says now. Null when the request is to add a punch that was never recorded. */
+  currentOccurredAt: number | null;
+  requestedOccurredAt: number;
+  workDate: string;
+  kind: PunchKind;
+};
+
+/**
  * What an approver reads before confirming a decision. Display only — nothing here is ever used to
  * decide anything, and it exists at all only because a human is about to be asked a question.
  */
@@ -616,6 +644,21 @@ export type ActPreview = {
   /** 1-based, for display: "step 2 of 3". */
   stepNumber: number;
   stepCount: number;
+  /**
+   * What this request would change, present only when the submission is an amendment.
+   *
+   * ABSENT IS THE DISCRIMINATOR, and `describeApproval` branches on it. An amendment's `minutes` is
+   * 0 by design — `fileAmendment` writes it and nothing ever reads it — so a description built from
+   * `minutes` alone told the approver they were signing off zero minutes of overtime. There is no
+   * value of `minutes` that could have carried this; the detail had to arrive.
+   *
+   * `lockedPeriod` is the one fact here that is NOT a property of the request: it is the state of
+   * the month the write would land in, named rather than flagged because the approver needs to read
+   * which month. Null means open. Applying an approved amendment is the only write in the system
+   * allowed into a closed period (see `actOnAmendment`), so this is the single thing about the
+   * decision an approver most needs told and least able to infer.
+   */
+  amendment?: AmendmentDetail & { lockedPeriod: string | null };
 };
 
 /**
@@ -661,7 +704,63 @@ export function previewAct(sql: SqlStorage, input: ActCheck): ActProbe {
     stepNumber: submission.current_step + 1,
     stepCount: snapshot.steps.length,
   };
+  if (submission.kind === "amendment") {
+    preview.amendment = amendmentPreview(sql, submission.id);
+  }
   return { preview, afterEventId: latestEventId(sql, submission.id) };
+}
+
+/**
+ * The amendment half of `previewAct`: what this request would change, plus whether the month it
+ * lands in is closed.
+ *
+ * NOT `getAmendment`, and the difference is the point. That function answers "what does the record
+ * say this request is", from one table. This answers "what is the approver being asked to agree
+ * to", which needs the target punch's CURRENT time joined in — the right-hand side of the
+ * comparison lives on the request, the left-hand side lives on the punch, and only the punch knows
+ * whether somebody has moved it since the request was filed.
+ *
+ * `LEFT JOIN`, because the target is null for an addition, and a null `currentOccurredAt` is the
+ * honest answer there rather than an absence to paper over.
+ *
+ * Read here rather than in `amendments.ts` because that module imports this one; asking it for this
+ * would close a cycle. The query is small and belongs to the question `previewAct` is answering.
+ */
+function amendmentPreview(
+  sql: SqlStorage, submissionId: number,
+): AmendmentDetail & { lockedPeriod: string | null } {
+  const row = sql
+    .exec<{
+      target_punch_id: number | null;
+      current_occurred_at: number | null;
+      requested_occurred_at: number;
+      work_date: string;
+      kind: PunchKind;
+    }>(
+      `SELECT a.target_punch_id,
+              t.occurred_at AS current_occurred_at,
+              a.occurred_at AS requested_occurred_at,
+              a.work_date, a.kind
+       FROM amendment_requests a
+       LEFT JOIN punches t ON t.id = a.target_punch_id
+       WHERE a.submission_id = ?`,
+      submissionId,
+    )
+    .toArray()[0];
+  if (!row) {
+    // A submission whose `kind` says amendment with no amendment row is a broken record, not a
+    // display problem. Uncoded on purpose: `isDomainRefusal` must not read this as a clean refusal.
+    throw new Error(`previewAct: submission ${submissionId} is an amendment with no request row`);
+  }
+  return {
+    targetPunchId: row.target_punch_id,
+    currentOccurredAt: row.current_occurred_at,
+    requestedOccurredAt: row.requested_occurred_at,
+    workDate: row.work_date,
+    kind: row.kind,
+    // Named, not flagged: the approver needs to read WHICH month. Null means open.
+    lockedPeriod: isLocked(sql, row.work_date) ? periodOf(row.work_date) : null,
+  };
 }
 
 export function actOnSubmission(sql: SqlStorage, input: ActInput): SubmissionState {

@@ -42,6 +42,7 @@ import { AdminKintaiApi, ViewerKintaiApi } from "./admin-api.js";
 import {
   assertMinutes, assertText, assertWorkDate, InvalidInputError, LIMITS,
 } from "./input.js";
+import { jstClockTime } from "./work-date.js";
 import TYPES_CODE from "./types.txt";
 import APP_HTML from "./generated/app.txt";
 
@@ -390,6 +391,114 @@ function quoted(text: string): string {
   return trimmed.split("\n").map((line) => `> ${line}`).join("\n");
 }
 
+/**
+ * What the approver reads before confirming a decision on a PUNCH CORRECTION.
+ *
+ * Split from `describeApproval`'s overtime text rather than parameterised, because almost nothing
+ * survives the translation. An amendment's `minutes` is 0 by design and there is no quantity to
+ * report; what a manager has to judge instead is a comparison — this punch says X, the employee
+ * says it should say Y — and whether they believe the reason for the difference. Rendering that
+ * through an overtime-shaped template produced "0 minutes of overtime", which is not a vague
+ * description of the right thing but a confident description of the wrong one.
+ *
+ * The closed-period line is the one fact here that is not a property of the request, and it is
+ * stated in both the title and the body on purpose. Applying an approved correction is the only
+ * write in this system permitted into a month that has been closed (see `actOnAmendment`), the
+ * approver cannot infer it from anything else they are shown, and a period is closed precisely
+ * when somebody has already been paid on its totals.
+ */
+function describeCorrectionApproval(
+  preview: ActPreview, action: ApprovalAction, comment?: string,
+): ActionDescription {
+  const amendment = preview.amendment!;
+  const { verb } = DECISIONS[action];
+  const requested = jstClockTime(amendment.requestedOccurredAt);
+  // An addition has no left-hand side. Saying "nothing on this day" is the honest comparison; a
+  // fabricated 00:00 would read as a punch that exists.
+  const current = amendment.currentOccurredAt === null
+    ? null
+    : jstClockTime(amendment.currentOccurredAt);
+  const change = current === null
+    ? `${amendment.kind} punch added at ${requested} (none recorded)`
+    : `${amendment.kind} punch ${current} → ${requested}`;
+  const closed = amendment.lockedPeriod === null
+    ? ""
+    : `, into the closed period ${amendment.lockedPeriod}`;
+  const step = preview.stepCount > 1
+    ? `\n- **Approval step:** ${preview.stepNumber} of ${preview.stepCount}`
+    : "";
+  const lockWarning = amendment.lockedPeriod === null
+    ? ""
+    : `\n**The period ${amendment.lockedPeriod} is closed.** Applying this changes a month that ` +
+      "has already been closed off, so any total already reported from it — including anything " +
+      "already paid — no longer matches the record. A correction is the only write allowed in.\n";
+
+  return {
+    title:
+      `${verb} the correction to ${preview.employeeName}'s attendance on ` +
+      `${amendment.workDate}: ${change}${closed}`,
+    description:
+      `**${preview.actorName}** is deciding a punch correction for ` +
+      `**${preview.employeeName}**. This is the sign-off itself, not a draft.\n` +
+      "\n" +
+      `- **Decision:** ${action}\n` +
+      `- **Employee:** ${preview.employeeName} (${preview.employeeNumber})\n` +
+      `- **Work date:** ${amendment.workDate}\n` +
+      `- **Punch:** ${amendment.kind}\n` +
+      `- **Currently recorded:** ${current ?? "nothing on this day"}\n` +
+      `- **Requested time:** ${requested}${step}\n` +
+      lockWarning +
+      "\n" +
+      "**The employee's stated reason**\n" +
+      "\n" +
+      `${quoted(preview.reason)}\n` +
+      "\n" +
+      `**${preview.actorName}'s comment**\n` +
+      "\n" +
+      `${quoted(comment ?? "")}\n` +
+      "\n" +
+      `${CORRECTION_DECISIONS[action].effect}\n` +
+      "\n" +
+      "Authority is re-checked against the organisation chart at the moment this is applied, so a " +
+      "decision that is no longer yours to make will be refused rather than performed. So is the " +
+      "correction itself: if the punch has been changed by someone else in the meantime, applying " +
+      "this is refused rather than overwriting them. It cannot be undone automatically — punches " +
+      "are never edited or deleted, so reversing an applied correction means filing another one.",
+    implementsRevert: false,
+    awaitDecision: true,
+    actionKind: { tag: "kintai.actOnSubmission", label: "Decide a punch correction" },
+  };
+}
+
+/**
+ * What each decision does to a punch correction, in place of `DECISIONS`' overtime effects.
+ *
+ * A separate table rather than a reworded one: overtime's text is pinned byte-for-byte by tests,
+ * and the two outcomes genuinely differ. Approving overtime makes minutes payable; approving a
+ * correction WRITES A PUNCH — appending a row to an append-only table, superseding one that stays
+ * permanently readable, and doing so even when the month is closed. That is a different promise and
+ * an approver should not read one and get the other.
+ */
+const CORRECTION_DECISIONS = {
+  approve: {
+    effect:
+      "Approving advances the correction to its next approval step, or — if this is the last step " +
+      "— applies it immediately: a new punch is written and the one it replaces is superseded. " +
+      "Both rows stay in the record permanently, so the original reading remains readable.",
+  },
+  reject: {
+    effect:
+      "Rejecting closes the request for good and changes no punch. The record keeps saying what it " +
+      "says now. The employee would have to file a fresh correction.",
+  },
+  return: {
+    effect:
+      "Returning sends the request back to the employee as a draft so they can change what they " +
+      "are asking for, and voids every approval collected so far — including any from other " +
+      "approvers. No punch is written.",
+  },
+} as const satisfies Record<ApprovalAction, { effect: string }>;
+
 const DECISIONS = {
   approve: {
     verb: "Approve",
@@ -430,6 +539,10 @@ const DECISIONS = {
 function describeApproval(
   preview: ActPreview, action: ApprovalAction, comment?: string,
 ): ActionDescription {
+  // Branch on what the submission IS, never on anything a caller passed. `preview.amendment` is
+  // populated by `previewAct` from the two tables, so a correction cannot be made to describe
+  // itself as overtime by any argument reaching this function.
+  if (preview.amendment) return describeCorrectionApproval(preview, action, comment);
   const decision = DECISIONS[action];
   const duration = `${preview.minutes} minutes (${formatDuration(preview.minutes)})`;
   const step = preview.stepCount > 1

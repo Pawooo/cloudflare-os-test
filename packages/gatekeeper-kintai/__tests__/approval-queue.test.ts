@@ -1145,6 +1145,138 @@ describe("an amendment that can no longer be applied", () => {
 //
 // Read as source text with `?raw` rather than by importing the classes: constructing them needs
 // arguments, and a list of classes to construct is the same hand-maintained list one level down.
+// ------------------------------------------------------------------------------------------------
+// What the approver is shown when the submission is a CORRECTION rather than overtime.
+//
+// An amendment's `minutes` is 0 by design — it has no minutes, and `fileAmendment` says so — so an
+// unconditionally overtime-shaped description asked a manager to confirm "0 minutes of overtime",
+// with nothing about which punch, what it says now, what it would say, or that the write lands in
+// a closed month. The comment on the overtime test above names the harm this is one step worse
+// than: a confirmation that MISdescribes the write is worse than one that says too little.
+describe("describing a correction to an approver", () => {
+  /**
+   * A worker with a manager, one clock-in at 09:00, and a pending correction of it to 08:30.
+   *
+   * `day` is a parameter because this file shares ONE store (`getByName("")`, matching production)
+   * so that queue state accumulates the way it really does — and a period lock is the one piece of
+   * that state no employee tag can scope. A test that closes a month closes it for every later
+   * test, so the test asserting an OPEN period has to be asked about a month nothing has locked.
+   */
+  async function stagedCorrection(bossTag = "desc-boss", day = AMEND_DAY) {
+    const nine = Date.parse(`${day}T00:00:00Z`);
+    const { employeeId: boss, accountId: bossAccount } = await linkedEmployee(bossTag);
+    const { employeeId: worker, accountId: workerAccount } = await linkedEmployee("desc-worker");
+    await store.setReportingLine(worker, boss, 0);
+    const punchId = await store.recordPunch({
+      employeeId: worker, workDate: day, kind: "in", now: nine, source: "gadget",
+    });
+    const submissionId = await store.fileAmendment({
+      employeeId: worker, targetPunchId: punchId, occurredAt: nine - 1800_000,
+      reason: "clocked in before the terminal woke up", now: nine + 20 * 3_600_000,
+      department: null, employmentType: null, createdBy: worker,
+    });
+    return { boss, bossAccount, worker, workerAccount, punchId, submissionId };
+  }
+
+  it("names the punch, what it says now and what it would say", async () => {
+    const { bossAccount, submissionId } = await stagedCorrection();
+
+    await sessionFor(bossAccount).actOnSubmission(submissionId, "approve", "checked the site log");
+    const submitted = (await lastSubmitted())!;
+
+    expect(submitted.title).toBe(
+      "Approve the correction to desc-worker's attendance on 2026-07-03: " +
+      "in punch 09:00 → 08:30",
+    );
+    for (const detail of [
+      "- **Work date:** 2026-07-03",
+      "- **Punch:** in",
+      "- **Currently recorded:** 09:00",
+      "- **Requested time:** 08:30",
+      "clocked in before the terminal woke up",  // why the record differs
+      "checked the site log",                    // the approver's own comment
+    ]) {
+      expect(submitted.description).toContain(detail);
+    }
+    // No minutes are invented. An amendment has none, and 0 is not a claim of nothing.
+    expect(submitted.title).not.toMatch(/overtime|minute/i);
+    expect(submitted.description).not.toMatch(/Overtime claimed|0 minutes/);
+    expect(submitted.actionKind).toEqual({
+      tag: "kintai.actOnSubmission",
+      label: "Decide a punch correction",
+    });
+  });
+
+  it("says no punch exists rather than showing a time that does not", async () => {
+    const { employeeId: boss, accountId: bossAccount } = await linkedEmployee("add-boss");
+    const { employeeId: worker } = await linkedEmployee("add-worker");
+    await store.setReportingLine(worker, boss, 0);
+    const submissionId = await store.fileAmendment({
+      employeeId: worker, targetPunchId: null, workDate: AMEND_DAY, kind: "out",
+      occurredAt: AMEND_SIX_PM, reason: "forgot to clock out",
+      now: AMEND_NINE + 20 * 3_600_000,
+      department: null, employmentType: null, createdBy: worker,
+    });
+
+    await sessionFor(bossAccount).actOnSubmission(submissionId, "approve");
+    const submitted = (await lastSubmitted())!;
+
+    expect(submitted.title).toBe(
+      "Approve the correction to add-worker's attendance on 2026-07-03: " +
+      "out punch added at 18:00 (none recorded)",
+    );
+    expect(submitted.description).toContain("- **Currently recorded:** nothing on this day");
+    expect(submitted.description).toContain("- **Requested time:** 18:00");
+  });
+
+  it("says plainly that the write lands in a closed period", async () => {
+    // The one thing an approver most needs to know and cannot infer: applying this is the only
+    // write in the system allowed into a month that has been closed.
+    // A month of its own: locking 2026-07 here would make the next test's "open period" claim
+    // false, and the failure would look like a bug in the description rather than in the fixture.
+    const { boss, bossAccount, submissionId } =
+      await stagedCorrection("locked-boss", "2026-06-03");
+    await store.lockPeriod("2026-06", boss, AMEND_NINE + 25 * 3_600_000);
+
+    await sessionFor(bossAccount).actOnSubmission(submissionId, "approve");
+    const submitted = (await lastSubmitted())!;
+
+    expect(submitted.title).toContain("into the closed period 2026-06");
+    expect(submitted.description).toContain("**The period 2026-06 is closed.**");
+  });
+
+  it("says nothing about a period that is open", async () => {
+    const { bossAccount, submissionId } = await stagedCorrection("open-boss");
+
+    await sessionFor(bossAccount).actOnSubmission(submissionId, "approve");
+    const submitted = (await lastSubmitted())!;
+
+    expect(submitted.title).not.toContain("closed");
+    expect(submitted.description).not.toContain("is closed");
+  });
+
+  it("names the decision it is staging, on a correction as on overtime", async () => {
+    const { bossAccount, submissionId } = await stagedCorrection("reject-boss");
+
+    await sessionFor(bossAccount).actOnSubmission(submissionId, "reject");
+
+    expect((await lastSubmitted())!.title).toMatch(/^Reject the correction/);
+  });
+
+  it("still describes overtime as overtime", async () => {
+    // The branch must be on what the submission IS, not on anything a caller says, and the
+    // overtime description is pinned byte-for-byte by the tests above this one.
+    const { bossAccount, submissionId } = await pendingUnderManager(90, "2026-07-03");
+
+    await sessionFor(bossAccount).actOnSubmission(submissionId, "approve");
+    const submitted = (await lastSubmitted())!;
+
+    expect(submitted.title).toContain("1h 30m of overtime");
+    expect(submitted.description).toContain("- **Overtime claimed:** 90 minutes (1h 30m)");
+    expect(submitted.actionKind).toMatchObject({ label: "Decide an overtime submission" });
+  });
+});
+
 describe("the terminal-refusal classification", () => {
   /**
    * Every coded refusal these two modules define, and whether the condition it names can ever

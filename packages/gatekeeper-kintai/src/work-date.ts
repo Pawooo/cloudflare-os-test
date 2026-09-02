@@ -17,6 +17,27 @@ export function jstWorkDate(now: number): string {
 }
 
 /**
+ * The JST clock time of an instant, for a human to read: `09:00`, or `09:00:17` when the seconds
+ * are not zero.
+ *
+ * Here rather than beside its one caller (`describeApproval`) because the `+9h` offset is this
+ * module's fact and a second copy of it is precisely the duplication `jstWorkDate` moved here to
+ * avoid. The two answers about one instant — which work date, and what time of day — are the same
+ * arithmetic read twice.
+ *
+ * Seconds are shown only when they are non-zero, and sub-second precision is dropped. A punch time
+ * a manager can judge is minute-granular, and `09:00:00` reads as machine output on a payroll
+ * confirmation — but a correction that moves a punch by seconds must not render as `09:00 → 09:00`,
+ * which would describe the write as a no-op. Requests differing by less than a second still render
+ * alike; `occurred_at` is compared at millisecond precision by the duplicate checks, so that gap
+ * is a display limit and not a correctness one.
+ */
+export function jstClockTime(at: number): string {
+  const clock = new Date(at + 9 * 60 * 60 * 1000).toISOString().slice(11, 19);
+  return clock.endsWith(":00") ? clock.slice(0, 5) : clock;
+}
+
+/**
  * The longest a shift may run before `shift_start` stops attributing punches to it: 16 hours.
  *
  * This is the guard that makes `shift_start` safe rather than dangerous. Without it a forgotten
