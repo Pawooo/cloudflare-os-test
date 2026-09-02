@@ -111,6 +111,22 @@ function insert(
  * Append a punch. Returns the existing punch's id when it lands inside the duplicate window with
  * the same kind, so a double-tap does not create a second record or surface an error.
  */
+/**
+ * KNOWN GAP, for whoever adds an import path. This suppression query has NO upper bound on
+ * `occurred_at`, unlike `openShiftWorkDate`, which carries `AND p.occurred_at <= now` with a
+ * comment naming `'import'` as the anticipated source. The two are documented as agreeing "term
+ * for term"; they do not, and this is the missing term.
+ *
+ * Reachable in both directions once any caller supplies an `occurred_at` that is not the current
+ * instant. Backwards: a backdated `now` matches a LATER punch on the day and returns its id while
+ * writing nothing — the defect that made `appendMissingPunch` necessary, measured in
+ * `__tests__/amendments.test.ts`. Forwards: a future-dated punch already on the day makes an
+ * ordinary live `recordPunch` return that punch's id and write nothing.
+ *
+ * Not fixed here because the live path (`commitPunch`) always passes the real clock, where the
+ * unbounded match can only ever find a genuine double-tap, and `punches.source` already carries
+ * `'import'` for a path that does not exist yet. Add `AND p.occurred_at <= ?` when it does.
+ */
 export function recordPunch(sql: SqlStorage, input: NewPunch): number {
   const recent = sql
     .exec<{ id: number }>(

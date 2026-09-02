@@ -287,12 +287,21 @@ const APPLY_OUTCOME_UNKNOWN =
  * exactly this reason (see `UnlinkedAccountError`'s own comment). The message is the only place a
  * caller can read the code from.
  *
- * The safety of this rests on a second property, which holds today and must keep holding: NOTHING
- * in `actOnSubmission` after the `INSERT INTO approval_events` throws at all. Every `KINTAI_`-coded
- * error it can raise comes from the prologue, before any write. If a future change adds a
- * `KINTAI_`-prefixed throw AFTER the insert, this function would classify a write that DID land as
- * a clean refusal, return the row to `pending`, and invite a retry that double-applies it — the
- * dangerous direction, and the one the claim machinery exists to prevent.
+ * The safety of this rests on a second property, which holds today and must keep holding: no
+ * `KINTAI_`-CODED error is raised after the `INSERT INTO approval_events`. Every coded error on
+ * this path comes from a prologue, before any write. If a future change adds a `KINTAI_`-prefixed
+ * throw AFTER the insert, this function would classify a write that DID land as a clean refusal,
+ * return the row to `pending`, and invite a retry that double-applies it — the dangerous
+ * direction, and the one the claim machinery exists to prevent.
+ *
+ * Note what the property is NOT: things after the insert certainly do throw. Via the amendment
+ * branch, `actOnSubmission` delegates to `actOnAmendment`, which writes a punch and updates
+ * `amendment_requests` after the approval event, and both can fail — `correctPunch`'s invariant
+ * checks, a raw SQLite error. Those throws are UNCODED, so they land in the `APPLY_OUTCOME_UNKNOWN`
+ * branch below, which is the honest disposition for a turn whose writes are genuinely half-done
+ * (verified: a throw mid-turn does NOT roll back earlier writes in that turn). It is the coded/
+ * uncoded split that is load-bearing here, not the absence of throws. `actOnAmendment` states the
+ * same property from its own side and orders every coded refusal before its first write to keep it.
  *
  * KNOWN FRAGILITY, so the next person meets it here rather than in production: the match is
  * anchored at the start of the message. If anything in the RPC path ever starts prefixing error

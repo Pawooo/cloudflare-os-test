@@ -229,6 +229,14 @@ export class AmendmentTargetSupersededError extends Error {
  * legal and have to be, because a double-tap outside the suppression window is a real record. So
  * the only place it can be caught is here, against the day as it stands in the same turn of the
  * input gate as the write.
+ *
+ * MATCHED ON THE EXACT INSTANT, deliberately, and the residue is caught rather than ignored. Two
+ * amendments landing `out` punches a second apart both apply -- there is no window that separates
+ * "two requests converged" from "the terminal was tapped twice", and guessing at one would refuse
+ * real records. What makes the narrow line acceptable is that the leftover is VISIBLE: a day with
+ * two clock-outs pairs wrongly, so `dayAnomalies` returns `orphan_out` and the day surfaces to a
+ * human instead of quietly mis-paying. That is this package's policy everywhere else -- flag it,
+ * do not guess at it (see `long_span`).
  */
 export class AmendmentDuplicatesPunchError extends Error {
   readonly code = "KINTAI_AMENDMENT_DUPLICATE_PUNCH";
@@ -531,6 +539,16 @@ export function actOnAmendment(sql: SqlStorage, input: ActInput): AmendmentDecis
     assertStillApplicable(sql, submission.employee_id, amendment);
   }
 
+  // Read BEFORE `actOnSubmission`, and the ordering is the whole reason this line is here rather
+  // than beside its use below. `getSubmission` throws `SubmissionNotFoundError`, whose message
+  // begins `KINTAI_NOT_FOUND:` -- a coded throw, and every coded throw on this path must happen
+  // before the approval event is written or `isDomainRefusal` will read a write that DID land as a
+  // clean refusal and invite a retry. It is unreachable either way (the row was read microseconds
+  // ago in this same turn, and nothing anywhere deletes from `submissions`), but a coded throw
+  // sitting textually after the insert is the exact shape this function's contract forbids, and
+  // being unreachable is a weaker guarantee than being impossible.
+  const submission = getSubmission(sql, input.submissionId);
+
   const state = actOnSubmission(sql, input);
   if (state !== "approved") return { state, appliedPunchId: null };
 
@@ -541,7 +559,6 @@ export function actOnAmendment(sql: SqlStorage, input: ActInput): AmendmentDecis
     return { state, appliedPunchId: amendment.applied_punch_id };
   }
 
-  const submission = getSubmission(sql, input.submissionId);
   const punch: NewPunch = {
     employeeId: submission.employee_id,
     // THE WORK DATE COMES FROM THE REQUEST, and is not re-derived from `occurred_at` through
@@ -576,7 +593,12 @@ export function actOnAmendment(sql: SqlStorage, input: ActInput): AmendmentDecis
       );
 
   sql.exec(
-    `UPDATE amendment_requests SET applied_punch_id = ? WHERE submission_id = ?`,
+    // `AND applied_punch_id IS NULL` makes this a real compare-and-set rather than a write that
+    // merely happens to be guarded. The JS check above already makes a second write unreachable,
+    // and this costs nothing -- but the guarantee then lives in the statement itself, which is what
+    // a reader auditing "can this link be overwritten?" will actually look at.
+    `UPDATE amendment_requests SET applied_punch_id = ?
+     WHERE submission_id = ? AND applied_punch_id IS NULL`,
     punchId, input.submissionId,
   );
 

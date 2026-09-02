@@ -694,6 +694,79 @@ describe("applying an approved amendment", () => {
     };
   }
 
+  // ----------------------------------------------------------------------------------------------
+  // The three cases the review found undertested. None of them is a new rule; each one pins a claim
+  // the code already makes in prose.
+  // ----------------------------------------------------------------------------------------------
+
+  it("shows why appendMissingPunch cannot be recordPunch", async () => {
+    // THE COUNTERFACTUAL behind `appendMissingPunch`'s doc comment, which says "Measured, not
+    // theorised -- see __tests__/amendments.test.ts" and until now cited nothing.
+    //
+    // `recordPunch`'s suppression has no upper bound on `occurred_at`: it takes the LATEST
+    // unsuperseded punch of that kind on the day with `occurred_at > now - 60s`. Backdate `now`
+    // and a later punch matches. Nothing is written and the caller is handed a punch id that has
+    // nothing to do with what it asked for -- which, on the amendment path, `applied_punch_id`
+    // would then record as the punch the request wrote.
+    const sevenPm = await punchAt(NINE_AM + 10 * 3600_000, "out");
+
+    const returned = await store.recordPunch({
+      employeeId, workDate: DAY, kind: "out", now: SIX_PM, source: "gadget",
+    });
+
+    expect(returned).toBe(sevenPm);
+    expect((await store.currentPunches(employeeId, DAY)).filter((p) => p.kind === "out"))
+      .toHaveLength(1);
+  });
+
+  it("writes nothing on the non-final signature of an all_of step", async () => {
+    const second = await store.createEmployee({
+      employeeNumber: "M911", displayName: "Ito", joinedOn: "2026-04-01",
+    });
+    await store.setReportingLine(employeeId, second, APR);
+    // Scoped to a department, and the filing names it. A route with no department TIES the
+    // catch-all `applySchema` seeds and loses the tie on id, so an unscoped route here would
+    // silently exercise the seeded single-step `any_of` and this test would assert nothing.
+    await store.createRoute({
+      name: "both-managers", department: "CONSTRUCTION",
+      steps: [{ rule: "all_of", approverKind: "manager", approverEmployeeId: null }],
+    });
+    const submissionId = await store.fileAmendment(
+      addition({ department: "CONSTRUCTION" }),
+    );
+
+    expect(await approve(submissionId, managerId)).toBe("pending");
+    expect((await store.getAmendment(submissionId))!.applied_punch_id).toBeNull();
+    expect(await store.currentPunches(employeeId, DAY)).toHaveLength(0);
+
+    // Only the signature that finalises the step writes -- and it is that signer whose name lands
+    // in `amended_by`, which is what the doc comment means by "whoever finalised it".
+    expect(await approve(submissionId, second, DECIDED_AT + 1000)).toBe("approved");
+    const punches = await store.currentPunches(employeeId, DAY);
+    expect(punches).toHaveLength(1);
+    expect(punches[0].amended_by).toBe(second);
+  });
+
+  it("reports unappliable ahead of stale when a decision is both", async () => {
+    // Documented precedence: `assertStillApplicable` runs before `actOnSubmission`, so it answers
+    // first. Both leave nothing written and both end with a human deciding again, so the ordering
+    // is not load-bearing -- but it is observable, and an untested documented ordering is one
+    // refactor away from being a lie.
+    const punchId = await punchAt(NINE_AM);
+    const submissionId = await store.fileAmendment(correction(punchId));
+    // Someone fixes the punch by hand: the request can never apply now.
+    await store.correctPunch(
+      punchId, { employeeId, workDate: DAY, kind: "in", now: NINE_AM - 60_000, source: "admin" },
+      managerId, "fixed at the terminal", DECIDED_AT - 1000,
+    );
+
+    await expect(() => store.actOnSubmission({
+      submissionId, actorId: managerId, action: "approve", now: DECIDED_AT,
+      // A marker that is ALSO stale: nothing has been acted on, so the real value is 0.
+      expectedAfterEventId: 99,
+    })).rejects.toThrow(/KINTAI_AMENDMENT_TARGET_SUPERSEDED/);
+  });
+
   function approve(
     submissionId: number, actorId = managerId, now = DECIDED_AT,
   ): Promise<SubmissionState> {
