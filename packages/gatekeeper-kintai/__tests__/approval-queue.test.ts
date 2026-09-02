@@ -1,5 +1,10 @@
 import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
+import { isTerminalRefusal } from "../src/kintai.js";
+// The two store modules whose coded refusals can reach `applyAction`, as source text. See
+// "the terminal-refusal classification" at the foot of this file for why they are read this way.
+import submissionsSource from "../src/store/submissions.ts?raw";
+import amendmentsSource from "../src/store/amendments.ts?raw";
 
 // `actOnSubmission` is the one side-effecting operation Kintai exposes to a Gadget, and it is a
 // manager's approval of somebody else's pay. `Gatekeeper.startSession` requires that side-effecting
@@ -1015,5 +1020,217 @@ describe("a staged decision the world has moved past", () => {
 
     expect((await store.getSubmission(submissionId)).state).toBe("approved");
     expect(await store.approvalEvents(submissionId)).toHaveLength(2);
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// Refusals that no amount of waiting can turn into an appliable decision.
+//
+// `KINTAI_STALE_DECISION` was the first of these and the reason `isTerminalRefusal` exists: a
+// permanent refusal left `pending` composes with staging's dedupe into a dead end with a
+// success-shaped exit. The amendment path added two more of exactly that shape —
+// `punches` is append-only, `supersedes_id` is never cleared and an added punch is never removed,
+// so neither `KINTAI_AMENDMENT_TARGET_SUPERSEDED` nor `KINTAI_AMENDMENT_DUPLICATE_PUNCH` can ever
+// revert — and both errors' own text ends "Reject it". Left `pending`, that instruction was
+// impossible to follow: the rejection was refused as `KINTAI_DECISION_CONFLICT`, the identical
+// approval deduplicated onto the dead row and RESOLVED without queueing anything, and the manager
+// had no route out at all.
+//
+// Exercised through the real facet, because that is where the classification lives: the store
+// refuses identically whichever way the facet reads the refusal.
+const AMEND_DAY = "2026-07-03";
+/** 09:00 JST on `AMEND_DAY`. */
+const AMEND_NINE = Date.parse("2026-07-03T00:00:00Z");
+/** 18:00 JST on `AMEND_DAY`, where a forgotten clock-out belongs. */
+const AMEND_SIX_PM = AMEND_NINE + 9 * 3_600_000;
+/** When the manager decides: after every punch and filing instant used below. */
+const AMEND_DECIDED = AMEND_NINE + 30 * 3_600_000;
+
+/** A worker with a manager, one clock-in on `AMEND_DAY`, and the account ids for both. */
+async function amendableWorker() {
+  const { employeeId: boss, accountId: bossAccount } = await linkedEmployee("amend-boss");
+  const { employeeId: worker, accountId: workerAccount } = await linkedEmployee("amend-worker");
+  await store.setReportingLine(worker, boss, 0);
+  const punchId = await store.recordPunch({
+    employeeId: worker, workDate: AMEND_DAY, kind: "in", now: AMEND_NINE, source: "gadget",
+  });
+  return { boss, bossAccount, worker, workerAccount, punchId };
+}
+
+describe("an amendment that can no longer be applied", () => {
+  it("frees the approver to reject a correction whose target was fixed by hand", async () => {
+    const { boss, bossAccount, worker, punchId } = await amendableWorker();
+    const submissionId = await store.fileAmendment({
+      employeeId: worker, targetPunchId: punchId, occurredAt: AMEND_NINE - 1800_000,
+      reason: "clocked in before the terminal woke up", now: AMEND_NINE + 20 * 3_600_000,
+      department: null, employmentType: null, createdBy: worker,
+    });
+    const session = sessionFor(bossAccount);
+    await session.actOnSubmission(submissionId, "approve", "looks right");
+
+    // An administrator corrects the punch directly while the request sits in the queue. Nothing
+    // reserves a target against `correctPunch`, and `punches_supersedes_unique` allows only one
+    // live successor — so this correction can never be written, now or ever.
+    await store.correctPunch(
+      punchId,
+      { employeeId: worker, workDate: AMEND_DAY, kind: "in", now: AMEND_NINE - 60_000,
+        source: "admin" },
+      boss, "fixed by hand", AMEND_NINE + 26 * 3_600_000,
+    );
+
+    await expect(() => overseerFor(bossAccount).applyAction(1))
+      .rejects.toThrow(/KINTAI_AMENDMENT_TARGET_SUPERSEDED/);
+    // Terminal: the row carries the refusal's own text rather than "outcome unknown", so a second
+    // callback repeats what happened instead of re-asking a store that will never say yes.
+    await expect(() => overseerFor(bossAccount).applyAction(1))
+      .rejects.toThrow(/KINTAI_AMENDMENT_TARGET_SUPERSEDED/);
+
+    // ...and the disposal the error itself prescribes is now available. `failed` is outside the
+    // open-decision index, so the rejection stages immediately instead of colliding with the dead
+    // approval as `KINTAI_DECISION_CONFLICT`.
+    await session.actOnSubmission(submissionId, "reject", "already fixed directly");
+    expect((await host.readQueue()).actions).toHaveLength(2);
+    await overseerFor(bossAccount).applyAction(2);
+    expect((await store.getSubmission(submissionId)).state).toBe("rejected");
+    expect(await store.getAmendment(submissionId)).toMatchObject({ applied_punch_id: null });
+
+    // The dead decision is still clearable the ordinary way.
+    expect(await overseerFor(bossAccount).rejectAction(1)).toBeUndefined();
+  });
+
+  it("frees the approver to reject an addition the day has since acquired", async () => {
+    const { bossAccount, worker } = await amendableWorker();
+    const submissionId = await store.fileAmendment({
+      employeeId: worker, targetPunchId: null, workDate: AMEND_DAY, kind: "out",
+      occurredAt: AMEND_SIX_PM, reason: "forgot to clock out",
+      now: AMEND_NINE + 20 * 3_600_000,
+      department: null, employmentType: null, createdBy: worker,
+    });
+    const session = sessionFor(bossAccount);
+    await session.actOnSubmission(submissionId, "approve");
+
+    // The punch arrives by another route. Two punches at one instant are legal — a double-tap
+    // outside the suppression window is a real record — so nothing in the database would refuse
+    // the write; the day would simply carry the same event twice, forever.
+    await store.recordPunch({
+      employeeId: worker, workDate: AMEND_DAY, kind: "out", now: AMEND_SIX_PM, source: "gadget",
+    });
+
+    await expect(() => overseerFor(bossAccount).applyAction(1))
+      .rejects.toThrow(/KINTAI_AMENDMENT_DUPLICATE_PUNCH/);
+    await expect(() => overseerFor(bossAccount).applyAction(1))
+      .rejects.toThrow(/KINTAI_AMENDMENT_DUPLICATE_PUNCH/);
+
+    await session.actOnSubmission(submissionId, "reject", "the punch is already there");
+    await overseerFor(bossAccount).applyAction(2);
+    expect((await store.getSubmission(submissionId)).state).toBe("rejected");
+    expect((await store.currentPunches(worker, AMEND_DAY))
+      .filter((punch) => punch.kind === "out")).toHaveLength(1);
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// The classification itself, kept exhaustive by construction.
+//
+// The defect above was not a bug in a branch; it was a hand-maintained list of one code in
+// `kintai.ts` while the codes themselves were being added two modules away. Nothing failed, and
+// nothing could have: no test knew the list was meant to be complete.
+//
+// So this is the test that now fails. It reads the two store modules whose coded refusals can
+// reach `applyAction` — `actOnSubmission` and the amendment path it dispatches to — finds every
+// `KINTAI_` code they define, and requires each one to appear in the table below AND for
+// `isTerminalRefusal` to agree with it. Adding a coded refusal to either module without deciding,
+// in writing, whether waiting can ever make it appliable is therefore a red suite rather than a
+// deadlocked approver.
+//
+// Read as source text with `?raw` rather than by importing the classes: constructing them needs
+// arguments, and a list of classes to construct is the same hand-maintained list one level down.
+describe("the terminal-refusal classification", () => {
+  /**
+   * Every coded refusal these two modules define, and whether the condition it names can ever
+   * revert. `terminal` means it cannot: the staged decision is failed rather than left `pending`,
+   * so the manager can decide again immediately instead of deadlocking against staging's dedupe.
+   *
+   * Codes that no longer reach `applyAction` at all are still classified, and classified as
+   * `retryable` — the disposition they have today. Where that is because the refusal is
+   * unreachable rather than because it can revert, the comment says so, because "unreachable" is
+   * a fact about today's callers and the classification has to survive one of them changing.
+   */
+  const DISPOSITION: Record<string, "terminal" | "retryable"> = {
+    // --- submissions.ts
+    // Both operands are immutable — a submission's `employee_id` and `created_by` never change,
+    // and the staged row's actor is fixed and re-verified — so neither can become true after
+    // staging, and staging itself refused them through the same prologue.
+    KINTAI_SELF_APPROVAL: "retryable",
+    KINTAI_FILED_BY_APPROVER: "retryable",
+    // `submitOvertime` only; no decision path raises it.
+    KINTAI_EXEMPT_EMPLOYEE: "retryable",
+    // The genuinely retryable one, and the reason the default is `pending`: a reporting line is
+    // restored or a designated approver is set, and the same decision then applies.
+    KINTAI_NOT_AUTHORIZED: "retryable",
+    // Nothing deletes submissions, so this is permanent in practice — but a decision on a
+    // submission that does not exist has nothing to double-apply, and `rejectAction` clears the
+    // row. Left retryable because failing it changes nothing an approver can observe.
+    KINTAI_NOT_FOUND: "retryable",
+    // Reverts: a returned submission is resubmitted and is `pending` again. Pinned through the
+    // facet by "leaves a refused action retryable rather than consuming it".
+    KINTAI_INVALID_TRANSITION: "retryable",
+    // The marker is `MAX(approval_events.id)`, which is monotonic. The comparison that failed
+    // fails identically forever.
+    KINTAI_STALE_DECISION: "terminal",
+
+    // --- amendments.ts
+    // Filing-time refusals. `fileAmendment` raises all four before any submission exists, so no
+    // staged decision can meet them.
+    KINTAI_AMENDMENT_TARGET: "retryable",
+    KINTAI_PUNCH_ALREADY_AMENDED: "retryable",
+    KINTAI_DUPLICATE_PUNCH: "retryable",
+    KINTAI_DUPLICATE_AMENDMENT: "retryable",
+    // `supersedes_id` is never cleared and `punches` is append-only, so the successor that made
+    // this correction unwritable is there for good.
+    KINTAI_AMENDMENT_TARGET_SUPERSEDED: "terminal",
+    // Same reason: the punch that would be duplicated is never removed.
+    KINTAI_AMENDMENT_DUPLICATE_PUNCH: "terminal",
+  };
+
+  const DEFINED = [
+    ...submissionsSource.matchAll(/readonly code = "(KINTAI_[A-Z_]+)"/g),
+    ...amendmentsSource.matchAll(/readonly code = "(KINTAI_[A-Z_]+)"/g),
+  ].map((match) => match[1]);
+
+  it("has an entry for every coded refusal the two modules define", () => {
+    // Guard the guard: a regex that matched nothing would make this test vacuously green.
+    expect(DEFINED.length).toBeGreaterThan(10);
+    for (const code of DEFINED) {
+      expect(
+        Object.keys(DISPOSITION),
+        `${code} is a coded refusal with no entry in DISPOSITION. Decide whether the condition ` +
+        `it names can ever revert: if it cannot, it belongs in isTerminalRefusal, or a staged ` +
+        `decision meeting it deadlocks the approver.`,
+      ).toContain(code);
+    }
+  });
+
+  it("has no entry for a code that no longer exists", () => {
+    // The other direction, so a renamed code is caught rather than silently reclassified: the
+    // rename would add an unclassified code above and leave a dead entry here.
+    for (const code of Object.keys(DISPOSITION)) expect(DEFINED).toContain(code);
+  });
+
+  it("classifies each of them the way the table says", () => {
+    for (const [code, disposition] of Object.entries(DISPOSITION)) {
+      expect(isTerminalRefusal(new Error(`${code}: whatever the message says`)), code)
+        .toBe(disposition === "terminal");
+    }
+  });
+
+  it("matches the code only at the start of the message", () => {
+    // The anchoring `isDomainRefusal` documents as load-bearing, held here too: a refusal that
+    // merely mentions a terminal code in its prose must not be failed terminally.
+    expect(isTerminalRefusal(
+      new Error("KINTAI_NOT_AUTHORIZED: see also KINTAI_STALE_DECISION for the other case"),
+    )).toBe(false);
+    expect(isTerminalRefusal(new Error("KINTAI_STALE_DECISIONS: not this code"))).toBe(false);
+    expect(isTerminalRefusal("KINTAI_STALE_DECISION: not an Error at all")).toBe(false);
   });
 });

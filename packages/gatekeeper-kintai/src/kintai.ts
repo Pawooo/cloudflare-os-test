@@ -307,27 +307,64 @@ function isDomainRefusal(err: unknown): boolean {
 }
 
 /**
- * Was this refusal the staleness guard specifically?
+ * The coded refusals of a decision that NO amount of waiting can turn into an appliable one.
  *
- * THE ONE DOMAIN REFUSAL THAT IS NOT RETRYABLE, and so the one exception to "a clean refusal goes
- * back to `pending`". Every other refusal describes something that can change back — an account is
- * re-linked, a reporting line is restored — so a retry can succeed and the Overseer offers one. A
- * stale decision cannot: the marker is `MAX(approval_events.id)`, which is monotonic, so the
- * comparison that failed will fail identically forever.
- *
- * Left `pending` it is worse than merely stuck, because it composes with staging's dedupe: the
- * identical decision re-issued would deduplicate onto the unappliable row and return SUCCESS
- * without queueing anything, a different one would be refused with `KINTAI_DECISION_CONFLICT`, and
- * the session has no discard — so an agent following this error's own advice to decide again finds
- * both routes closed and its retry silently doing nothing. Failing the row is what reopens them:
+ * THE EXCEPTIONS TO "a clean refusal goes back to `pending`". Almost every refusal describes
+ * something that can change back — a reporting line is restored, a returned submission is
+ * resubmitted — so a retry can succeed and the Overseer offers one. These cannot, and left
+ * `pending` they are worse than merely stuck, because a permanent refusal composes with staging's
+ * dedupe: the identical decision re-issued deduplicates onto the unappliable row and returns
+ * SUCCESS without queueing anything, a different one is refused with `KINTAI_DECISION_CONFLICT`,
+ * and the session has no discard — so an approver following the error's own advice finds both
+ * routes closed and their retry silently doing nothing. Failing the row is what reopens them:
  * `failed` is outside `staged_approvals_open`, so the manager can stage a fresh decision on the
  * same submission immediately, and `rejectAction` still clears it.
  *
+ * Why each one is permanent:
+ *
+ *  - `KINTAI_STALE_DECISION` — the marker is `MAX(approval_events.id)`, which is monotonic, so
+ *    the comparison that failed will fail identically forever.
+ *  - `KINTAI_AMENDMENT_TARGET_SUPERSEDED` — `punches` is append-only and `supersedes_id` is never
+ *    cleared, so the successor that made the correction unwritable is there for good.
+ *    `punches_supersedes_unique` admits one live successor per punch and it is taken.
+ *  - `KINTAI_AMENDMENT_DUPLICATE_PUNCH` — same table, same reason: the punch this request would
+ *    duplicate is never removed.
+ *
+ * The last two are why this is a LIST and no longer a question about staleness. Both were shipped
+ * as ordinary domain refusals, both are as permanent as staleness is, and both end their own
+ * message with "Reject it" — an instruction the approver could not follow, because the rejection
+ * collided with the dead approval as `KINTAI_DECISION_CONFLICT`. Nothing failed when they were
+ * added, because the only statement that this list was meant to be complete was prose.
+ *
+ * IT IS NOW A TESTED CLAIM. `__tests__/approval-queue.test.ts` reads the two store modules whose
+ * coded refusals reach `applyAction`, finds every code they define, and requires each one to be
+ * classified there and this function to agree — so a new coded refusal cannot be added without
+ * someone deciding, in writing, which side of this line it falls on. Add a permanent one here and
+ * to that table together; the suite is red until you do.
+ *
  * Matched on the message for the same reason `isDomainRefusal` is — `code` does not survive the
- * RPC boundary, so every error in this package repeats its code in its text.
+ * RPC boundary, so every error in this package repeats its code in its text — and anchored at the
+ * start for the same reason too. See `isDomainRefusal`'s KNOWN FRAGILITY: a wrapper that prefixed
+ * messages would stop every one of these being recognised.
  */
-function isStaleRefusal(err: unknown): boolean {
-  return err instanceof Error && /^KINTAI_STALE_DECISION:/.test(err.message);
+const TERMINAL_REFUSAL_CODES = [
+  "KINTAI_STALE_DECISION",
+  "KINTAI_AMENDMENT_TARGET_SUPERSEDED",
+  "KINTAI_AMENDMENT_DUPLICATE_PUNCH",
+] as const;
+
+/**
+ * Is this refusal one a retry can never resolve? See `TERMINAL_REFUSAL_CODES`.
+ *
+ * Exported for the exhaustiveness test described there, and for nothing else — the same reason
+ * `applyStagedApprovalsSchema` is exported. A caller outside this module has no use for it: the
+ * disposition it decides is `applyAction`'s, and there is only one `applyAction`.
+ */
+export function isTerminalRefusal(err: unknown): boolean {
+  return (
+    err instanceof Error &&
+    TERMINAL_REFUSAL_CODES.some((code) => err.message.startsWith(`${code}:`))
+  );
 }
 
 /** Minutes as a human reads them: `45m`, `2h`, `1h 30m`. */
@@ -1455,11 +1492,13 @@ export class KintaiGatekeeper
       });
     } catch (err) {
       if (isDomainRefusal(err)) {
-        if (isStaleRefusal(err)) {
-          // Terminal, and deliberately so — see `isStaleRefusal`. Nothing landed here either (the
-          // guard is checked before the write), so this is not `APPLY_OUTCOME_UNKNOWN`: the row
-          // carries the refusal's own text, which names what happened and tells the reader to
-          // decide again. It records WHY this one cannot be retried when every sibling can.
+        if (isTerminalRefusal(err)) {
+          // Terminal, and deliberately so — see `TERMINAL_REFUSAL_CODES`. Nothing landed here
+          // either (every one of them is raised before the write), so this is not
+          // `APPLY_OUTCOME_UNKNOWN`: the row carries the refusal's own text, which names what
+          // happened and tells the reader what to do instead — decide again, or reject the request
+          // that can no longer be applied. It records WHY this one cannot be retried when most of
+          // its siblings can, and frees the submission for the decision the text asks for.
           this.#setState(action, "failed", (err as Error).message);
           this.#prune();
           throw err;
