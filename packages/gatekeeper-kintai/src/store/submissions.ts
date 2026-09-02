@@ -543,9 +543,11 @@ type ActAuthority = {
  * THE authority prologue for acting on a submission. There is exactly one of these, deliberately.
  *
  * `actOnSubmission` (the write), `previewAct` (the stage-time probe, run before an approval is
- * queued for a human to confirm) and `pendingApprovalsFor` (the queue) all call this. They are not
- * three checks kept in agreement — they are one check called three times, because this project has
- * already shipped a real bug from copies of "who may approve" drifting apart: `authorize`,
+ * queued for a human to confirm), `pendingApprovalsFor` (the queue) and `actOnAmendment` (which
+ * runs it ahead of its own apply-time re-validation, so that an approver learns nothing about a
+ * day they may not act on) all call this. They are not four checks kept in agreement — they are
+ * one check called four times, because this project has already shipped a real bug from copies of
+ * "who may approve" drifting apart: `authorize`,
  * `requiredApprovers` and `hasReachableApprover` each answer a version of it, and one of them
  * silently disagreed for weeks, letting a designated approver sign for an employee who already had
  * a manager. A probe, or a queue, written separately from the write is exactly how that happens
@@ -578,7 +580,7 @@ type ActAuthority = {
  * it, and fails closed without disclosing anything, so the corrupt row reports that rather than
  * its own state.
  */
-function checkMayAct(sql: SqlStorage, input: ActCheck): ActAuthority {
+export function checkMayAct(sql: SqlStorage, input: ActCheck): ActAuthority {
   const submission = getSubmission(sql, input.submissionId);
   if (input.actorId === submission.employee_id) throw new SelfApprovalError();
   // After the employee check, never before it: somebody who is both gets the more specific

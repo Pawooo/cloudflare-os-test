@@ -1,8 +1,10 @@
 // A request to change one punch, and the reads that answer "what does this submission ask for?"
 // and "is this punch already spoken for?".
 //
-// One responsibility: what a correction request IS. Nothing here knows about RPC, sessions, or
-// authority beyond what it is handed.
+// One responsibility: what a correction request IS, and what applying one does. Nothing here knows
+// about RPC or sessions. It does ask `checkMayAct` who may decide a request -- the same prologue
+// the approval stack uses, called rather than restated -- but it never decides who may FILE for
+// whom: that is the session's question and this module is handed the answer in `createdBy`.
 //
 // `amendment_requests` is the one table in this feature that is not append-only. `applied_punch_id`
 // goes from NULL to a value exactly once, when the approval that applies the request writes its
@@ -14,8 +16,11 @@ import {
 } from "../input.js";
 import { resolveRoute } from "../routes.js";
 import { assertApproverReachable } from "./org.js";
-import { assertSatisfiable } from "./submissions.js";
-import type { EmployeeId, PunchKind } from "../types.js";
+import {
+  actOnSubmission, assertSatisfiable, checkMayAct, getSubmission, type ActInput,
+} from "./submissions.js";
+import { appendMissingPunch, correctPunch, type NewPunch } from "./punches.js";
+import type { EmployeeId, PunchKind, SubmissionState } from "../types.js";
 
 /**
  * A request to change one punch, hung off the submission that carries its approval.
@@ -183,6 +188,60 @@ export class DuplicateAmendmentError extends Error {
 }
 
 /**
+ * APPLY TIME: the punch this correction names was superseded after the request was filed, so the
+ * correction can never be written.
+ *
+ * Filing refuses a target that is ALREADY superseded (`PunchAlreadyAmendedError`) and reserves a
+ * target against a second undecided request (`pendingAmendmentForPunch`), but neither can stop a
+ * `correctPunch` from some other surface superseding the target while the request sits in a queue.
+ * Nothing re-checked it, so the request stayed approvable and could never land:
+ * `punches_supersedes_unique` allows one live successor per punch, and the second attempt came
+ * back as a raw `UNIQUE constraint failed` -- after the approval had been recorded. Measured; see
+ * `__tests__/amendments.test.ts`.
+ *
+ * Its own code rather than `PunchAlreadyAmendedError`'s, because the audiences differ. That one
+ * tells a FILER to name the row that is current. This one tells an APPROVER that the request in
+ * front of them is unappliable through no fault of theirs, and that rejecting it is the disposal.
+ */
+export class AmendmentTargetSupersededError extends Error {
+  readonly code = "KINTAI_AMENDMENT_TARGET_SUPERSEDED";
+  constructor(punchId: number, successorId: number) {
+    super(
+      `KINTAI_AMENDMENT_TARGET_SUPERSEDED: punch ${punchId} was corrected by punch ` +
+      `${successorId} after this request was filed, so this correction can no longer be applied. ` +
+      `Reject it; a fresh correction can be filed against punch ${successorId}.`,
+    );
+  }
+}
+
+/**
+ * APPLY TIME: writing this request would put a second identical punch on the day.
+ *
+ * THE CONVERGING-REQUESTS CASE, and it is not exotic. An `out` at 17:00 exists. An ADDITION of an
+ * `out` at 18:00 is filed and accepted, because nothing is at 18:00. A CORRECTION moving the 17:00
+ * punch to 18:00 is filed and accepted too, because its target is a different punch with no
+ * request against it. Filing's two uniqueness queries are structurally blind to each other -- one
+ * keys on a punch id, the other on a `(day, kind, instant)` tuple that was clean when it was
+ * asked -- so approving both leaves the day carrying two `out` punches at one instant, which is
+ * exactly what `DuplicatePunchError` refuses at filing time. Reproduced before this check existed.
+ *
+ * Nothing in the database would refuse it, and nothing should: two punches at one instant are
+ * legal and have to be, because a double-tap outside the suppression window is a real record. So
+ * the only place it can be caught is here, against the day as it stands in the same turn of the
+ * input gate as the write.
+ */
+export class AmendmentDuplicatesPunchError extends Error {
+  readonly code = "KINTAI_AMENDMENT_DUPLICATE_PUNCH";
+  constructor(kind: PunchKind, workDate: string, punchId: number) {
+    super(
+      `KINTAI_AMENDMENT_DUPLICATE_PUNCH: punch ${punchId} already records a ${kind} at that ` +
+      `time on ${workDate}, so applying this request would record the same event twice. It was ` +
+      `not there when the request was filed. Reject this request.`,
+    );
+  }
+}
+
+/**
  * What the target punch says about itself, and whether anything has replaced it.
  *
  * `superseded` is `EXISTS`, not a join: a punch has at most one live successor (the partial unique
@@ -261,16 +320,18 @@ function undecidedAdditionOf(
  *  - who may file for whom. `createdBy` is recorded, not authorised: authority over another
  *    employee is the session's question, and this function is handed the answer.
  *
- * KNOWN, AND TASK 6's TO CLOSE — neither is caught here, and both must be re-validated at APPLY
- * time, where one Durable Object turn can see the day as it actually stands:
+ * NOT CAUGHT HERE, AND CLOSED AT APPLY TIME INSTEAD, where one Durable Object turn can see the day
+ * as it actually stands — see `assertStillApplicable`, and the two error classes for how each of
+ * these becomes true only after a request has been accepted:
  *  - CONVERGING REQUESTS. An addition of `out` at 18:00 and a correction moving an existing `out`
  *    to 18:00 both pass filing: the two uniqueness queries look at different things (one at
  *    punches, one at undecided additions) and neither can see the other. Approve both and the day
- *    ends up with two identical punches.
+ *    ends up with two identical punches (`AmendmentDuplicatesPunchError`).
  *  - A TARGET SUPERSEDED OUT OF BAND. `describeCorrection` refuses a target that is already
  *    superseded, but nothing stops a direct `correctPunch` from superseding it AFTER the request
  *    is filed. The request stays queued and approvable and can never apply, because
- *    `punches_supersedes_unique` refuses the second successor.
+ *    `punches_supersedes_unique` refuses the second successor
+ *    (`AmendmentTargetSupersededError`).
  */
 export function fileAmendment(sql: SqlStorage, input: NewAmendment): number {
   // The only account of why history differs from what was recorded, so it may not be blank; and
@@ -397,4 +458,175 @@ function describeAddition(
   if (pending !== null) throw new DuplicateAmendmentError(pending);
 
   return { workDate: input.workDate, kind: input.kind };
+}
+
+/**
+ * What acting on an amendment answers: the submission's new state, and the punch it wrote.
+ *
+ * `appliedPunchId` is non-null on exactly the one decision that approved the request. Every other
+ * decision -- a step advanced, a rejection, a return -- reports null, because nothing was written.
+ */
+export type AmendmentDecision = {
+  state: SubmissionState;
+  appliedPunchId: number | null;
+};
+
+/**
+ * Act on an amendment, and write its punch in the SAME turn of the input gate if that decision
+ * approved it.
+ *
+ * ONE FUNCTION, NOT A FACET MAKING TWO CALLS, and that is the whole point of it. Deciding the
+ * approval and writing the punch it authorises are one fact; as two store calls they are two turns
+ * of the Durable Object's input gate, with the decision made in the first and acted on in the
+ * second. This package has already shipped and fixed a double-apply race of exactly that shape --
+ * a claim taken after an outgoing RPC (see `KintaiGatekeeper.applyAction`). There is no `await`
+ * anywhere from the recomputation of the decision to the `UPDATE` that records the link, and there
+ * must never be one: an `await` reopens the gate and the guarantee becomes theatre.
+ *
+ * THE PERIOD LOCK IS DELIBERATELY NOT CONSULTED. This is the one write in the system allowed into
+ * a closed month -- it is what `PeriodLockedError` has been pointing users at, and it is why locks
+ * live in the facet rather than in the store's write functions. Neither this function nor anything
+ * wrapping it may call `assertWritable`.
+ *
+ * THE TWO APPLY-TIME RE-VALIDATIONS RUN BEFORE ANYTHING IS WRITTEN, not after the approval. That
+ * ordering is load-bearing twice over:
+ *
+ *  - `isDomainRefusal` in `kintai.ts` classifies any `KINTAI_`-coded error out of this path as
+ *    "refused outright, nothing landed, safe to retry", and that classification is only sound
+ *    while nothing after `INSERT INTO approval_events` raises one. A coded throw after the
+ *    approval had been recorded would be read as a clean refusal and invite a retry of a write
+ *    that DID land -- the dangerous direction, and the one that comment warns about by name.
+ *  - the alternative dispositions are all worse. Recording the approval and then failing leaves a
+ *    submission whose history says it was approved and whose day says otherwise. Marking it
+ *    `rejected` writes a verdict the approver did not give, into an append-only table. Sending it
+ *    back to `draft` fabricates a `return` nobody performed. Leaving it `pending` with nothing
+ *    written is the only outcome that neither invents a decision nor claims a correction that was
+ *    never applied; the approver is told what happened, and the disposal is an ordinary rejection
+ *    or the employee's withdrawal. Only `approve` is guarded for that reason -- refusing every
+ *    verb would leave an unappliable request in the queue with no way to clear it.
+ *
+ * `checkMayAct` is run first so that the re-validation, which reads the employee's day, is only
+ * reached by somebody who may act on that submission at all; `actOnSubmission` then runs it again
+ * for itself. Two runs of one pure read in one synchronous turn, not two implementations -- the
+ * ordering rule that check's own doc comment sets out (authority before anything that names a
+ * fact about the submission) applies to these refusals too. One consequence worth knowing: an
+ * approval that is BOTH stale and unappliable now reports unappliable, because
+ * `expectedAfterEventId` is compared inside `actOnSubmission`, after this. Both outcomes end with
+ * a human deciding again, and neither writes anything.
+ *
+ * `amendment_requests` is the one table in this feature that is not append-only:
+ * `applied_punch_id` goes from NULL to a value exactly once, here. That is a link being completed,
+ * not history being rewritten, and the punch it points at is itself append-only.
+ */
+export function actOnAmendment(sql: SqlStorage, input: ActInput): AmendmentDecision {
+  const amendment = getAmendment(sql, input.submissionId);
+  if (!amendment) {
+    // Not a coded error: the store routes here only for `kind = 'amendment'`, and an amendment
+    // submission without its companion row is a broken invariant rather than a caller's mistake.
+    throw new Error(`actOnAmendment: submission ${input.submissionId} has no amendment record`);
+  }
+
+  if (input.action === "approve" && amendment.applied_punch_id === null) {
+    const { submission } = checkMayAct(sql, input);
+    assertStillApplicable(sql, submission.employee_id, amendment);
+  }
+
+  const state = actOnSubmission(sql, input);
+  if (state !== "approved") return { state, appliedPunchId: null };
+
+  // Belt and braces. `actOnSubmission` returns "approved" exactly once -- a second decision finds
+  // the submission out of `pending` -- so this is unreachable as the code stands. It is written
+  // anyway because this is a payroll write and the cost of being wrong is a duplicated punch.
+  if (amendment.applied_punch_id !== null) {
+    return { state, appliedPunchId: amendment.applied_punch_id };
+  }
+
+  const submission = getSubmission(sql, input.submissionId);
+  const punch: NewPunch = {
+    employeeId: submission.employee_id,
+    // THE WORK DATE COMES FROM THE REQUEST, and is not re-derived from `occurred_at` through
+    // `workDateFor`. An amendment writes history; it does not re-run attribution. The request
+    // named a day, an approver agreed to that day, and for a `shift_start` employee the day a
+    // 06:00 clock-out belongs to is the previous one anyway -- re-deriving it would move the punch
+    // somewhere nobody approved. For a correction the day is the target punch's own, copied at
+    // filing time, and `correctPunch` refuses a mismatch against the row it supersedes.
+    workDate: amendment.work_date,
+    kind: amendment.kind,
+    // The instant the punch should have carried, not the instant this is being written. See
+    // `NewPunch.now`, and `recordedAt` below for the other half of that pair.
+    now: amendment.occurred_at,
+    // Not a punch anybody tapped, and the record says so.
+    source: "amendment",
+  };
+
+  // `input.actorId` -- the APPROVER -- is the amender, deliberately. `amended_by` is the account
+  // of whose authority admitted this row to payroll, and the approver is who is accountable for
+  // the record differing from what was first recorded. Recording the filer instead would let an
+  // employee stamp their own name on a punch they changed about themselves, which is the reading
+  // the whole approval stack exists to make false; who ASKED is `submissions.created_by`, one join
+  // away, and on a multi-person step every signature is in `approval_events`.
+  //
+  // `input.now` is the moment the amendment was approved and is passed as `recordedAt`, never as
+  // the occurrence: "when was this correction entered?" is the fact an auditor needs about a punch
+  // that appeared in a closed month.
+  const punchId = amendment.target_punch_id === null
+    ? appendMissingPunch(sql, punch, input.actorId, submission.reason, input.now)
+    : correctPunch(
+        sql, amendment.target_punch_id, punch, input.actorId, submission.reason, input.now,
+      );
+
+  sql.exec(
+    `UPDATE amendment_requests SET applied_punch_id = ? WHERE submission_id = ?`,
+    punchId, input.submissionId,
+  );
+
+  return { state, appliedPunchId: punchId };
+}
+
+/**
+ * Can this approved request still be written? Read against the day as it stands, in the turn that
+ * would write it.
+ *
+ * Neither of these can be answered at filing time, because neither is true then -- see
+ * `AmendmentTargetSupersededError` and `AmendmentDuplicatesPunchError` for how each becomes true
+ * while the request waits in a queue. Both throw before anything is written; see `actOnAmendment`
+ * for why that is not negotiable.
+ *
+ * Deliberately NOT re-checked here: that the target still exists and still belongs to the employee
+ * (`punches` is append-only and neither column is ever updated, so filing's answer cannot go
+ * stale), that `occurred_at` is not in the future (time only moves the bound further away), and
+ * that an approver is reachable (one is acting).
+ */
+function assertStillApplicable(
+  sql: SqlStorage, employeeId: number, amendment: AmendmentRequest,
+): void {
+  if (amendment.target_punch_id !== null) {
+    const successor = sql
+      .exec<{ id: number }>(
+        `SELECT id FROM punches WHERE supersedes_id = ? LIMIT 1`, amendment.target_punch_id,
+      )
+      .toArray()[0];
+    if (successor) {
+      throw new AmendmentTargetSupersededError(amendment.target_punch_id, successor.id);
+    }
+  }
+
+  // `p.id IS NOT ?` rather than `<>`, because `IS NOT` is null-safe: for an addition the parameter
+  // is NULL and the clause is true of every row, which is what is wanted. For a correction it
+  // excludes the target itself, which is legitimately sitting at its own instant and is about to
+  // be superseded by this very write.
+  const clash = sql
+    .exec<{ id: number }>(
+      `SELECT p.id FROM punches p
+       WHERE p.employee_id = ? AND p.work_date = ? AND p.kind = ? AND p.occurred_at = ?
+         AND p.id IS NOT ?
+         AND NOT EXISTS (SELECT 1 FROM punches s WHERE s.supersedes_id = p.id)
+       LIMIT 1`,
+      employeeId, amendment.work_date, amendment.kind, amendment.occurred_at,
+      amendment.target_punch_id,
+    )
+    .toArray()[0];
+  if (clash) {
+    throw new AmendmentDuplicatesPunchError(amendment.kind, amendment.work_date, clash.id);
+  }
 }

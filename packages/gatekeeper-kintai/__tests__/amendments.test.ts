@@ -645,3 +645,362 @@ describe("filing an amendment", () => {
     });
   });
 });
+
+/**
+ * The decision and the punch it writes, in one turn of the input gate.
+ *
+ * Everything here goes through `store.actOnSubmission`, which is the only entry point: the store
+ * reads the submission's kind for itself and routes an amendment through `actOnAmendment`. There
+ * is deliberately no second RPC to apply an approved request — a facet that fetched the kind, then
+ * decided, then wrote would have the gate open between each pair, which is the shape of the
+ * double-apply race this package has already shipped and fixed once.
+ */
+describe("applying an approved amendment", () => {
+  let managerId: number;
+
+  /** When the manager decides. After every punch and every filing instant used below. */
+  const DECIDED_AT = NINE_AM + 30 * 3600_000;
+  /** 18:00 JST on DAY — where the converging-requests case makes two punches collide. */
+  const SIX_PM = NINE_AM + 9 * 3600_000;
+
+  beforeEach(async () => {
+    managerId = await store.createEmployee({
+      employeeNumber: "M910", displayName: "Sato", joinedOn: "2026-04-01",
+    });
+    await store.setReportingLine(employeeId, managerId, APR);
+  });
+
+  async function punchAt(occurredAt: number, kind: PunchKind = "in"): Promise<number> {
+    return store.recordPunch({
+      employeeId, workDate: DAY, kind, now: occurredAt, source: "gadget",
+    });
+  }
+
+  function correction(punchId: number, over: Partial<NewCorrection> = {}): NewCorrection {
+    return {
+      employeeId, targetPunchId: punchId, occurredAt: NINE_AM - 1800_000,
+      reason: "clocked in before the terminal woke up", now: NINE_AM + 20 * 3600_000,
+      department: null, employmentType: null, createdBy: employeeId,
+      ...over,
+    };
+  }
+
+  function addition(over: Partial<NewAddition> = {}): NewAddition {
+    return {
+      employeeId, targetPunchId: null, workDate: DAY, kind: "out",
+      occurredAt: SIX_PM, reason: "forgot to clock out", now: NINE_AM + 20 * 3600_000,
+      department: null, employmentType: null, createdBy: employeeId,
+      ...over,
+    };
+  }
+
+  function approve(
+    submissionId: number, actorId = managerId, now = DECIDED_AT,
+  ): Promise<SubmissionState> {
+    return store.actOnSubmission({ submissionId, actorId, action: "approve", now });
+  }
+
+  it("supersedes the target punch and links the result", async () => {
+    const original = await punchAt(NINE_AM);
+    const submissionId = await store.fileAmendment(correction(original));
+
+    expect(await approve(submissionId)).toBe("approved");
+
+    const current = await store.currentPunches(employeeId, DAY);
+    expect(current).toHaveLength(1);
+    expect(current[0]).toMatchObject({
+      occurred_at: NINE_AM - 1800_000,
+      // Not a punch anybody tapped, and the record says so.
+      source: "amendment",
+      supersedes_id: original,
+      // The APPROVER, not the filer. `amended_by` is the account of whose authority admitted this
+      // punch to payroll; who asked for it is `submissions.created_by`.
+      amended_by: managerId,
+      amend_reason: "clocked in before the terminal woke up",
+      // When the correction was ENTERED, which is not when the punch occurred. Conflating the two
+      // would erase the one fact an auditor most needs about a backdated write.
+      recorded_at: DECIDED_AT,
+    });
+
+    expect(await store.getAmendment(submissionId))
+      .toMatchObject({ applied_punch_id: current[0].id });
+
+    // The original row is history, not garbage: still readable, still saying what was first
+    // recorded. `punches` is append-only.
+    const all = await store.allPunches(employeeId, DAY);
+    expect(all.map((punch) => punch.id)).toEqual([original, current[0].id]);
+    expect(all[0]).toMatchObject({ occurred_at: NINE_AM, source: "gadget", amended_by: null });
+  });
+
+  it("writes a missing punch that has no target", async () => {
+    await punchAt(NINE_AM);
+    const submissionId = await store.fileAmendment(addition());
+
+    expect(await approve(submissionId)).toBe("approved");
+
+    const current = await store.currentPunches(employeeId, DAY);
+    expect(current.map((punch) => punch.kind)).toEqual(["in", "out"]);
+    expect(current[1]).toMatchObject({
+      occurred_at: SIX_PM,
+      source: "amendment",
+      // Nothing to supersede — that is the whole difference between the two cases — but the
+      // amender and the reason are still recorded, because they are the only in-table account of
+      // why a punch nobody made exists at all.
+      supersedes_id: null,
+      amended_by: managerId,
+      amend_reason: "forgot to clock out",
+      recorded_at: DECIDED_AT,
+    });
+    // The forgotten clock-out, closed. This is what `long_span` has had no outlet for.
+    expect(await store.workedMinutes(employeeId, DAY)).toBe(540);
+    expect(await store.dayAnomalies(employeeId, DAY)).toEqual([]);
+    expect(await store.getAmendment(submissionId))
+      .toMatchObject({ applied_punch_id: current[1].id });
+  });
+
+  it("writes the added punch even when a later punch of the same kind sits on the day", async () => {
+    // `recordPunch` must not be the write on this path, and this is why. Its duplicate
+    // suppression asks for the LATEST unsuperseded punch of the same kind on the day with
+    // `occurred_at > now - 60s` and NO upper bound; with `now` set to a backdated occurrence, the
+    // 19:00 `out` below matches. `recordPunch` would then return that punch's id, write nothing,
+    // and the request would record it as the punch it applied — a day left wrong and an
+    // `applied_punch_id` pointing at a punch this amendment did not write.
+    await punchAt(NINE_AM);
+    const late = await punchAt(NINE_AM + 10 * 3600_000, "out");
+    const submissionId = await store.fileAmendment(addition());
+
+    expect(await approve(submissionId)).toBe("approved");
+
+    const applied = (await store.getAmendment(submissionId))?.applied_punch_id;
+    expect(applied).not.toBe(late);
+    const current = await store.currentPunches(employeeId, DAY);
+    expect(current).toHaveLength(3);
+    expect(current.find((punch) => punch.id === applied))
+      .toMatchObject({ occurred_at: SIX_PM, source: "amendment" });
+  });
+
+  it("writes nothing while the submission is still pending a second approver", async () => {
+    const bossId = await store.createEmployee({
+      employeeNumber: "B910", displayName: "Ito", joinedOn: "2026-04-01",
+    });
+    // Scoped to a department so it outranks the seeded catch-all.
+    await store.createRoute({
+      name: "two-step", department: "CONSTRUCTION",
+      steps: [
+        { rule: "any_of", approverKind: "manager", approverEmployeeId: null },
+        { rule: "any_of", approverKind: "employee", approverEmployeeId: bossId },
+      ],
+    });
+    const original = await punchAt(NINE_AM);
+    const submissionId = await store.fileAmendment(
+      correction(original, { department: "CONSTRUCTION" }),
+    );
+
+    expect(await approve(submissionId)).toBe("pending");
+
+    // A step advanced, not a decision reached. Applying here would write a punch the second
+    // approver had not agreed to and could no longer refuse.
+    expect(await store.getAmendment(submissionId)).toMatchObject({ applied_punch_id: null });
+    expect((await store.currentPunches(employeeId, DAY)).map((punch) => punch.occurred_at))
+      .toEqual([NINE_AM]);
+
+    expect(await approve(submissionId, bossId, DECIDED_AT + 3600_000)).toBe("approved");
+    expect((await store.currentPunches(employeeId, DAY))[0].occurred_at)
+      .toBe(NINE_AM - 1800_000);
+  });
+
+  it("writes nothing when the decision is a rejection", async () => {
+    const original = await punchAt(NINE_AM);
+    const submissionId = await store.fileAmendment(correction(original));
+
+    expect(await store.actOnSubmission({
+      submissionId, actorId: managerId, action: "reject", now: DECIDED_AT,
+    })).toBe("rejected");
+
+    expect(await store.getAmendment(submissionId)).toMatchObject({ applied_punch_id: null });
+    expect((await store.currentPunches(employeeId, DAY))[0].occurred_at).toBe(NINE_AM);
+  });
+
+  it("applies into a locked period, which stays shut to everything else", async () => {
+    const original = await punchAt(NINE_AM);
+    // Closed BEFORE the request is filed, which is the story `PeriodLockedError` tells: the direct
+    // write is refused and the user is sent here. Filing is not blocked by the lock either —
+    // refusing to even ask would leave a closed month permanently wrong.
+    await store.lockPeriod("2026-07", managerId, NINE_AM + 25 * 3600_000);
+    const submissionId = await store.fileAmendment(correction(original));
+
+    expect(await approve(submissionId)).toBe("approved");
+    expect((await store.currentPunches(employeeId, DAY))[0].occurred_at)
+      .toBe(NINE_AM - 1800_000);
+
+    // And the lock is unmoved. `assertWritable` is the check the facet runs before an ordinary
+    // punch — locks live in the facet rather than in the store's write functions precisely so
+    // that this one path can go round them, so this is that refusal, immediately afterwards.
+    expect(await store.isLocked(DAY)).toBe(true);
+    await expect(() => store.assertWritable(DAY)).rejects.toThrow(/KINTAI_PERIOD_LOCKED/);
+  });
+
+  it("produces one punch when two approvers act concurrently", async () => {
+    const bossId = await store.createEmployee({
+      employeeNumber: "B911", displayName: "Ito", joinedOn: "2026-04-01",
+    });
+    // Two live managers of the employee, and the seeded route is a single `any_of` manager step,
+    // so either of them alone approves it.
+    await store.setReportingLine(employeeId, bossId, APR);
+    const original = await punchAt(NINE_AM);
+    const submissionId = await store.fileAmendment(correction(original));
+
+    const outcomes = await Promise.allSettled([
+      approve(submissionId, managerId),
+      approve(submissionId, bossId),
+    ]);
+
+    // One decides; the other finds the submission already out of `pending`. The decision and the
+    // write are one synchronous run inside one turn of the input gate, so there is no instant at
+    // which both callers can see it as undecided.
+    expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
+    const refused = outcomes.find((outcome) => outcome.status === "rejected");
+    expect((refused as PromiseRejectedResult).reason.message)
+      .toMatch(/KINTAI_INVALID_TRANSITION/);
+
+    const all = await store.allPunches(employeeId, DAY);
+    expect(all.filter((punch) => punch.source === "amendment")).toHaveLength(1);
+    expect(all).toHaveLength(2);
+  });
+
+  it("does not write a second punch when the request is already linked to one", async () => {
+    // Belt and braces. `actOnSubmission` returns "approved" once, so this is unreachable through
+    // the path as it stands — the state is set by hand below because nothing in the package can
+    // produce it. It is pinned anyway: this is a payroll write, and the cost of being wrong is a
+    // duplicated punch.
+    const original = await punchAt(NINE_AM);
+    const submissionId = await store.fileAmendment(correction(original));
+    const decoy = await punchAt(NINE_AM + 3600_000, "break_start");
+    await runInDurableObject(store, (instance) => {
+      instance.sql.exec(
+        `UPDATE amendment_requests SET applied_punch_id = ? WHERE submission_id = ?`,
+        decoy, submissionId,
+      );
+    });
+
+    expect(await approve(submissionId)).toBe("approved");
+
+    expect(await store.getAmendment(submissionId)).toMatchObject({ applied_punch_id: decoy });
+    expect((await store.allPunches(employeeId, DAY))
+      .filter((punch) => punch.source === "amendment")).toHaveLength(0);
+  });
+
+  /**
+   * Two things filing cannot catch, because neither is true when the request is filed.
+   *
+   * Both are refused BEFORE the approval event is written, which is the whole reason they are
+   * checked where they are: `isDomainRefusal` in `kintai.ts` classifies any `KINTAI_`-coded error
+   * out of this path as "refused outright, nothing landed, retryable", and that classification is
+   * only safe while nothing after the insert throws one. So the submission stays `pending` with
+   * no approval recorded, and disposal is a rejection or a withdrawal — an approval that cannot
+   * be applied is not recorded as one.
+   */
+  describe("a request that can no longer be applied", () => {
+    it("refuses an approval whose target was corrected by another route", async () => {
+      const original = await punchAt(NINE_AM);
+      const submissionId = await store.fileAmendment(correction(original));
+      // Superseded AFTER filing, so filing's own check could not have seen it. `correctPunch` is
+      // reachable from the admin surface, and nothing reserves a target against it.
+      await store.correctPunch(
+        original,
+        { employeeId, workDate: DAY, kind: "in", now: NINE_AM - 60_000, source: "admin" },
+        managerId, "fixed by hand", NINE_AM + 26 * 3600_000,
+      );
+
+      // `punches_supersedes_unique` would refuse the write anyway (see `__tests__/punches.test.ts`
+      // — a second correction of one row throws a raw constraint violation). A coded refusal
+      // before anything is written is the difference between an approver being told what happened
+      // and an approver being handed a 500 after their approval was recorded.
+      await expect(() => approve(submissionId))
+        .rejects.toThrow(/KINTAI_AMENDMENT_TARGET_SUPERSEDED/);
+
+      expect(await store.getAmendment(submissionId)).toMatchObject({ applied_punch_id: null });
+      expect(await store.approvalEvents(submissionId)).toEqual([]);
+      expect((await store.getSubmission(submissionId)).state).toBe("pending");
+      expect(await store.currentPunches(employeeId, DAY)).toHaveLength(1);
+    });
+
+    it("refuses an approval that would duplicate a punch another amendment added", async () => {
+      // THE CONVERGING-REQUESTS CASE. Both requests pass filing and neither uniqueness query can
+      // see the other: one keys on a punch id, the other on a (day, kind, instant) tuple that was
+      // clean when it was asked.
+      await punchAt(NINE_AM);
+      const atFive = await punchAt(NINE_AM + 8 * 3600_000, "out");
+      const added = await store.fileAmendment(addition());
+      const moved = await store.fileAmendment(
+        correction(atFive, { occurredAt: SIX_PM, reason: "clocked out early by mistake" }),
+      );
+
+      expect(await approve(added)).toBe("approved");
+
+      // The day now has an 18:00 `out`. Applying the correction as well would put two `out`
+      // punches at one instant on it — exactly what `DuplicatePunchError` refuses at filing time,
+      // arriving by a route filing cannot see. The database would not refuse it: two punches at
+      // one instant are legal, and have to be.
+      await expect(() => approve(moved, managerId, DECIDED_AT + 3600_000))
+        .rejects.toThrow(/KINTAI_AMENDMENT_DUPLICATE_PUNCH/);
+
+      expect((await store.getSubmission(moved)).state).toBe("pending");
+      expect(await store.approvalEvents(moved)).toEqual([]);
+      expect(await store.getAmendment(moved)).toMatchObject({ applied_punch_id: null });
+      expect((await store.currentPunches(employeeId, DAY))
+        .filter((punch) => punch.kind === "out").map((punch) => punch.occurred_at))
+        .toEqual([NINE_AM + 8 * 3600_000, SIX_PM]);
+    });
+
+    it("still lets an approver reject it", async () => {
+      // The disposal route, and the reason the re-validation guards approvals only. Refusing every
+      // decision would leave an unappliable request in the queue for good, clearable only by the
+      // employee withdrawing it.
+      const original = await punchAt(NINE_AM);
+      const submissionId = await store.fileAmendment(correction(original));
+      await store.correctPunch(
+        original,
+        { employeeId, workDate: DAY, kind: "in", now: NINE_AM - 60_000, source: "admin" },
+        managerId, "fixed by hand", NINE_AM + 26 * 3600_000,
+      );
+
+      expect(await store.actOnSubmission({
+        submissionId, actorId: managerId, action: "reject", now: DECIDED_AT,
+      })).toBe("rejected");
+      expect(await store.getAmendment(submissionId)).toMatchObject({ applied_punch_id: null });
+    });
+  });
+
+  it("applies an amendment for a shift_start employee onto the shift's own date", async () => {
+    const nightId = await store.createEmployee({
+      employeeNumber: "N910", displayName: "Night", joinedOn: "2026-04-01",
+    });
+    await store.setReportingLine(nightId, managerId, APR);
+    await store.setWorkDatePolicy(nightId, "shift_start");
+
+    // 22:00 JST on DAY, no clock-out. The shift's date is DAY even though the missing clock-out
+    // belongs to 06:00 the next morning.
+    const shiftStart = Date.parse("2026-07-03T13:00:00Z");
+    await store.recordPunch({
+      employeeId: nightId, workDate: DAY, kind: "in", now: shiftStart, source: "gadget",
+    });
+
+    const submissionId = await store.fileAmendment({
+      employeeId: nightId, targetPunchId: null, workDate: DAY, kind: "out",
+      occurredAt: shiftStart + 8 * 3600_000, reason: "forgot at the end of the night",
+      now: shiftStart + 30 * 3600_000,
+      department: null, employmentType: null, createdBy: nightId,
+    });
+    expect(await approve(submissionId, managerId, shiftStart + 31 * 3600_000)).toBe("approved");
+
+    // The added punch lands on the work date the REQUEST named, not the JST date of its
+    // `occurred_at` — which is the next day. An amendment writes history; it does not re-run
+    // attribution, because the request named a day and an approver agreed to that day.
+    const punches = await store.currentPunches(nightId, DAY);
+    expect(punches.map((punch) => punch.kind)).toEqual(["in", "out"]);
+    expect(await store.workedMinutes(nightId, DAY)).toBe(480);
+    expect(await store.dayAnomalies(nightId, DAY)).toEqual([]);
+    expect(await store.currentPunches(nightId, "2026-07-04")).toEqual([]);
+  });
+});

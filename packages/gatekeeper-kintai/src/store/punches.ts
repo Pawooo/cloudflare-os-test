@@ -16,9 +16,9 @@ export type NewPunch = {
   kind: PunchKind;
   /**
    * The punch's `occurred_at` — always server-determined, never a client-supplied timestamp.
-   * For `recordPunch` this is simply the current server time. For `correctPunch` this is the
-   * corrected `occurred_at` the punch should have carried, which may be earlier than the
-   * original. The moment the correction was actually entered is `correctPunch`'s separate
+   * For `recordPunch` this is simply the current server time. For `correctPunch` and
+   * `appendMissingPunch` this is the `occurred_at` the punch should have carried, which may be
+   * long past. The moment the write was actually entered is those two functions' separate
    * `recordedAt` parameter, not this field — the two must not be conflated.
    */
   now: number;
@@ -170,6 +170,41 @@ export function correctPunch(
   }
 
   return insert(sql, input, recordedAt, supersedesId, amendedBy, reason);
+}
+
+/**
+ * Append a punch that was never recorded at all, as an approved amendment says it should have
+ * been. The forgotten clock-out.
+ *
+ * DELIBERATELY NOT `recordPunch`, and the difference is not stylistic. `recordPunch` is the
+ * clock-punching write: it takes `input.now` as both the occurrence and the moment of recording,
+ * and it suppresses a repeat of the same kind inside `DUPLICATE_WINDOW_MS`. Both are wrong for a
+ * write that is history rather than a tap on a terminal:
+ *
+ *  - `recorded_at` must be the moment the amendment was APPROVED, not the backdated instant the
+ *    punch should have carried. "When was this entered, and by whom?" is precisely the fact an
+ *    auditor needs about a punch that appeared in a closed month, and `occurred_at` cannot answer
+ *    it. `correctPunch` takes a separate `recordedAt` for the same reason.
+ *  - the suppression window would sit in the PAST, where it protects nothing — and worse, it has
+ *    no upper bound on `occurred_at`: it returns the LATEST unsuperseded punch of that kind on the
+ *    day with `occurred_at > backdated - 60s`. A day already carrying an `out` at 19:00 therefore
+ *    swallows an amendment adding an `out` at 18:00 and hands back the 19:00 punch's id, which the
+ *    request records as the punch it wrote. Nothing is written, the day stays wrong, and
+ *    `applied_punch_id` points at a punch this amendment had nothing to do with. Measured, not
+ *    theorised — see `__tests__/amendments.test.ts`.
+ *
+ * `amendedBy` and `reason` are recorded exactly as they are for a correction, even though there is
+ * nothing to supersede: they are the only account in this table of why a punch nobody made exists
+ * at all.
+ */
+export function appendMissingPunch(
+  sql: SqlStorage,
+  input: NewPunch,
+  amendedBy: EmployeeId,
+  reason: string,
+  recordedAt: number,
+): number {
+  return insert(sql, input, recordedAt, null, amendedBy, reason);
 }
 
 /** Punches for the day that nothing supersedes. */

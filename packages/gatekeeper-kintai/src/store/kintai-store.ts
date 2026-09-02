@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import { applySchema } from "./schema.js";
 import {
-  fileAmendment, getAmendment, pendingAmendmentForPunch,
+  actOnAmendment, fileAmendment, getAmendment, pendingAmendmentForPunch,
   type AmendmentRequest, type NewAmendment,
 } from "./amendments.js";
 import {
@@ -307,7 +307,24 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
     return submitOvertime(this.sql, input);
   }
 
+  /**
+   * Decide a submission -- and, if it is an amendment that this decision approved, write the punch
+   * it asks for in this same turn of the input gate. See `actOnAmendment`.
+   *
+   * THE BRANCH IS HERE, not in the facet, and reading the kind is one statement of this same
+   * synchronous run. A facet that fetched the kind over one RPC and decided over another would put
+   * the input gate between the two, which is the extra round trip this whole path exists to
+   * remove: the decision and the write it authorises must not be separated by anything that can
+   * interleave. It is also why the return type is unchanged -- the caller does not need to know
+   * which kind it just decided, and asking would be the round trip again.
+   *
+   * `getSubmission` is `actOnSubmission`'s own first statement, so an unknown id is refused
+   * exactly as it always was and nothing new about the submission is disclosed by asking.
+   */
   async actOnSubmission(input: ActInput): Promise<SubmissionState> {
+    if (getSubmission(this.sql, input.submissionId).kind === "amendment") {
+      return actOnAmendment(this.sql, input).state;
+    }
     return actOnSubmission(this.sql, input);
   }
 
@@ -322,6 +339,11 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
    *
    * It also returns the staleness marker (`ActProbe.afterEventId`), read in this same call so the
    * authority verdict and the marker describe one consistent version of the submission.
+   *
+   * An amendment's apply-time re-validation (see `actOnAmendment`) is deliberately NOT run here,
+   * even though the argument above would seem to ask for it: `ActCheck` carries no action, so this
+   * cannot tell an approval from the rejection that is exactly how an unappliable request is
+   * disposed of. Refusing the probe would block the disposal along with the approval.
    */
   async previewActOnSubmission(input: ActCheck): Promise<ActProbe> {
     return previewAct(this.sql, input);
