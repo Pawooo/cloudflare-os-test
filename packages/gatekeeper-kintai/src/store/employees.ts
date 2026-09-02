@@ -275,6 +275,19 @@ export function designatedApproverOf(
 export function setDesignatedApprover(
   sql: SqlStorage, employeeId: EmployeeId, approverId: EmployeeId,
 ): void {
+  // Self-designation is refused HERE as well as at the admin boundary, and it is the one check
+  // this primitive keeps for itself. Unlike `setReportingLine`, this write is destructive: edges
+  // are additive, so a bad one leaves the good ones standing, but this column holds a single value
+  // and pointing it at the employee themself OVERWRITES whoever could previously sign for them.
+  // An employee with no manager and a valid designated approver goes from reachable to orphaned in
+  // one statement -- verified by review. Everything else about the value (does the approver exist,
+  // may this caller do it, is it audited) stays at the admin boundary where the answers live.
+  if (approverId === employeeId) {
+    throw new InvalidInputError(
+      `an employee cannot be their own designated approver: nobody may approve their own ` +
+      `submission, so this would leave them unable to file anything.`,
+    );
+  }
   sql.exec(
     `UPDATE employees SET designated_approver_id = ? WHERE id = ?`, approverId, employeeId,
   );

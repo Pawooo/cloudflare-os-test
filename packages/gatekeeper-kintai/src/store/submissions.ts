@@ -332,11 +332,18 @@ export function submitOvertime(sql: SqlStorage, input: NewSubmission): number {
   // one reachable hole: a `submitOvertime` call for an employee who never had a manager or a
   // designated approver at all. Guard it here.
   //
-  // `setDesignatedApprover` only ever points the column AT somebody, so it cannot orphan anyone
-  // either. The moment an edge-closing API is introduced — or a way to clear a designated
-  // approver — this stops being the only hole: that write needs this same check, not only
-  // submission time, because an employee orphaned before they next file would otherwise pass
-  // silently until they did.
+  // `setDesignatedApprover` points the column at somebody, so through the admin surface it cannot
+  // orphan anyone. Do NOT read that as a property of the write itself: unlike a reporting edge,
+  // which is additive, this column holds one value and the write is destructive — pointing it at
+  // the employee themself overwrites whoever could previously sign for them, taking an employee
+  // with no manager from reachable to orphaned in one statement. The store primitive refuses that
+  // one case for itself; everything else is guaranteed at the admin boundary, which is where the
+  // guarantee ends. An in-process caller reaching the store directly inherits nothing else.
+  //
+  // The moment an edge-closing API is introduced — or a way to clear a designated approver —
+  // this stops being the only hole: that write needs this same check, not only submission time,
+  // because an employee orphaned before they next file would otherwise pass silently until
+  // they did.
   //
   // Asked at `input.now`, NOT at `requestedAt`, and unlike exemption above that is the whole
   // point. "Who can approve this?" is a question about the org as it stands when the answer is

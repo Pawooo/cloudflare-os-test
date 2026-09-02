@@ -752,7 +752,7 @@ pnpm exec vitest run __tests__/amendments.test.ts
 
 Expected: PASS, all five.
 
-- [x] **Step 6: Run every gate, then commit** — 407 worker, 68 app.
+- [x] **Step 6: Run every gate, then commit** — 411 worker, 68 app.
 
 ```bash
 pnpm exec vitest run && pnpm exec vitest run -c vitest.app.config.ts && pnpm exec tsc --noEmit && pnpm run typecheck:app
@@ -1012,7 +1012,7 @@ pnpm exec vitest run __tests__/amendments.test.ts __tests__/submissions.test.ts
 
 Expected: PASS. Every prior submissions test must still pass unchanged — if any needed editing, `created_by` was not what you assumed and you should stop and report.
 
-- [x] **Step 6: Run every gate, then commit** — 407 worker, 68 app.
+- [x] **Step 6: Run every gate, then commit** — 411 worker, 68 app.
 
 ```bash
 pnpm exec vitest run && pnpm exec vitest run -c vitest.app.config.ts && pnpm exec tsc --noEmit && pnpm run typecheck:app
@@ -1282,7 +1282,7 @@ This is agent-facing behaviour. It must say:
 - That an amendment is the way through `KINTAI_PERIOD_LOCKED`, which the existing text already promises.
 - That filing for another employee requires authority over them.
 
-- [x] **Step 6: Run every gate, then commit** — 407 worker, 68 app.
+- [ ] **Step 6: Run every gate, then commit**
 
 ```bash
 pnpm exec vitest run && pnpm exec vitest run -c vitest.app.config.ts && pnpm exec tsc --noEmit && pnpm run typecheck:app && pnpm exec capnweb-validate build --out .wrangler/validate
