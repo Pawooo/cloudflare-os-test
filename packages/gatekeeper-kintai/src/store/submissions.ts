@@ -542,13 +542,15 @@ type ActAuthority = {
 /**
  * THE authority prologue for acting on a submission. There is exactly one of these, deliberately.
  *
- * `actOnSubmission` (the write) and `previewAct` (the stage-time probe, run before an approval is
- * queued for a human to confirm) both call this. They are not two checks kept in agreement — they
- * are one check called twice, because this project has already shipped a real bug from copies of
- * "who may approve" drifting apart: `authorize`, `requiredApprovers`, `hasReachableApprover` and
- * `pendingApprovalsFor` all answer a version of it, and one of them silently disagreed for weeks,
- * letting a designated approver sign for an employee who already had a manager. A probe written
- * separately from the write is exactly how that happens again.
+ * `actOnSubmission` (the write), `previewAct` (the stage-time probe, run before an approval is
+ * queued for a human to confirm) and `pendingApprovalsFor` (the queue) all call this. They are not
+ * three checks kept in agreement — they are one check called three times, because this project has
+ * already shipped a real bug from copies of "who may approve" drifting apart: `authorize`,
+ * `requiredApprovers` and `hasReachableApprover` each answer a version of it, and one of them
+ * silently disagreed for weeks, letting a designated approver sign for an employee who already had
+ * a manager. A probe, or a queue, written separately from the write is exactly how that happens
+ * again — the queue was, in SQL, until the property test in `__tests__/submissions.test.ts` was
+ * written to hold the two together.
  *
  * The ORDER here is itself load-bearing and must not be rearranged:
  *
@@ -782,25 +784,68 @@ export function listSubmissionsFor(
 }
 
 /**
+ * The refusals that mean "not you, not this one, not now" — the only errors out of `checkMayAct`
+ * that describe a row the queue should quietly leave out rather than fail over.
+ *
+ * Enumerated, never `catch (err) { return false }`. The filter below runs the whole authority
+ * prologue per row, so a broken route snapshot, a missing employee record or a SQLite failure all
+ * arrive here too, and swallowing those would turn a real fault into an empty queue — an approver
+ * shown nothing to do, which is exactly the invisible stranding this function exists to prevent,
+ * arrived at from the other side. Each one, and why it is on the list or not:
+ *
+ *  - `SelfApprovalError` — the actor is the employee. Unconditional and permanent: no route shape
+ *    or later step makes their own submission decidable by them.
+ *  - `FiledBySelfError` — the actor filed it. Same: whoever raises a request never settles it.
+ *  - `NotAuthorizedError` — `authorize` found no edge and no root fallback, or the row has no step
+ *    at its current index. The second is unreachable for well-formed data and fails closed here
+ *    for the same reason it does in `actOnSubmission`.
+ *  - `InvalidTransitionError` — the row is not `pending`. Unreachable while the SQL narrows to
+ *    `pending`, and listed anyway so that narrowing stays a narrowing: if it is ever widened, the
+ *    queue keeps answering correctly instead of throwing.
+ *  - `SubmissionNotFoundError` is deliberately ABSENT. Every id passed in came from the SELECT in
+ *    the same synchronous turn, so a row disappearing between the two is not a refusal — it is a
+ *    fact about the database nobody should be hiding.
+ */
+function isQueueRefusal(err: unknown): boolean {
+  return err instanceof SelfApprovalError ||
+    err instanceof FiledBySelfError ||
+    err instanceof NotAuthorizedError ||
+    err instanceof InvalidTransitionError;
+}
+
+/**
  * Submissions this approver can act on right now, derived from the org graph and each submission's
  * own route snapshot — never from a caller's claim about who they are or what they manage.
  *
- * The filter is `authorize` itself rather than a parallel SQL predicate. Those two must agree: a
- * queue that lists what the approver cannot act on produces dead entries, and — much worse — a
- * queue that omits what they alone can act on strands the submission in `pending` invisibly. The
- * only way to keep them in step under every route shape (a step pinned to a named employee, a
- * delegate covering an absent manager, a root employee's designated approver) is to ask the same
- * function. Route snapshots are JSON on the row, so the current step cannot be evaluated in SQL;
- * SQL narrows to the pending rows and the authorisation decision happens here.
+ * The filter is `checkMayAct` — the whole authority prologue, the same function `previewAct` and
+ * `actOnSubmission` call, not a re-statement of it. Those must agree: a queue that lists what the
+ * approver cannot act on produces dead entries, and — much worse — a queue that omits what they
+ * alone can act on strands the submission in `pending` invisibly. The only way to keep them in
+ * step under every route shape (a step pinned to a named employee, a delegate covering an absent
+ * manager, a root employee's designated approver) is to ask the same question, so this is one
+ * function called three times, exactly as `previewAct`/`actOnSubmission` are one called twice.
  *
- * The two exclusions in the SQL are not optimisations. `checkMayAct` refuses an actor who is the
- * submission's employee AND one who filed it, so in both cases the row could never be acted on by
- * this approver and listing it would produce exactly the dead entry described above. Excluding
- * them cannot hide anything actionable, because the refusal is unconditional: no route shape,
- * delegation or later step makes such a row decidable by that person.
+ * It used to call `authorize` and re-state the rest: `employee_id != ?` for `SelfApprovalError`,
+ * a `created_by` test for `FiledBySelfError`, an explicit `if (!step) return false`. Those agreed
+ * with `checkMayAct` only by construction, and drifted silently in both directions — a refusal
+ * added AHEAD of `authorize` would have left the SQL behind and filled the queue with rows nobody
+ * could act on, and `FiledBySelfError` ever narrowed would have left the SQL hiding rows the
+ * approver alone could act on. `__tests__/submissions.test.ts` now asserts the equivalence as a
+ * property over a matrix of submissions and actors, because nothing else was going to catch it.
  *
- * `created_by` is nullable, so the filer test has to admit NULL rather than compare against it —
- * `NULL != ?` is NULL, not true, and would silently drop every row that predates the column.
+ * `state = 'pending'` survives, purely as narrowing: it is not the authority answer — the filter
+ * would refuse a non-pending row on its own — it just keeps the company's whole submission history
+ * out of memory on every queue open. Route snapshots are JSON on the row, so the actual decision
+ * cannot be evaluated in SQL at all.
+ *
+ * The cost is one extra indexed point lookup per pending row: `checkMayAct` takes an id and
+ * re-reads the row this function already holds. Measured in the workerd test runtime, over 1000
+ * pending rows for one approver, it moves a median 16-17ms per call to 21ms — about 4µs a row, and
+ * a real ~28% on a synthetic worst case. At 50 rows, which is already a large queue for one
+ * person, both are 1ms and the difference does not show above the timer's resolution. The cost is
+ * bounded by the PENDING set, not by history, and the alternative on offer is a second copy of the
+ * approval rule that has already drifted once. If it ever does matter, the fix is to pass the row
+ * into the prologue rather than the id — not to restate what it decides.
  */
 export function pendingApprovalsFor(
   sql: SqlStorage, approverId: EmployeeId, now: number,
@@ -808,25 +853,16 @@ export function pendingApprovalsFor(
   const pending = sql
     .exec<SubmissionRow>(
       // submitted_at is caller-supplied and so is not monotonic; id breaks ties in insertion order.
-      `SELECT * FROM submissions
-       WHERE state = 'pending' AND employee_id != ?
-         AND (created_by IS NULL OR created_by != ?)
-       ORDER BY submitted_at, id`,
-      approverId, approverId,
+      `SELECT * FROM submissions WHERE state = 'pending' ORDER BY submitted_at, id`,
     )
     .toArray();
 
   return pending.filter((submission) => {
-    const snapshot = JSON.parse(submission.route_snapshot) as RouteSnapshot;
-    const step = snapshot.steps[submission.current_step];
-    // A submission with no step at its current index is unactionable by anyone (see
-    // `actOnSubmission`); it must not appear in a queue that promises "you can act on this".
-    if (!step) return false;
     try {
-      authorize(sql, submission, step, approverId, now);
+      checkMayAct(sql, { submissionId: submission.id, actorId: approverId, now });
       return true;
     } catch (err) {
-      if (err instanceof NotAuthorizedError) return false;
+      if (isQueueRefusal(err)) return false;
       throw err;
     }
   });

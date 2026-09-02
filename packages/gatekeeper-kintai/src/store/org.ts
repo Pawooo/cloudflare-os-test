@@ -166,9 +166,10 @@ export class NoApproverError extends Error {
  * queue, on the record of the person whose hours most warrant a second reader.
  *
  * The arm is gone rather than made conditional. One function that answers one question is the
- * whole point of this one existing: `authorize`, `requiredApprovers`, `hasReachableApprover` and
- * `pendingApprovalsFor` all answer a version of "who may approve for this employee", and this
- * package has already shipped a bug from one of them quietly disagreeing. A second variant here,
+ * whole point of this one existing: `authorize`, `requiredApprovers` and `hasReachableApprover`
+ * each answer a version of "who may approve for this employee" — `pendingApprovalsFor` used to be
+ * a fourth and now asks `checkMayAct` instead — and this package has already shipped a bug from
+ * one of them quietly disagreeing. A second variant here,
  * or a flag saying which caller is asking, is that bug's next opportunity.
  *
  * This must stay in lockstep with `submissions.ts`'s `requiredApprovers`/`authorize`, which decide

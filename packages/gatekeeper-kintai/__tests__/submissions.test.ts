@@ -442,8 +442,8 @@ describe("designated approver", () => {
     expect((await store.getSubmission(id)).state).toBe("pending");
     expect((await store.approvalEvents(id))).toEqual([]);
 
-    // ...and it is not in their queue either: the queue filters through `authorize` itself, so the
-    // two answers cannot disagree.
+    // ...and it is not in their queue either: the queue filters through `checkMayAct` itself, so
+    // the two answers cannot disagree.
     expect((await store.pendingApprovalsFor(director, JUL + 1000)).map((row) => row.id))
       .not.toContain(id);
 
@@ -623,7 +623,7 @@ describe("a filer's own queue", () => {
   });
 
   it("still lists it for another approver at the same step", async () => {
-    // A second manager, so step 0 has someone other than the filer who can act. Excluding the
+    // A second manager, so step 0 has someone other than the filer who can act. Refusing the
     // filer must not amount to hiding the row from everyone.
     await store.setReportingLine(worker, director, APR);
     await singleStepRoute();
@@ -643,8 +643,10 @@ describe("a filer's own queue", () => {
   it("keeps listing rows that predate the filer column", async () => {
     await singleStepRoute();
     const id = await submit();
-    // `created_by` is null here. `NULL != ?` is NULL rather than true, so a predicate without the
-    // IS NULL arm would silently drop every row filed before the column existed.
+    // `created_by` is null here, and a null filer is not a match for anybody. The queue no longer
+    // states that for itself — `FiledBySelfError`'s `created_by !== null` guard is the only place
+    // it is decided — but the row it protects is the same one: every submission filed before the
+    // column existed.
     expect((await store.pendingApprovalsFor(boss, JUL + 1000)).map((r) => r.id))
       .toContain(id);
   });
@@ -1045,5 +1047,136 @@ describe("no reachable approver", () => {
     // And nothing was left behind to strand: the first submission this store would create is id 1.
     await expect(() => store.getSubmission(1)).rejects.toThrow(/KINTAI_NOT_FOUND/);
     expect(await store.pendingApprovalsFor(boss, Date.parse("2026-08-10T00:00:00Z"))).toEqual([]);
+  });
+});
+
+/**
+ * `pendingApprovalsFor` and `checkMayAct` are ONE rule, asserted as a property rather than by
+ * example. Nothing here names a route shape or an org edge: it enumerates a set of submissions and
+ * a set of actors, asks the authority prologue about every pair, and requires the queue to hold
+ * exactly the pairs it accepted.
+ *
+ * This is the test whose absence let the two drift. The queue used to restate the origination rule
+ * as SQL — `employee_id != ?` and a `created_by` test — which agreed with `checkMayAct` only by
+ * construction, and in both directions silently: a refusal added ahead of `authorize` would leave
+ * the SQL behind and put dead entries in the queue, and a `FiledBySelfError` ever narrowed would
+ * leave the SQL hiding rows nobody else can act on. The second is invisible stranding, which is
+ * the failure `pendingApprovalsFor`'s own doc comment says it exists to prevent.
+ *
+ * By construction it exercises every arm of the queue's refusal list, and asserts that it did:
+ * a matrix that happened to miss one would be a matrix that stopped guarding it.
+ */
+describe("the queue lists exactly what the act check accepts", () => {
+  /**
+   * The domain refusals that mean "not this person, not now" — the same list the queue filters on.
+   * Anything else is a real failure and must reach the test, never be read as "no": a queue that
+   * was empty because every row threw would otherwise pass this file.
+   */
+  const REFUSALS = [
+    "KINTAI_SELF_APPROVAL", "KINTAI_FILED_BY_APPROVER",
+    "KINTAI_NOT_AUTHORIZED", "KINTAI_INVALID_TRANSITION",
+  ];
+
+  const NOW = JUL + 10_000;
+  const seen = new Set<string>();
+
+  /**
+   * Does the authority prologue accept this actor for this submission? `previewActOnSubmission` is
+   * `checkMayAct` with nothing after it, so this asks the exact question `actOnSubmission` asks,
+   * without writing. Awaited inside the try, so no rejected promise is ever left for a turn.
+   */
+  async function mayAct(submissionId: number, actorId: number): Promise<boolean> {
+    try {
+      await store.previewActOnSubmission({ submissionId, actorId, now: NOW });
+      return true;
+    } catch (err) {
+      const message = (err as Error).message;
+      const code = REFUSALS.find((candidate) => message.startsWith(`${candidate}:`));
+      if (code === undefined) throw err;
+      seen.add(code);
+      return false;
+    }
+  }
+
+  it("holds a row for an actor exactly when the act check would let them act", async () => {
+    await twoStepRoute();
+
+    // A root employee: no manager edge, so `authorize` can only reach them through the designated
+    // approver fallback.
+    const chief = await store.createEmployee({
+      employeeNumber: "P-CHIEF", displayName: "Chief", joinedOn: "2026-04-01",
+      designatedApproverId: director,
+    });
+    // Both a live manager AND a designated approver: the shape where the fallback must NOT apply,
+    // and the one that shipped a real bug once.
+    const both = await store.createEmployee({
+      employeeNumber: "P-BOTH", displayName: "Both", joinedOn: "2026-04-01",
+      designatedApproverId: director,
+    });
+    await store.setReportingLine(both, boss, APR);
+    // Somebody with no authority over anyone, to keep the matrix from being all approvers.
+    const outsider = await store.createEmployee({
+      employeeNumber: "P-OUT", displayName: "Outsider", joinedOn: "2026-04-01",
+    });
+    await store.setReportingLine(outsider, boss, APR);
+
+    const filed = await store.submitOvertime({
+      employeeId: worker, requestedFor: "2026-07-03", minutes: 120,
+      reason: "entered from the paper sheet", now: JUL,
+      department: "CONSTRUCTION", employmentType: null, createdBy: boss,
+    });
+    const atStepOne = await submit(90, worker);
+    await store.actOnSubmission({
+      submissionId: atStepOne, actorId: boss, action: "approve", now: JUL + 1000,
+    });
+    const withdrawn = await submit(45, worker);
+    await store.withdrawSubmission(withdrawn, worker);
+    const returned = await submit(15, worker);
+    await store.actOnSubmission({
+      submissionId: returned, actorId: boss, action: "return", now: JUL + 1000,
+    });
+
+    const submissions = [
+      // A manager step, decidable by the one manager.
+      { name: "plain", id: await submit(120, worker) },
+      // Filed by the only person who could have decided it: decidable by nobody.
+      { name: "filed by the approver", id: filed },
+      // The approver's own overtime, decided a level up.
+      { name: "about the boss", id: await submit(60, boss) },
+      // A step pinned to a named employee rather than to a relationship.
+      { name: "at a pinned step", id: atStepOne },
+      // Reachable only through the root-of-organisation fallback.
+      { name: "root employee", id: await submit(30, chief) },
+      // Manager AND designated approver: the manager decides, the designated approver may not.
+      { name: "manager and approver", id: await submit(75, both) },
+      // Left `pending` by nothing: not actionable however authorised the actor is.
+      { name: "withdrawn", id: withdrawn },
+      { name: "returned to draft", id: returned },
+    ];
+    const actors = [
+      { name: "worker", id: worker }, { name: "boss", id: boss },
+      { name: "director", id: director }, { name: "chief", id: chief },
+      { name: "outsider", id: outsider },
+    ];
+
+    for (const actor of actors) {
+      const queued = new Set(
+        (await store.pendingApprovalsFor(actor.id, NOW)).map((row) => row.id),
+      );
+      for (const submission of submissions) {
+        const allowed = await mayAct(submission.id, actor.id);
+        // Compared as strings so a failure names the pair rather than reporting `true !== false`.
+        expect(`${submission.name} / ${actor.name}: queued=${queued.has(submission.id)}`)
+          .toBe(`${submission.name} / ${actor.name}: queued=${allowed}`);
+      }
+      // The queue must not hold anything outside the matrix either — an id from another test's
+      // fixture appearing here would mean the filter let something through unexamined.
+      expect([...queued].filter((id) => !submissions.some((s) => s.id === id))).toEqual([]);
+    }
+
+    // And the matrix is not weaker than it looks: every refusal the queue filters on was reached
+    // by a real pair above. One that stopped being exercised would be one that stopped being
+    // guarded, silently, which is how this pair of rules drifted the first time.
+    expect([...seen].sort()).toEqual([...REFUSALS].sort());
   });
 });
