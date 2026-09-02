@@ -782,6 +782,52 @@ nothing let a human choose a punch time. This is that path."
 **Interfaces:**
 - Produces: `FiledBySelfError` (code `KINTAI_FILED_BY_APPROVER`); `assertAmendmentSatisfiable(snapshot, employeeId, createdBy)`.
 
+### The org root, and why an exemption is not an approver — settled 2026-09-02
+
+Three things can ever give an employee an approver: a **manager**, a **designated approver**, or a
+**管理監督者 exemption**. Whoever sits at the top of the reporting tree has no manager by
+definition, so they need one of the other two — and the exemption does not actually work.
+
+`hasReachableApprover` counts an exemption as "needs nobody". That is right for overtime, which
+refuses an exempt filer outright: no premium is owed, so there is nothing to approve. It is **wrong
+for amendments**. An exempt employee's punches are still the record of when they worked, and a
+wrong one still needs fixing — but `requiredApprovers` never counts an exemption toward a step, so
+the request sits pending with nobody able to act on it. Overtime cannot reach that shape.
+Amendments can, and the person most likely to hit it is the 代表取締役 whose own record most
+warrants a second pair of eyes.
+
+`designated_approver_id` is the mechanism already designed for this — `employees.ts:227` calls it
+"the escape hatch for employees at the root of the reporting tree". It is settable **only in
+`createEmployee`**, with no update path anywhere. So employee 1, created when nobody else exists,
+can never be given one. Implemented, documented, and unreachable by exactly the person it was
+written for — the same shape as `createRoute` and `correctPunch`
+(see `docs/kintai-architecture-limits.md`).
+
+Four parts, all approved:
+
+1. **`setDesignatedApprover(employeeId, approverId)` on the admin API.** Same shape as
+   `setReportingLine`: on the `KintaiAdminApi` **interface**, implemented on `AdminKintaiApi`,
+   throwing on `ViewerKintaiApi`, audited with before/after. This is what breaks the
+   chicken-and-egg. Must refuse self-designation (`approverId === employeeId`), and refuse an
+   approver who does not exist.
+2. **An exemption does not satisfy amendment approval.** Overtime keeps today's behaviour exactly
+   — do not change `hasReachableApprover` for its callers. Amendments need a real human: a manager
+   or a designated approver. Whether that is a second function or a parameter is the implementer's
+   call; the constraint is that overtime's behaviour must not move, and there must not end up being
+   two drifting implementations of "who can approve".
+3. **Refuse at filing time**, inside `assertAmendmentSatisfiable`, naming the fix: *"you have no
+   approver for corrections — ask an administrator to set a designated approver."* Failing where
+   somebody can still act beats stranding a request in a queue nobody can see.
+4. **Surface it on the roster.** The roster's "Ready" column uses the reachability check that
+   counts the exemption, so an exempt root shows ready and would strand a correction — observed
+   live on 2026-09-01, where Admin displayed "Ready · 管理監督者" and could not have had a
+   correction approved. HR should see this before it bites.
+
+Rejected, with reasons: **self-approval for the root** breaks the one invariant the whole model
+rests on, on the record that most needs review; **skipping approval for the root** is the same
+thing with extra steps; **peer approval among 管理監督者** is a real Japanese practice but a new
+routing concept, and it reduces to "designate someone", which already exists.
+
 **The rule:** `checkMayAct` refuses when the actor is the submission's `employee_id`. With managers filing on behalf of workers, the filer and the employee are different people, so that check no longer catches a manager who files a correction for their report and then approves it — one person originating and authorising a change to payroll input, with nothing in the trail marking it. The actor must be neither.
 
 `created_by` and `employee_id` are the same person for every overtime submission today, so the new refusal is a no-op there and cannot regress it. Pin that with a test rather than asserting it.
