@@ -1312,12 +1312,15 @@ describe("the terminal-refusal classification", () => {
     KINTAI_STALE_DECISION: "terminal",
 
     // --- amendments.ts
-    // Filing-time refusals. `fileAmendment` raises all four before any submission exists, so no
+    // Filing-time refusals. `fileAmendment` raises all five before any submission exists, so no
     // staged decision can meet them.
     KINTAI_AMENDMENT_TARGET: "retryable",
     KINTAI_PUNCH_ALREADY_AMENDED: "retryable",
     KINTAI_DUPLICATE_PUNCH: "retryable",
     KINTAI_DUPLICATE_AMENDMENT: "retryable",
+    // The occurrence against the day it names. A filing-time refusal like the four above, and
+    // retryable in the sense that matters here: the pair of values is the caller's to change.
+    KINTAI_AMENDMENT_WORK_DATE: "retryable",
     // `supersedes_id` is never cleared and `punches` is append-only, so the successor that made
     // this correction unwritable is there for good.
     KINTAI_AMENDMENT_TARGET_SUPERSEDED: "terminal",

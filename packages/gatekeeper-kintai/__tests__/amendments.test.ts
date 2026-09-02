@@ -3,12 +3,17 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { fileAmendment } from "../src/store/amendments.js";
 import type { NewAddition, NewCorrection } from "../src/store/amendments.js";
 import type { PunchKind, SubmissionState } from "../src/types.js";
+import { MAX_SHIFT_MS } from "../src/work-date.js";
 
 // Rejection assertions are written as `expect(() => store.method(...))`, never as
 // `expect(store.method(...))` — see the header of `submissions.test.ts` for why.
 
 const DAY = "2026-07-03";
 const NINE_AM = Date.parse("2026-07-03T00:00:00Z");
+/** The instant `DAY` begins in JST — nine hours before `NINE_AM`, not `Date.parse(DAY)`. */
+const DAY_START = Date.parse("2026-07-03T00:00:00+09:00");
+/** JST has no DST, so every JST day is exactly this long. */
+const DAY_MS = 24 * 3600_000;
 const APR = Date.parse("2026-04-01T00:00:00Z");
 
 let store: ReturnType<typeof env.KINTAI_STORE.getByName>;
@@ -301,6 +306,111 @@ describe("filing an amendment", () => {
       const punchId = await punchAt(NINE_AM);
       await expect(() => store.fileAmendment(correction(punchId, { occurredAt: Number.NaN })))
         .rejects.toThrow(/KINTAI_INVALID_INPUT/);
+    });
+  });
+
+  // ----------------------------------------------------------------------------------------------
+  // The named work date and the occurrence, checked AGAINST EACH OTHER.
+  //
+  // Nothing did, so an addition naming 2026-07-03 with an occurrence three weeks away was accepted
+  // and applied there — and a correction, whose day is copied off the target and so cannot be
+  // wrong, could still move a punch's TIME to an instant that day never contained. Both produce a
+  // punch filed against a day it does not belong to, which is precisely what `long_span`,
+  // `orphan_out` and `negative_gross` exist to flag after the fact.
+  //
+  // The caller most likely to get this wrong is an agent constructing a date, and "the approver
+  // will notice" is weak when the request reads plausibly: an approver is shown the day and the
+  // clock time, not the arithmetic between them.
+  // ----------------------------------------------------------------------------------------------
+  describe("the occurrence against the day it names", () => {
+    it("refuses an addition whose occurrence is weeks from the day it names", async () => {
+      await expect(() => store.fileAmendment(
+        addition({ occurredAt: DAY_START + 21 * DAY_MS, now: DAY_START + 30 * DAY_MS }),
+      )).rejects.toThrow(/KINTAI_AMENDMENT_WORK_DATE/);
+    });
+
+    it("refuses an addition one day off, which is the mistake actually made", async () => {
+      // A JST/UTC confusion is worth nine hours, so it lands on the neighbouring date rather than
+      // somewhere obviously absurd. This is the case the check is for.
+      await expect(() => store.fileAmendment(
+        addition({ occurredAt: NINE_AM + DAY_MS, now: NINE_AM + 2 * DAY_MS }),
+      )).rejects.toThrow(/KINTAI_AMENDMENT_WORK_DATE/);
+    });
+
+    it("holds the day's own boundaries for a calendar employee", async () => {
+      // The whole JST day and nothing either side of it. `assertWorkDate` guarantees the day is
+      // real, so this is exactly `jstWorkDate(occurredAt) === workDate` — the same answer live
+      // attribution gives a `calendar` employee, asked of a past instant.
+      const lastInstant = await store.fileAmendment(
+        addition({ occurredAt: DAY_START + DAY_MS - 1 }),
+      );
+      expect(await store.getAmendment(lastInstant)).toMatchObject({
+        occurred_at: DAY_START + DAY_MS - 1,
+      });
+
+      await expect(() => store.fileAmendment(
+        addition({ occurredAt: DAY_START + DAY_MS, reason: "one millisecond into tomorrow" }),
+      )).rejects.toThrow(/KINTAI_AMENDMENT_WORK_DATE/);
+      await expect(() => store.fileAmendment(
+        addition({ occurredAt: DAY_START - 1, reason: "one millisecond before the day" }),
+      )).rejects.toThrow(/KINTAI_AMENDMENT_WORK_DATE/);
+    });
+
+    it("refuses a correction that moves a punch off its own day", async () => {
+      // The correction half, and it is not covered by the addition half: `work_date` is copied off
+      // the target and so cannot disagree with it, but `occurred_at` is caller-supplied on both
+      // paths. `correctPunch` would write the new time against the target's day without comment.
+      const punchId = await punchAt(NINE_AM);
+      await expect(() => store.fileAmendment(
+        correction(punchId, { occurredAt: NINE_AM + DAY_MS, now: NINE_AM + 2 * DAY_MS }),
+      )).rejects.toThrow(/KINTAI_AMENDMENT_WORK_DATE/);
+    });
+
+    it("allows a night worker's clock-out on the following morning", async () => {
+      // The case that forbids a plain equality check: for a `shift_start` employee a 06:00
+      // clock-out belongs to the date the shift STARTED, so the occurrence's own JST date is
+      // legitimately the next one. This is the forgotten clock-out this whole feature exists for.
+      await store.setWorkDatePolicy(employeeId, "shift_start");
+      const nightShiftOut = DAY_START + 30 * 3600_000;  // 06:00 JST the following morning
+
+      const submissionId = await store.fileAmendment(
+        addition({ occurredAt: nightShiftOut, now: DAY_START + 40 * 3600_000 }),
+      );
+      expect(await store.getAmendment(submissionId)).toMatchObject({
+        work_date: DAY, occurred_at: nightShiftOut,
+      });
+    });
+
+    it("bounds a night worker's day by one shift's length past it", async () => {
+      // A shift can open at any hour of the named day and stops claiming punches at
+      // `MAX_SHIFT_MS` — so the widest instant any shift dated D can honestly reach is
+      // `MAX_SHIFT_MS` past the END of D. Past that the punch belongs to a later day whatever
+      // the policy.
+      await store.setWorkDatePolicy(employeeId, "shift_start");
+      const edge = DAY_START + DAY_MS + MAX_SHIFT_MS;
+
+      const submissionId = await store.fileAmendment(
+        addition({ occurredAt: edge - 1, now: edge + DAY_MS }),
+      );
+      expect(await store.getAmendment(submissionId)).toMatchObject({ occurred_at: edge - 1 });
+
+      await expect(() => store.fileAmendment(
+        addition({ occurredAt: edge, now: edge + DAY_MS, reason: "one past the bound" }),
+      )).rejects.toThrow(/KINTAI_AMENDMENT_WORK_DATE/);
+    });
+
+    it("reads the policy off the employee, not off the request", async () => {
+      // The same instant, refused for a `calendar` employee and accepted for a night worker. The
+      // policy is HR's setting on the employee record and no caller can name it.
+      const nightShiftOut = DAY_START + 30 * 3600_000;
+      await expect(() => store.fileAmendment(
+        addition({ occurredAt: nightShiftOut, now: DAY_START + 40 * 3600_000 }),
+      )).rejects.toThrow(/KINTAI_AMENDMENT_WORK_DATE/);
+
+      await store.setWorkDatePolicy(employeeId, "shift_start");
+      await expect(store.fileAmendment(
+        addition({ occurredAt: nightShiftOut, now: DAY_START + 40 * 3600_000 }),
+      )).resolves.toBeGreaterThan(0);
     });
   });
 

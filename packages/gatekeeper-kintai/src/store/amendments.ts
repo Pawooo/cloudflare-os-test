@@ -15,12 +15,14 @@ import {
   LIMITS, assertNotFuture, assertPunchKind, assertRequiredText, assertWorkDate,
 } from "../input.js";
 import { resolveRoute } from "../routes.js";
+import { MAX_SHIFT_MS, workDateStart } from "../work-date.js";
+import { workDatePolicyOf } from "./employees.js";
 import { assertApproverReachable } from "./org.js";
 import {
   actOnSubmission, assertSatisfiable, checkMayAct, getSubmission, type ActInput,
 } from "./submissions.js";
 import { appendMissingPunch, correctPunch, type NewPunch } from "./punches.js";
-import type { EmployeeId, PunchKind, SubmissionState } from "../types.js";
+import type { EmployeeId, PunchKind, SubmissionState, WorkDatePolicy } from "../types.js";
 
 /**
  * A request to change one punch, hung off the submission that carries its approval.
@@ -200,6 +202,70 @@ export class DuplicateAmendmentError extends Error {
 }
 
 /**
+ * The time asked for does not belong to the day the request is filed against.
+ *
+ * NOTHING CHECKED THESE TWO AGAINST EACH OTHER before this, and they are separately validated:
+ * `assertWorkDate` says the day is a real date, `assertNotFuture` says the instant has passed, and
+ * an addition naming 2026-07-03 with an occurrence three weeks away satisfied both and applied
+ * there. A correction is not immune either — its day is copied off the target and so cannot
+ * disagree, but its TIME is caller-supplied, so it could move a punch to an instant its own day
+ * never contained. Either way an approved request writes a punch onto a day it does not belong
+ * to, which is what `long_span`, `orphan_out` and `negative_gross` exist to flag after the fact.
+ *
+ * THE BOUND IS THE ATTRIBUTION RULE, ASKED BACKWARDS. `workDateFor` answers "which day does a
+ * punch at this instant belong to?"; this asks "could a punch on this day have happened at this
+ * instant?", and takes its answer from the same two facts:
+ *
+ *  - `calendar` — the whole of the named JST day and nothing either side of it. Identical to
+ *    `jstWorkDate(occurredAt) === workDate`, expressed as an interval so the two policies read as
+ *    one rule with one relaxation rather than as two checks.
+ *  - `shift_start` — the named day, plus `MAX_SHIFT_MS` past the end of it. A shift may open at
+ *    any hour of its own date (a shift-opening `in` is calendar-dated, so its date IS the work
+ *    date) and stops claiming punches once it has been open that long, so the latest instant any
+ *    shift dated D can honestly reach is one shift's length past the end of D. This is why the
+ *    check cannot be plain equality: a night worker's 06:00 clock-out belongs to the previous
+ *    day's shift and its own JST date is legitimately the next one.
+ *
+ * WHY THE `shift_start` BOUND IS NOT MEASURED FROM THE DAY'S ACTUAL SHIFT START, which would be
+ * tighter by the hours between midnight and the clock-in. Two reasons, both of them about being
+ * wrong in the expensive direction. The shift's start is a punch, and it is often the very row
+ * being corrected — a clock-in recorded at 08:00 that should read 22:00, or moved an hour earlier
+ * — so a bound derived from it refuses the corrections most likely to be needed. And a day whose
+ * clock-in is the punch that was never recorded has no shift start to measure from at all, which
+ * is the forgotten-punch case this feature exists for. A bound that has to be special-cased for
+ * the requests it most has to admit is not tighter, only more conditional.
+ *
+ * WHAT IT DOES NOT CATCH, stated so nobody reads more into it. A `shift_start` employee's punch
+ * named against the day its own clock says rather than the shift's — a 06:00 clock-out filed
+ * against the following date — passes: that date's window contains 06:00, and distinguishing the
+ * two would mean re-deriving attribution from the punch table, which cannot answer for a shift
+ * that has already closed (the usual state of a day being amended). It is visible rather than
+ * silent: the day pairs wrongly, so `dayAnomalies` reports `unpaired_in` on one date and
+ * `orphan_out` on the other, and the approver is shown the date and the clock time together. This
+ * check exists to refuse the occurrences no approver could be expected to sanity-check, not to
+ * replace the approver.
+ *
+ * Its own code, not `KINTAI_INVALID_INPUT`: both values are well-formed and each is fine on its
+ * own. What is wrong is the pair, and the remedy is to name the other day or the other time.
+ */
+export class OccurrenceWorkDateError extends Error {
+  readonly code = "KINTAI_AMENDMENT_WORK_DATE";
+  constructor(workDate: string, policy: WorkDatePolicy) {
+    super(
+      `KINTAI_AMENDMENT_WORK_DATE: that time is not on ${workDate}, so a punch filed against ` +
+      `${workDate} cannot have happened at it. ` +
+      (policy === "shift_start"
+        ? `This employee's punches are dated by the shift they belong to, so a punch on ` +
+          `${workDate} may run into the following morning — but not beyond one shift's length ` +
+          `past the end of the day.`
+        : `This employee's punches are dated by the JST calendar, so the time must fall on ` +
+          `${workDate} itself.`) +
+      ` Name the day the punch belongs to, or the time it should carry.`,
+    );
+  }
+}
+
+/**
  * APPLY TIME: the punch this correction names was superseded after the request was filed, so the
  * correction can never be written.
  *
@@ -363,6 +429,11 @@ export function fileAmendment(sql: SqlStorage, input: NewAmendment): number {
     ? describeAddition(sql, input)
     : describeCorrection(sql, input);
 
+  // AFTER the day is known and BEFORE the route is resolved, so it covers both shapes with one
+  // call: an addition's day is the caller's and a correction's is the target's, and the occurrence
+  // has to belong to whichever it turned out to be.
+  assertOccurrenceOnDay(sql, input.employeeId, workDate, input.occurredAt);
+
   // Asked at the filing instant, not against the day the punch belongs to. "Who can approve this?"
   // is a question about the org as it stands when the answer is needed; a correction to a punch
   // from three months ago is approved by whoever manages this employee today, because that is who
@@ -478,6 +549,45 @@ function describeAddition(
   if (pending !== null) throw new DuplicateAmendmentError(pending);
 
   return { workDate: input.workDate, kind: input.kind };
+}
+
+/** JST has no DST, so every JST day is exactly this long. */
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Could a punch filed against `workDate` have occurred at `occurredAt`? See
+ * `OccurrenceWorkDateError` for the bound and the argument for it.
+ *
+ * HERE RATHER THAN IN THE SESSION, which is where the request is assembled. The rule needs the
+ * employee's `work_date_policy`, which is a row in this database: asked from the facet it would be
+ * another RPC and another turn of the input gate between the answer and the insert that relies on
+ * it. It also has to hold for every caller of `fileAmendment`, and the session facet is only the
+ * first of them — an admin surface filing from a paper sheet is the next, and a rule enforced in
+ * one of two callers is the shape this package has repeatedly shipped bugs from.
+ *
+ * NOT IN `recordPunch`, which takes its work date on trust and must keep doing so: it is the write
+ * the tests, the importers and the apply path itself use, each of which knows the day for a reason
+ * of its own. This is a rule about a REQUEST a human will be asked to approve.
+ */
+function assertOccurrenceOnDay(
+  sql: SqlStorage, employeeId: EmployeeId, workDate: string, occurredAt: number,
+): void {
+  const policy = workDatePolicyOf(sql, employeeId);
+  const start = workDateStart(workDate);
+  // A day this function cannot place cannot be checked, and passing would mean the check is
+  // silently absent for exactly the malformed rows a caller might contrive. `assertWorkDate` has
+  // already run for an addition; a correction's day comes from `punches`, where `recordPunch`
+  // accepts whatever it is handed. Refusing fails safe: such a punch is not amendable through this
+  // path, and `KINTAI_AMENDMENT_WORK_DATE` says so.
+  if (!Number.isFinite(start)) throw new OccurrenceWorkDateError(workDate, policy);
+
+  const end = policy === "shift_start" ? start + DAY_MS + MAX_SHIFT_MS : start + DAY_MS;
+  // Half-open, like every other interval in this package: the first instant of the next day is
+  // the next day's, and `MAX_SHIFT_MS` exactly is the first instant a shift stops claiming punches
+  // (see `MAX_SHIFT_MS`, which `openShiftWorkDate` compares the same way).
+  if (occurredAt < start || occurredAt >= end) {
+    throw new OccurrenceWorkDateError(workDate, policy);
+  }
 }
 
 /**
