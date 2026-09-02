@@ -19,6 +19,7 @@ export type KintaiAdminClient = {
   createEmployee(input: NewEmployee): Promise<EmployeeId>;
   linkAccount(accountId: string, employeeId: EmployeeId): Promise<void>;
   setReportingLine(employeeId: EmployeeId, managerId: EmployeeId): Promise<void>;
+  setDesignatedApprover(employeeId: EmployeeId, approverId: EmployeeId): Promise<void>;
   grantExemption(employeeId: EmployeeId): Promise<void>;
   setWorkDatePolicy(employeeId: EmployeeId, policy: WorkDatePolicy): Promise<void>;
 };
@@ -31,7 +32,7 @@ type View =
   | { status: "admin"; identity: KintaiIdentity; roster: RosterEntry[] };
 
 /** Which form a message or a spinner belongs to. Failures must land beside what failed. */
-type FormKey = "create" | "link" | "report" | "exempt" | "policy";
+type FormKey = "create" | "link" | "report" | "approver" | "exempt" | "policy";
 type Notice = { kind: "ok" | "error"; text: string };
 
 /**
@@ -57,10 +58,12 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
   // Set by the roster's row actions so a form opens on the employee whose row was clicked.
   const [linkTarget, setLinkTarget] = useState<string>("");
   const [reportTarget, setReportTarget] = useState<string>("");
+  const [approverTarget, setApproverTarget] = useState<string>("");
   const [exemptTarget, setExemptTarget] = useState<string>("");
   const [policyTarget, setPolicyTarget] = useState<string>("");
   const linkCodeRef = useRef<HTMLInputElement>(null);
   const managerRef = useRef<HTMLSelectElement>(null);
+  const approverRef = useRef<HTMLSelectElement>(null);
   const exemptRef = useRef<HTMLSelectElement>(null);
   const policyRef = useRef<HTMLSelectElement>(null);
   const live = useRef(true);
@@ -186,6 +189,10 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
               setReportTarget(String(employee.id));
               reveal(managerRef.current, "set-reporting-line");
             }}
+            onSetApprover={(employee) => {
+              setApproverTarget(String(employee.id));
+              reveal(approverRef.current, "set-designated-approver");
+            }}
             onExempt={(employee) => {
               setExemptTarget(String(employee.id));
               reveal(exemptRef.current, "grant-exemption");
@@ -222,6 +229,20 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
                   await api.setReportingLine(employeeId, managerId);
                   return `${nameOf(view.roster, employeeId)} now reports to ` +
                     `${nameOf(view.roster, managerId)}.`;
+                })}
+            />
+            <DesignatedApproverForm
+              roster={view.roster}
+              employeeId={approverTarget}
+              onEmployeeId={setApproverTarget}
+              approverRef={approverRef}
+              busy={pending === "approver"}
+              notice={notices.approver}
+              onSubmit={(employeeId, approverId) =>
+                submit("approver", "Couldn’t set that designated approver.", async () => {
+                  await api.setDesignatedApprover(employeeId, approverId);
+                  return `${nameOf(view.roster, approverId)} can now approve for ` +
+                    `${nameOf(view.roster, employeeId)}.`;
                 })}
             />
             <ExemptionForm
@@ -376,19 +397,22 @@ function AccountCard({ identity, admin }: { identity: KintaiIdentity; admin: boo
  * Who exists, who is linked, and — the column this screen exists for — who still cannot use the
  * system.
  *
- * A linked employee with no reachable approver is not done. `submitOvertime` calls
- * `assertApproverReachable` and will refuse them the first time they file, so showing a link as
- * completion would be a promise the system does not keep. `approverReachable` comes from the
- * server, computed by the same function that enforcement calls; nothing here re-derives it from
- * the manager list, because that list is shown to explain the verdict rather than to reach it.
+ * A linked employee with no reachable approver is not done. `submitOvertime` and `fileAmendment`
+ * both call `assertApproverReachable` and will refuse them the first time they file, so showing a
+ * link as completion would be a promise the system does not keep. `approverReachable` comes from
+ * the server, computed by the same function that enforcement calls; nothing here re-derives it
+ * from the manager list or from `exempt`, because those are shown to explain the verdict rather
+ * than to reach it — and `exempt` is not even an input to it. This screen once showed "Ready ·
+ * 管理監督者" for an employee whose punch corrections nobody could have approved.
  */
 function Roster({
-  roster, canSetManager, onLink, onSetManager, onExempt, onSetPolicy,
+  roster, canSetManager, onLink, onSetManager, onSetApprover, onExempt, onSetPolicy,
 }: {
   roster: RosterEntry[];
   canSetManager: boolean;
   onLink: (employee: RosterEntry) => void;
   onSetManager: (employee: RosterEntry) => void;
+  onSetApprover: (employee: RosterEntry) => void;
   onExempt: (employee: RosterEntry) => void;
   onSetPolicy: (employee: RosterEntry) => void;
 }) {
@@ -421,6 +445,7 @@ function Roster({
               canSetManager={canSetManager}
               onLink={() => onLink(employee)}
               onSetManager={() => onSetManager(employee)}
+              onSetApprover={() => onSetApprover(employee)}
               onExempt={() => onExempt(employee)}
               onSetPolicy={() => onSetPolicy(employee)}
             />
@@ -432,13 +457,14 @@ function Roster({
 }
 
 function RosterRow({
-  employee, names, canSetManager, onLink, onSetManager, onExempt, onSetPolicy,
+  employee, names, canSetManager, onLink, onSetManager, onSetApprover, onExempt, onSetPolicy,
 }: {
   employee: RosterEntry;
   names: Map<number, string>;
   canSetManager: boolean;
   onLink: () => void;
   onSetManager: () => void;
+  onSetApprover: () => void;
   onExempt: () => void;
   onSetPolicy: () => void;
 }) {
@@ -475,7 +501,14 @@ function RosterRow({
             )}
             {!employee.approverReachable && (
               <li className="text-xs text-kumo-danger" data-issue="no-approver">
-                Nobody can approve for them — overtime they file will be refused.
+                {/* Not "overtime". A punch correction needs approval too, and naming only
+                    overtime is what made an exempt officer look finished: they file no overtime,
+                    so the warning read as inapplicable to them. */}
+                {employee.exempt
+                  ? "Nobody can approve for them — 管理監督者 exempts their overtime, but a punch" +
+                    " correction still needs a person. Give them a manager or a designated approver."
+                  : "Nobody can approve for them — anything they file will be refused. Give them a" +
+                    " manager, or a designated approver if they report to nobody."}
               </li>
             )}
           </ul>
@@ -504,18 +537,33 @@ function RosterRow({
           </button>
         )}
         {/* The other honest way to complete this row, and the only one for somebody at the top of
-            the organisation. Offered beside "Set manager" so the choice is visible at the moment
-            HR would otherwise reach for a reporting line that does not exist. */}
-        {!employee.approverReachable && (
+            the organisation. Gated on the same `canSetManager`: a designated approver is another
+            employee, so with one record on the roster there is nobody to name and the form would
+            have nothing in its dropdown. */}
+        {!employee.approverReachable && canSetManager && (
           <button
             type="button"
-            data-action="exempt-this"
+            data-action="approver-for-this"
             className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-xs font-medium text-kumo-default hover:bg-kumo-tint"
-            onClick={onExempt}
+            onClick={onSetApprover}
           >
-            管理監督者
+            Set approver
           </button>
         )}
+        {/* Offered on every row, and NOT as a repair — which is what it used to look like, sitting
+            beside "Set manager" on exactly the rows that had no approver. 管理監督者 exempts an
+            employee's overtime from a premium; it grants nobody authority to sign, so it never
+            finished a row, and pointing HR at it from a row that needed an approver was pointing
+            them at a button that would not have fixed what they were looking at. It belongs with
+            "Work dates": a determination about one employee that HR makes on its own terms. */}
+        <button
+          type="button"
+          data-action="exempt-this"
+          className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-xs font-medium text-kumo-default hover:bg-kumo-tint"
+          onClick={onExempt}
+        >
+          管理監督者
+        </button>
         {/* Always offered, unlike the two above: an employee on the wrong work-date policy is not
             a broken row — the roster cannot tell, because both answers are legitimate — so there
             is no "issue" for this button to appear in response to. It is the only way HR can see
@@ -543,7 +591,10 @@ function approverReason(employee: RosterEntry, names: Map<number, string>): stri
   if (employee.managerIds.length > 0) {
     return `reports to ${employee.managerIds.map((id) => label(names, id)).join(", ")}`;
   }
-  if (employee.exempt) return "管理監督者 (exempt from overtime approval)";
+  // No 管理監督者 arm, and it is not an omission. This function mirrors `hasReachableApprover`,
+  // which stopped counting an exemption: it exempts overtime from a premium and authorises nobody
+  // to sign anything. Reported here it read as "Ready · 管理監督者" on a row whose punch
+  // corrections nobody could have approved -- observed live on 2026-09-01, on the Admin record.
   if (employee.designated_approver_id !== null) {
     return `approver ${label(names, employee.designated_approver_id)}`;
   }
@@ -677,6 +728,72 @@ function ReportingLineForm({
 }
 
 /**
+ * Name the person who may approve for an employee who reports to nobody.
+ *
+ * The other half of a reporting line, and the only half that reaches the top of the org chart.
+ * Whoever sits there has no manager by definition, and until this form existed the column that
+ * exists for them — `designated_approver_id` — was settable only when the record was created, so
+ * employee 1, created before anybody exists to name, could never be given one.
+ *
+ * Its own form rather than a control on the row, for the reason the exemption is: this hands one
+ * person authority to sign for another, on the record of the employee nobody else reviews. The
+ * row's button brings the reader here with the employee already chosen; the deliberate press is
+ * the one that writes.
+ */
+function DesignatedApproverForm({
+  roster, employeeId, onEmployeeId, approverRef, busy, notice, onSubmit,
+}: {
+  roster: RosterEntry[];
+  employeeId: string;
+  onEmployeeId: (value: string) => void;
+  approverRef: React.RefObject<HTMLSelectElement | null>;
+  busy: boolean;
+  notice?: Notice;
+  onSubmit: (employeeId: EmployeeId, approverId: EmployeeId) => Promise<boolean>;
+}) {
+  const [approverId, setApproverId] = useState("");
+  const id = useId();
+
+  return (
+    <FormCard
+      title="Set a designated approver"
+      hint="For an employee at the top of the organisation, who reports to nobody: it names the one person who may approve what they file — overtime, and corrections to their punches. Use a reporting line instead wherever one honestly exists. Nobody may approve their own submissions, so an employee cannot be their own approver."
+      disabled={roster.length < 2}
+      disabledHint="Two employee records are needed before anyone can approve for anyone."
+      busy={busy}
+      notice={notice}
+      action="set-designated-approver"
+      submitLabel="Set approver"
+      onSubmit={async () => {
+        if (!await onSubmit(Number(employeeId), Number(approverId))) return;
+        onEmployeeId("");
+        setApproverId("");
+      }}
+    >
+      <Field label="Employee" htmlFor={`${id}-employee`}>
+        <EmployeeSelect
+          id={`${id}-employee`}
+          name="employeeId"
+          roster={roster}
+          value={employeeId}
+          onChange={onEmployeeId}
+        />
+      </Field>
+      <Field label="Approved by" htmlFor={`${id}-approver`}>
+        <EmployeeSelect
+          id={`${id}-approver`}
+          name="approverId"
+          selectRef={approverRef}
+          roster={roster}
+          value={approverId}
+          onChange={setApproverId}
+        />
+      </Field>
+    </FormCard>
+  );
+}
+
+/**
  * Record that somebody is 管理監督者.
  *
  * Its own form rather than a button that writes straight from the roster row, and not only for
@@ -702,7 +819,7 @@ function ExemptionForm({
   return (
     <FormCard
       title="Record a 管理監督者 exemption"
-      hint="For a manager or officer who reports to nobody: it marks them exempt from overtime premiums, and from needing anybody to approve for them. Recorded from now and open-ended — there is no way to end it here yet, so use it only where the determination has actually been made."
+      hint="For a manager or officer whose authority and treatment make them 管理監督者 under 労働基準法 §41: it marks them exempt from overtime premiums, so they file no overtime requests. It does NOT give them an approver — their punches still need correcting sometimes, and a correction needs a person, so they still need a manager or a designated approver. Recorded from now and open-ended — there is no way to end it here yet, so use it only where the determination has actually been made."
       disabled={roster.length === 0}
       disabledHint="Add an employee record first."
       busy={busy}

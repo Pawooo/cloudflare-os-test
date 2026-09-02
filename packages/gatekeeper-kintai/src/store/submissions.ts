@@ -116,12 +116,12 @@ export class SelfApprovalError extends Error {
  * `created_by` is nullable, and a null must never match an actor: it records that no filer was
  * captured (an older row, or a `submitOvertime` call that omitted it), not that the actor was one.
  *
- * KNOWN GAP, deliberately left: `assertSatisfiable` refuses a route step pinned to the *employee*
- * at filing time, so such a submission never strands. It does not know about the filer, so a step
- * pinned to somebody who then files on another's behalf produces a submission nobody can decide —
- * discovered only when they try. Unreachable today, because the one caller that sets `createdBy`
- * (`KintaiSession.submitOvertime`) sets it to the employee; it becomes reachable with the first
- * filed-on-behalf path, and the filing-time check belongs there rather than here.
+ * `assertSatisfiable` is the filing-time half of this and now takes the filer, so a route step
+ * pinned to whoever files is refused before a submission exists rather than after somebody tries
+ * to decide it. One case is left for this check and cannot move earlier: a `manager_of` step whose
+ * only live manager turns out to be the filer. That set is resolved at approval time and can
+ * change in between, so asking at filing would mean re-resolving the org the snapshot exists to
+ * freeze — such a request is refused here, when it is asked.
  */
 export class FiledBySelfError extends Error {
   readonly code = "KINTAI_FILED_BY_APPROVER";
@@ -136,11 +136,16 @@ export class FiledBySelfError extends Error {
 /**
  * The spec says 管理監督者 "shouldn't be raising overtime requests at all" — they are exempt from
  * the premiums overtime approval exists to control, so there is nothing for an approver to sign.
- * No task in the plan wires that rule in elsewhere, and without it an exempt employee's submission
- * would be silently accepted and then strand: their own exemption satisfies `hasReachableApprover`
- * (Task 10), but that is a statement about them needing no approver, not about anyone being
- * required or able to approve a step. This is defense in depth in the same spirit as
- * `SelfApprovalError` — a store-level guard, not merely a UI concern.
+ * Defense in depth in the same spirit as `SelfApprovalError`: a store-level guard, not merely a UI
+ * concern.
+ *
+ * It was for a while the ONLY thing standing between an exempt employee and a stranded request,
+ * because `hasReachableApprover` counted an exemption as "needs nobody" and so let one through.
+ * That arm is gone — an exemption grants nobody authority to sign — so an exempt officer with
+ * nobody above them is now refused by `assertApproverReachable` as well, whichever instant each
+ * check is asked about. The two refusals answer different questions and both still belong here:
+ * this one is about the WORK (exempt work bears no premium, so there is nothing to approve), and
+ * that one is about the ORG (nobody could approve it if there were).
  */
 export class ExemptEmployeeError extends Error {
   readonly code = "KINTAI_EXEMPT_EMPLOYEE";
@@ -233,14 +238,33 @@ export function approvalEvents(sql: SqlStorage, submissionId: number): ApprovalE
  *    queue and can never advance. This is not exotic configuration: a 本社 escalation step pinned
  *    to a named 部長 strands that 部長's own overtime the moment they file any.
  *
- * A FOURTH way exists and is NOT rejected here: a step pinned to whoever FILED the submission, who
- * is refused by `FiledBySelfError` for the same reason the submitter is. This function is not given
- * the filer, and cannot be without deciding whether filing-on-behalf is even in play — see the
- * KNOWN GAP on `FiledBySelfError`. Unreachable while every filing path sets `created_by` to the
- * employee themself; the amendment work closes it with `assertAmendmentSatisfiable`. Do not read
- * the list above as exhaustive until it does.
+ *  - an `employee` step pinned to whoever FILED it, when that is not the employee. `checkMayAct`
+ *    refuses them by `FiledBySelfError` for the same reason it refuses the employee, so the step
+ *    is as unsatisfiable as a self-pinned one — a manager files a correction for their report
+ *    against a route that names the manager, and the request lands in a queue only they can see
+ *    and only they cannot act on.
+ *
+ * `createdBy` IS REQUIRED, and nullable rather than optional, so that every call site has to say
+ * who filed. An optional parameter is how the fourth case would go on being skipped by whichever
+ * path forgot it, which is exactly what happened while this function knew only about the employee.
+ * Null means no filer was recorded (an older row, or a store call that omitted it) and matches
+ * nobody — the same rule `FiledBySelfError` applies to a null `created_by`.
+ *
+ * It is one function rather than a general `assertSatisfiable` plus an amendment-flavoured one, and
+ * that is the deliberate part. The plan named the filer check `assertAmendmentSatisfiable` while
+ * amendments were the only path that could reach the shape; they are not — the store's
+ * `submitOvertime` takes `createdBy` too, and only the session facet's habit of setting it to the
+ * employee kept overtime out of it. A rule that two write paths both need, written twice, is how
+ * "who may approve" drifted apart here before.
+ *
+ * WHAT THIS DOES NOT CATCH, deliberately: a `manager_of` step whose only live manager happens to
+ * be the filer. The set of managers is resolved at approval time and can change between filing and
+ * then, and re-resolving the org here would make filing depend on the state the snapshot exists to
+ * freeze. That request is refused at approval instead, with `KINTAI_FILED_BY_APPROVER`.
  */
-export function assertSatisfiable(snapshot: RouteSnapshot, employeeId: EmployeeId): void {
+export function assertSatisfiable(
+  snapshot: RouteSnapshot, employeeId: EmployeeId, createdBy: EmployeeId | null,
+): void {
   if (snapshot.steps.length === 0) {
     throw new NoRouteError(
       `KINTAI_NO_ROUTE: approval route ${snapshot.routeId} has no approval steps, so nothing ` +
@@ -264,6 +288,21 @@ export function assertSatisfiable(snapshot: RouteSnapshot, employeeId: EmployeeI
       `KINTAI_NO_ROUTE: step ${selfPinned.stepIndex} of approval route ${snapshot.routeId} names ` +
       `this employee as its approver, and nobody may approve their own submission, so nothing ` +
       `could ever approve this request. Ask an administrator to fix it.`,
+    );
+  }
+  // After the employee arm, never before it: somebody who is both gets the more specific message,
+  // matching `checkMayAct`'s own ordering. Skipped when the filer IS the employee, which the arm
+  // above has already answered.
+  if (createdBy === null || createdBy === employeeId) return;
+  const filerPinned = snapshot.steps.find(
+    (step) => step.approverKind === "employee" && step.approverEmployeeId === createdBy,
+  );
+  if (filerPinned) {
+    throw new NoRouteError(
+      `KINTAI_NO_ROUTE: step ${filerPinned.stepIndex} of approval route ${snapshot.routeId} names ` +
+      `the person filing this request as its approver, and nobody may decide a request they ` +
+      `filed, so nothing could ever approve it. Ask the employee to file it themselves, or ask ` +
+      `an administrator to fix the route.`,
     );
   }
 }
@@ -290,13 +329,14 @@ export function submitOvertime(sql: SqlStorage, input: NewSubmission): number {
   // (`account_links` has an UPDATE ... valid_to path; `org_edges` does not), so no write can yet
   // orphan an employee who once had an approver. `createEmployee` cannot enforce it either, since
   // the very first employee in an organisation has no manager by definition. That leaves exactly
-  // one reachable hole: a `submitOvertime` call for an employee who never had a manager, an
-  // exemption, or a designated approver at all. Guard it here.
+  // one reachable hole: a `submitOvertime` call for an employee who never had a manager or a
+  // designated approver at all. Guard it here.
   //
-  // The moment an edge-closing API is introduced, this stops being the only hole: closing an
-  // employee's last reporting edge (or revoking their designated approver, if that ever becomes
-  // mutable) needs this same check at that write, not only at submission time — an employee who
-  // is orphaned before ever filing again would otherwise pass silently until they did.
+  // `setDesignatedApprover` only ever points the column AT somebody, so it cannot orphan anyone
+  // either. The moment an edge-closing API is introduced — or a way to clear a designated
+  // approver — this stops being the only hole: that write needs this same check, not only
+  // submission time, because an employee orphaned before they next file would otherwise pass
+  // silently until they did.
   //
   // Asked at `input.now`, NOT at `requestedAt`, and unlike exemption above that is the whole
   // point. "Who can approve this?" is a question about the org as it stands when the answer is
@@ -318,7 +358,7 @@ export function submitOvertime(sql: SqlStorage, input: NewSubmission): number {
     employmentType: input.employmentType,
     minutes: input.minutes,
   });
-  assertSatisfiable(snapshot, input.employeeId);
+  assertSatisfiable(snapshot, input.employeeId, input.createdBy ?? null);
 
   const row = sql
     .exec<{ id: number }>(
@@ -418,10 +458,11 @@ function designatedFallback(sql: SqlStorage, employeeId: EmployeeId): EmployeeId
  * designated approver, e.g. an employee covered only by a delegate, where the set stays empty and
  * the step is correctly never satisfied.
  *
- * Task 10's `hasReachableApprover` asks a related question with a third arm, 管理監督者 exemption.
- * That arm has no counterpart here and must not gain one: an exemption grants nobody authority to
- * sign, so it can never contribute a required approver. It means the employee needs no approval,
- * which is a question about whether to route at all, not about who must sign.
+ * `hasReachableApprover` asks the related question "is this set ever non-empty?", and now asks it
+ * over exactly these two arms. It used to have a third, 管理監督者 exemption, which had no
+ * counterpart here and never could: an exemption grants nobody authority to sign, so it can never
+ * contribute a required approver. Whether an employee needs approval at all is a different
+ * question, and `ExemptEmployeeError` is where overtime answers it.
  */
 function requiredApprovers(
   sql: SqlStorage, submission: SubmissionRow, step: RouteStep, now: number,

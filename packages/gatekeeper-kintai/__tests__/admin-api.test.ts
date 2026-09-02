@@ -57,6 +57,7 @@ const CALL_ARGS: Record<string, unknown[]> = {
   createEmployee: [{ employeeNumber: "X-1", displayName: "X", joinedOn: "2026-04-01" }],
   linkAccount: ["acct-victim", 1],
   setReportingLine: [1, 2],
+  setDesignatedApprover: [1, 2],
   grantExemption: [1],
   setWorkDatePolicy: [1, "shift_start"],
 };
@@ -70,7 +71,7 @@ const CALL_ARGS: Record<string, unknown[]> = {
  */
 const INTERFACE_MEMBERS = [
   "createEmployee", "grantExemption", "linkAccount", "listEmployees", "listReportingLines",
-  "setReportingLine", "setWorkDatePolicy", "whoAmI",
+  "setDesignatedApprover", "setReportingLine", "setWorkDatePolicy", "whoAmI",
 ];
 
 /**
@@ -475,36 +476,133 @@ describe("what an admin may write", () => {
   });
 });
 
-describe("recording 管理監督者", () => {
-  // The case this method exists for, and the one the roster could otherwise only be made green
-  // for by writing a reporting line that does not exist. A company officer reports to nobody.
+describe("designating an approver", () => {
+  // The case this method exists for. A company officer reports to nobody, and the only honest way
+  // to complete their row is to name the person who signs for them -- previously impossible,
+  // because `designated_approver_id` was settable only in `createEmployee`'s INSERT and employee 1
+  // is created when there is nobody in the table to point at.
   it("completes an employee who reports to nobody, without inventing a manager", async () => {
-    const hr = appUi(`acct-admin-exempt-${seq}`, true);
+    const hr = appUi(`acct-admin-designate-${seq}`, true);
     const officer = await employee("Officer");
+    const chair = await employee("Chair");
     await hr.linkAccount(`acct-officer-${seq}`, officer);
 
     const before = (await hr.listEmployees()).find((row: { id: number }) => row.id === officer);
-    expect(before).toMatchObject({ linked: true, exempt: false, approverReachable: false });
+    expect(before).toMatchObject({ linked: true, approverReachable: false });
 
-    await hr.grantExemption(officer);
+    await hr.setDesignatedApprover(officer, chair);
 
     const after = (await hr.listEmployees()).find((row: { id: number }) => row.id === officer);
     // Ready, and with an EMPTY manager list: nothing false was written into the org chart.
-    expect(after).toMatchObject({ exempt: true, approverReachable: true, managerIds: [] });
+    expect(after).toMatchObject({
+      designated_approver_id: chair, approverReachable: true, managerIds: [],
+    });
     expect(await store.listReportingLines())
       .not.toContainEqual(expect.objectContaining({ employee_id: officer }));
   });
 
-  // `hasReachableApprover` is what `submitOvertime` enforces through, so the roster's verdict has
+  // `hasReachableApprover` is what every filing path enforces through, so the roster's verdict has
   // to be the runtime's verdict and not a second reading that happens to agree today.
   it("makes the runtime agree that the employee can now file", async () => {
-    const hr = appUi(`acct-admin-exempt-runtime-${seq}`, true);
+    const hr = appUi(`acct-admin-designate-runtime-${seq}`, true);
     const officer = await employee("Runtime Officer");
+    const chair = await employee("Runtime Chair");
 
     await expect(() => store.assertApproverReachable(officer, Date.now()))
       .rejects.toThrow(/KINTAI_NO_APPROVER/);
-    await hr.grantExemption(officer);
+    await hr.setDesignatedApprover(officer, chair);
     await store.assertApproverReachable(officer, Date.now());
+  });
+
+  // Re-pointing overwrites, so the previous value survives only in the audit trail. That is the
+  // whole reason `before` is read ahead of the write.
+  it("audits the change with what it was and what it became", async () => {
+    const hr = appUi(`acct-admin-designate-audit-${seq}`, true);
+    const officer = await employee("Audited Officer");
+    const first = await employee("First Approver");
+    const second = await employee("Second Approver");
+
+    await hr.setDesignatedApprover(officer, first);
+    await hr.setDesignatedApprover(officer, second);
+
+    const entries = (await store.auditEntries())
+      .filter((row) => row.action === "set_designated_approver" && row.entity_id === officer);
+    expect(entries).toHaveLength(2);
+    expect(JSON.parse(entries[0].before!)).toEqual({ employeeId: officer, approverId: null });
+    expect(JSON.parse(entries[0].after!)).toEqual({ employeeId: officer, approverId: first });
+    expect(JSON.parse(entries[1].before!)).toEqual({ employeeId: officer, approverId: first });
+    expect(JSON.parse(entries[1].after!)).toEqual({ employeeId: officer, approverId: second });
+  });
+
+  // Nobody may approve their own submissions, so a self-designation grants no authority at all.
+  // `hasReachableApprover` and `requiredApprovers` both already collapse it to "no approver" and
+  // fail closed -- writing one would hand HR a green-looking field that changes nothing, which is
+  // the silent no-op `setReportingLine` refuses a self-edge to avoid.
+  it("refuses an employee designated as their own approver", async () => {
+    const hr = appUi(`acct-admin-designate-self-${seq}`, true);
+    const officer = await employee("Self Officer");
+
+    await expect(() => hr.setDesignatedApprover(officer, officer))
+      .rejects.toThrow(/KINTAI_INVALID_INPUT/);
+    expect(await store.designatedApproverOf(officer)).toBeNull();
+  });
+
+  it("refuses an approver who does not exist", async () => {
+    const hr = appUi(`acct-admin-designate-ghost-${seq}`, true);
+    const officer = await employee("Ghost Officer");
+
+    await expect(() => hr.setDesignatedApprover(officer, 999_999))
+      .rejects.toThrow(/KINTAI_NOT_FOUND/);
+    expect(await store.designatedApproverOf(officer)).toBeNull();
+  });
+
+  it("refuses an employee who does not exist", async () => {
+    await expect(() => appUi(`acct-admin-designate-noemp-${seq}`, true)
+      .setDesignatedApprover(999_999, 1)).rejects.toThrow(/KINTAI_NOT_FOUND/);
+  });
+
+  // Two officers who sign for each other is a legitimate arrangement and not a cycle anything
+  // walks: nothing follows `designated_approver_id` transitively -- `authorize` and
+  // `requiredApprovers` each take exactly one hop, and self-approval is what actually strands.
+  it("allows two employees to be each other's designated approver", async () => {
+    const hr = appUi(`acct-admin-designate-pair-${seq}`, true);
+    const one = await employee("Director A");
+    const two = await employee("Director B");
+
+    await hr.setDesignatedApprover(one, two);
+    await hr.setDesignatedApprover(two, one);
+
+    await store.assertApproverReachable(one, Date.now());
+    await store.assertApproverReachable(two, Date.now());
+  });
+
+  // A designated approver can sign for the employee at the root of the tree. Reachable by that
+  // employee, it would be a way to appoint whoever is most likely to say yes to their own record.
+  it("is refused to a non-administrator", async () => {
+    const officer = await employee("Nonadmin Officer");
+    const chair = await employee("Nonadmin Chair");
+
+    await expect(() => appUi(`acct-nonadmin-designate-${seq}`, false)
+      .setDesignatedApprover(officer, chair)).rejects.toThrow(/KINTAI_ADMIN_REQUIRED/);
+    expect(await store.designatedApproverOf(officer)).toBeNull();
+  });
+});
+
+describe("recording 管理監督者", () => {
+  // 管理監督者 says the employee's overtime bears no premium. It does NOT say anybody can approve
+  // for them, and the roster must not report it as though it did: their punches still need
+  // correcting, and a correction is a request that needs a human. Recorded, and still not ready.
+  it("does not complete an employee who reports to nobody", async () => {
+    const hr = appUi(`acct-admin-exempt-${seq}`, true);
+    const officer = await employee("Officer");
+    await hr.linkAccount(`acct-officer-${seq}`, officer);
+
+    await hr.grantExemption(officer);
+
+    const after = (await hr.listEmployees()).find((row: { id: number }) => row.id === officer);
+    expect(after).toMatchObject({ exempt: true, approverReachable: false, managerIds: [] });
+    await expect(() => store.assertApproverReachable(officer, Date.now()))
+      .rejects.toThrow(/KINTAI_NO_APPROVER/);
   });
 
   it("opens the period now and leaves it open", async () => {

@@ -24,13 +24,20 @@ describe("reachable approver", () => {
     expect(await store.hasReachableApprover(worker, JUL)).toBe(true);
   });
 
-  it("accepts a root employee who is 管理監督者 for that period", async () => {
+  // An exemption is not an approver. It says the employee's overtime bears no premium, which is
+  // why `submitOvertime` refuses them outright; it grants NOBODY authority to sign, so it can
+  // never make a request approvable. A correction to an exempt officer's punches is still a
+  // request that needs a human, and while this arm answered "reachable" that request was accepted
+  // and then sat in nobody's queue -- see `fileAmendment`.
+  it("does not accept a root employee whose only claim is a 管理監督者 exemption", async () => {
     const ceo = await store.createEmployee({
       employeeNumber: "V3", displayName: "CEO", joinedOn: "2026-04-01",
     });
     await store.grantExemption(ceo, APR);
 
-    expect(await store.hasReachableApprover(ceo, JUL)).toBe(true);
+    expect(await store.hasReachableApprover(ceo, JUL)).toBe(false);
+    await expect(() => store.assertApproverReachable(ceo, JUL))
+      .rejects.toThrow(/KINTAI_NO_APPROVER/);
   });
 
   it("accepts a root employee with a designated approver", async () => {
@@ -45,7 +52,7 @@ describe("reachable approver", () => {
     expect(await store.hasReachableApprover(president, JUL)).toBe(true);
   });
 
-  it("rejects a non-exempt root employee with no designated approver", async () => {
+  it("rejects a root employee with no designated approver", async () => {
     const orphan = await store.createEmployee({
       employeeNumber: "V6", displayName: "Orphan", joinedOn: "2026-04-01",
     });
@@ -100,20 +107,39 @@ describe("reachable approver", () => {
   // requiredApprovers, in case a future write path ever allows re-pointing it.
 
   describe("partial exemption windows", () => {
-    it("tracks exemption reachability instant-by-instant across the boundary", async () => {
-      // A root employee (no manager, no designated approver) exempt for part of the timeline but
-      // not all of it. hasReachableApprover must track isExempt's own half-open window exactly:
-      // reachable while exempt, unreachable the instant the exemption lapses.
+    // This used to pin the exemption arm's window against `isExempt`'s own half-open interval.
+    // The arm is gone, so what needs pinning is that no instant of an exemption window -- before
+    // it, inside it, after it -- makes any difference to the verdict. An exemption that flickered
+    // an employee in and out of "approvable" was the shape that let a correction be filed at one
+    // moment and be unapprovable at every moment afterwards.
+    it("counts an exemption at no instant, inside its window or outside it", async () => {
       const boundary = JUL; // exemption covers [APR, JUL)
       const root = await store.createEmployee({
         employeeNumber: "V12", displayName: "Root", joinedOn: "2026-04-01",
       });
       await store.grantExemption(root, APR, boundary);
 
-      expect(await store.hasReachableApprover(root, boundary - 1)).toBe(true);
-      expect(await store.hasReachableApprover(root, boundary)).toBe(false);
-      await expect(() => store.assertApproverReachable(root, boundary))
+      for (const at of [APR - 1, APR, boundary - 1, boundary, boundary + 1]) {
+        expect(await store.hasReachableApprover(root, at), `at ${at}`).toBe(false);
+      }
+      await expect(() => store.assertApproverReachable(root, APR))
         .rejects.toThrow(/KINTAI_NO_APPROVER/);
+    });
+
+    // The exemption is not ignored because it is irrelevant to the employee -- it is irrelevant to
+    // THIS question. A manager makes them approvable; the exemption neither adds to that nor
+    // takes it away.
+    it("neither helps nor hinders an exempt employee who has a manager", async () => {
+      const officer = await store.createEmployee({
+        employeeNumber: "V13", displayName: "Officer", joinedOn: "2026-04-01",
+      });
+      const chair = await store.createEmployee({
+        employeeNumber: "V14", displayName: "Chair", joinedOn: "2026-04-01",
+      });
+      await store.setReportingLine(officer, chair, APR);
+      await store.grantExemption(officer, APR);
+
+      expect(await store.hasReachableApprover(officer, JUL)).toBe(true);
     });
   });
 });

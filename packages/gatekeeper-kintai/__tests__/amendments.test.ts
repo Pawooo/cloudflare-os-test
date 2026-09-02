@@ -389,6 +389,26 @@ describe("filing an amendment", () => {
       expect(await store.pendingAmendmentForPunch(theirs)).toBeNull();
     });
 
+    // Asked at the FILING instant, not about the day the punch belongs to. A correction reaches
+    // back further than overtime ever does, so the work date is further from the org that has to
+    // act on it -- and the manager who has to act is the one who exists today. Anchored on the
+    // work date this is refused outright, permanently, with the obvious approver standing there.
+    it("asks who can approve as of now, not as of the day being corrected", async () => {
+      const latecomer = await store.createEmployee({
+        employeeNumber: "E904", displayName: "Late", joinedOn: "2026-04-01",
+      });
+      const theirs = await store.recordPunch({
+        employeeId: latecomer, workDate: DAY, kind: "in", now: NINE_AM, source: "gadget",
+      });
+      // Nobody could have approved for them on the day itself; a reporting line opened a month
+      // later, and it is that manager who will decide this request.
+      await store.setReportingLine(latecomer, managerId, NINE_AM + 30 * 86400_000);
+
+      await expect(store.fileAmendment(correction(theirs, {
+        employeeId: latecomer, createdBy: latecomer, now: NINE_AM + 40 * 86400_000,
+      }))).resolves.toEqual(expect.any(Number));
+    });
+
     it("refuses a route whose only step is pinned to the employee", async () => {
       // Scoped to a department so it outranks the seeded catch-all: an exact tie on specificity is
       // broken by the lowest route id, which is always that default.
@@ -403,6 +423,77 @@ describe("filing an amendment", () => {
       await expect(() => store.fileAmendment(
         correction(punchId, { department: "CONSTRUCTION" }),
       )).rejects.toThrow(/KINTAI_NO_ROUTE/);
+    });
+
+    // The shape overtime cannot reach and an amendment can. `submitOvertime` refuses an exempt
+    // employee outright -- no premium, nothing to approve -- so its exemption arm never came up.
+    // A 管理監督者's punches are still the record of when they worked, so this path deliberately
+    // does not refuse them, and while an exemption counted as "needs nobody" the request was
+    // accepted into a queue nobody could act on.
+    it("refuses an exempt employee with nobody to approve for them", async () => {
+      const officer = await store.createEmployee({
+        employeeNumber: "E905", displayName: "Officer", joinedOn: "2026-04-01",
+      });
+      await store.grantExemption(officer, APR);
+      const theirs = await store.recordPunch({
+        employeeId: officer, workDate: DAY, kind: "in", now: NINE_AM, source: "gadget",
+      });
+
+      await expect(() => store.fileAmendment(
+        correction(theirs, { employeeId: officer, createdBy: officer }),
+      )).rejects.toThrow(/KINTAI_NO_APPROVER/);
+      expect(await store.pendingAmendmentForPunch(theirs)).toBeNull();
+    });
+
+    // And the fix the refusal names actually works, which is the half that matters: refusing an
+    // officer who can never be given an approver would just be stranding them earlier.
+    it("accepts that same employee once an administrator designates an approver", async () => {
+      const officer = await store.createEmployee({
+        employeeNumber: "E906", displayName: "Officer", joinedOn: "2026-04-01",
+      });
+      await store.grantExemption(officer, APR);
+      await store.setDesignatedApprover(officer, managerId);
+      const theirs = await store.recordPunch({
+        employeeId: officer, workDate: DAY, kind: "in", now: NINE_AM, source: "gadget",
+      });
+
+      const submissionId = await store.fileAmendment(
+        correction(theirs, { employeeId: officer, createdBy: officer }),
+      );
+      // Filed AND decidable, by the person named. The route resolves to a manager step, which
+      // `authorize` satisfies from the designated approver for an employee with no reporting line.
+      expect(await store.actOnSubmission({
+        submissionId, actorId: managerId, action: "approve", now: NINE_AM + 2 * 3600_000,
+      })).toBe("approved");
+    });
+
+    // The fourth way a route can be unsatisfiable, and the one `assertSatisfiable` could not see
+    // until it was told who filed. A step pinned to the filer is refused by `checkMayAct` at
+    // approval time, so the request would sit in a queue nobody could clear.
+    it("refuses a route whose only step is pinned to whoever filed it", async () => {
+      await store.createRoute({
+        name: "filer-pinned", department: "CONSTRUCTION",
+        steps: [{ rule: "any_of", approverKind: "employee", approverEmployeeId: managerId }],
+      });
+      const punchId = await punchAt(NINE_AM);
+
+      await expect(() => store.fileAmendment(correction(punchId, {
+        department: "CONSTRUCTION", createdBy: managerId,
+      }))).rejects.toThrow(/KINTAI_NO_ROUTE/);
+      expect(await store.pendingAmendmentForPunch(punchId)).toBeNull();
+    });
+
+    // The same route, filed by the employee themself, is fine: the pinned approver is a third
+    // party to it. Refusing this too would make a legitimate escalation route unusable.
+    it("accepts that same route when the employee files their own correction", async () => {
+      await store.createRoute({
+        name: "third-party-pinned", department: "CONSTRUCTION",
+        steps: [{ rule: "any_of", approverKind: "employee", approverEmployeeId: managerId }],
+      });
+      const punchId = await punchAt(NINE_AM);
+
+      await expect(store.fileAmendment(correction(punchId, { department: "CONSTRUCTION" })))
+        .resolves.toEqual(expect.any(Number));
     });
 
     it("freezes the resolved route onto the submission", async () => {
@@ -482,6 +573,75 @@ describe("filing an amendment", () => {
 
       const queue = await store.pendingApprovalsFor(managerId, NINE_AM + 4 * 3600_000);
       expect(queue.map((row) => row.id)).toContain(submissionId);
+    });
+  });
+
+  /**
+   * `checkMayAct`'s filer refusal, pinned on the path that made it necessary.
+   *
+   * It landed with overtime (`a944e0f`) where it is a no-op, because `created_by` and
+   * `employee_id` are the same person for every overtime submission the facet writes. Amendments
+   * are the first thing that separates them for real: a foreman fixes their worker's forgotten
+   * clock-out, and without this they would be authorising a change to payroll input they
+   * originated, with nothing in the trail saying the two hands were one.
+   */
+  describe("nobody approves what they filed", () => {
+    it("refuses an approval by the manager who filed it for their report", async () => {
+      const punchId = await punchAt(NINE_AM);
+      const submissionId = await store.fileAmendment(
+        correction(punchId, { createdBy: managerId }),
+      );
+
+      await expect(() => store.actOnSubmission({
+        submissionId, actorId: managerId, action: "approve", now: NINE_AM + 4 * 3600_000,
+      })).rejects.toThrow(/KINTAI_FILED_BY_APPROVER/);
+      expect((await store.getSubmission(submissionId)).state).toBe("pending");
+    });
+
+    it("lets a different approver decide the same request", async () => {
+      // A second manager of the EMPLOYEE, not of the foreman: the seeded route is a single
+      // `any_of` manager step, so both are live approvers and the request the filer cannot decide
+      // is not thereby undecidable.
+      const bossId = await store.createEmployee({
+        employeeNumber: "B900", displayName: "Ito", joinedOn: "2026-04-01",
+      });
+      await store.setReportingLine(employeeId, bossId, APR);
+      const punchId = await punchAt(NINE_AM);
+      const submissionId = await store.fileAmendment(
+        correction(punchId, { createdBy: managerId }),
+      );
+
+      expect(await store.actOnSubmission({
+        submissionId, actorId: bossId, action: "approve", now: NINE_AM + 4 * 3600_000,
+      })).toBe("approved");
+    });
+
+    it("keeps it out of the filer's own queue, and in the other approver's", async () => {
+      const bossId = await store.createEmployee({
+        employeeNumber: "B901", displayName: "Ito", joinedOn: "2026-04-01",
+      });
+      await store.setReportingLine(employeeId, bossId, APR);
+      const punchId = await punchAt(NINE_AM);
+      const submissionId = await store.fileAmendment(
+        correction(punchId, { createdBy: managerId }),
+      );
+
+      const at = NINE_AM + 4 * 3600_000;
+      expect((await store.pendingApprovalsFor(managerId, at)).map((row) => row.id))
+        .not.toContain(submissionId);
+      expect((await store.pendingApprovalsFor(bossId, at)).map((row) => row.id))
+        .toContain(submissionId);
+    });
+
+    it("reports self-approval, not this, when the employee filed their own correction", async () => {
+      // Both rules match when an employee corrects their own punch, and the more specific one has
+      // to answer -- otherwise they are told a third party filed what they filed themselves.
+      const punchId = await punchAt(NINE_AM);
+      const submissionId = await store.fileAmendment(correction(punchId));
+
+      await expect(() => store.actOnSubmission({
+        submissionId, actorId: employeeId, action: "approve", now: NINE_AM + 4 * 3600_000,
+      })).rejects.toThrow(/KINTAI_SELF_APPROVAL/);
     });
   });
 });

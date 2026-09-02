@@ -34,6 +34,12 @@ export type PunchKind = (typeof PUNCH_KINDS)[number];
  * Adding a value is one edit here plus an activation: the seed is `INSERT OR IGNORE`, so the new
  * row appears on the next `applySchema` and no table is ever rebuilt.
  */
+/**
+ * TASK 7 MUST HAND-UPDATE `src/types.txt` WHEN AMENDMENTS BECOME REACHABLE. That file documents
+ * `SubmissionRow.kind` as `"overtime"` and nothing ties it to this array — no generator, no test.
+ * It is truthful only while no agent-reachable surface can create an amendment, which is exactly
+ * what Task 7 changes.
+ */
 export const SUBMISSION_KINDS = ["overtime", "amendment"] as const;
 export type SubmissionKind = (typeof SUBMISSION_KINDS)[number];
 
@@ -128,26 +134,34 @@ export type EmployeeRow = {
  * One employee plus everything the HR roster needs to say whether they can actually use the system.
  *
  * The computed half exists because "created" and "linked" are not the same as "working". An
- * employee whose account is linked still cannot file overtime unless somebody could approve it —
- * `submitOvertime` calls `assertApproverReachable` and refuses otherwise — so HR would finish
- * onboarding, see a linked record, and have produced a person the system will turn away. Every
- * field here is computed at the instant of the read from the same functions the runtime uses, so
- * the roster cannot promise something the enforcement path then denies.
+ * employee whose account is linked still cannot file anything unless somebody could approve it —
+ * `submitOvertime` and `fileAmendment` both call `assertApproverReachable` and refuse otherwise —
+ * so HR would finish onboarding, see a linked record, and have produced a person the system will
+ * turn away. Every field here is computed at the instant of the read from the same functions the
+ * runtime uses, so the roster cannot promise something the enforcement path then denies.
  */
 export type RosterEntry = EmployeeRow & {
   /** An account capability currently resolves to this employee. */
   linked: boolean;
   /** Reporting managers in force right now. Delegates are excluded, as they are everywhere else. */
   managerIds: EmployeeId[];
-  /** 管理監督者 right now: exempt from overtime premiums, and so from needing an approver. */
+  /**
+   * 管理監督者 right now: exempt from overtime premiums.
+   *
+   * NOT from needing an approver, which is what it used to say and what the roster used to show.
+   * An exemption grants nobody authority to sign; an exempt officer files no overtime, but their
+   * punches still need correcting and a correction still needs a human. It is shown beside
+   * `approverReachable`, never as a substitute for it.
+   */
   exempt: boolean;
   /**
    * Somebody could approve what this employee files.
    *
-   * Straight from the store's `hasReachableApprover` — the SAME function `submitOvertime` reaches
-   * through `assertApproverReachable`, never a second reading of the org tables. The three fields
-   * above are shown so HR can see WHY it is false and what would fix it; this one is the verdict,
-   * and it is the one the runtime will apply.
+   * Straight from the store's `hasReachableApprover` — the SAME function `submitOvertime` and
+   * `fileAmendment` reach through `assertApproverReachable`, never a second reading of the org
+   * tables. The three fields above are shown so HR can see WHY it is false and what would fix it;
+   * this one is the verdict, and it is the one the runtime will apply. Note that `exempt` is NOT
+   * one of the reasons it can be true — it is context for a row that is false.
    */
   approverReachable: boolean;
 };

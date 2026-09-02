@@ -14,6 +14,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 const APR = Date.parse("2026-04-01T00:00:00Z");
 const JUL = Date.parse("2026-07-03T00:00:00Z");
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 let store: ReturnType<typeof env.KINTAI_STORE.getByName>;
 let seq = 0;
@@ -902,13 +903,42 @@ describe("unusable routes", () => {
     });
     await expect(() => submit()).rejects.toThrow(/KINTAI_NO_ROUTE|no approver/i);
   });
+
+  // The fourth unsatisfiable shape, on the overtime path. It is not amendment-only: the store's
+  // `submitOvertime` takes `createdBy`, and only the session facet's habit of setting it to the
+  // employee kept this out of reach. Filed by the person the route pins, the request would reach
+  // step 1 and stop there for good -- `authorize` refuses everyone but Director, and `checkMayAct`
+  // refuses Director for having filed it.
+  it("refuses to create a submission against a step pinned to whoever filed it", async () => {
+    await twoStepRoute();
+
+    await expect(() => store.submitOvertime({
+      employeeId: worker, requestedFor: "2026-07-03", minutes: 120,
+      reason: "entered from the paper sheet", now: JUL,
+      department: "CONSTRUCTION", employmentType: null, createdBy: director,
+    })).rejects.toThrow(/KINTAI_NO_ROUTE/);
+    await expect(() => store.getSubmission(1)).rejects.toThrow(/KINTAI_NOT_FOUND/);
+  });
+
+  // The same route is fine when somebody else files, including the employee themself. The check is
+  // about this filer and this route, not about the route being unusable.
+  it("accepts that same route when the pinned approver did not file it", async () => {
+    await twoStepRoute();
+
+    await expect(store.submitOvertime({
+      employeeId: worker, requestedFor: "2026-07-03", minutes: 120,
+      reason: "entered from the paper sheet", now: JUL,
+      department: "CONSTRUCTION", employmentType: null, createdBy: boss,
+    })).resolves.toEqual(expect.any(Number));
+  });
 });
 
-// The spec says 管理監督者 "shouldn't be raising overtime requests at all", but exemption alone
-// satisfies hasReachableApprover (Task 10), so nothing else stops a submission of theirs from
-// being accepted and then stranding — no manager is required to sign it, and nobody is able to.
-// This is a store-level guard in the same spirit as the self-approval check: defense in depth, not
-// merely a UI concern.
+// The spec says 管理監督者 "shouldn't be raising overtime requests at all": they are exempt from
+// the premiums overtime approval exists to control, so there is nothing for an approver to sign.
+// A store-level guard in the same spirit as the self-approval check -- defense in depth, not
+// merely a UI concern. It is no longer the only thing standing between an exempt employee and a
+// stranded request: an exemption stopped counting as a reachable approver, so an exempt officer
+// with nobody above them is refused by `assertApproverReachable` too, whichever day they file for.
 describe("exempt employees", () => {
   it("refuses an overtime request from an employee exempt for the requested period", async () => {
     await singleStepRoute();
@@ -923,6 +953,49 @@ describe("exempt employees", () => {
     await store.grantExemption(worker, APR, JUL - 1000 * 60 * 60 * 24 * 3);
 
     await expect(submit()).resolves.toEqual(expect.any(Number));
+  });
+
+  // The deliberate half of the split `938639c` made: reachability moved to `now`, exemption stayed
+  // on the work date. Nothing asserted the half that stayed, so moving the exemption check to
+  // `input.now` too passed every test in this suite.
+  it("refuses a day the employee was exempt for, however long afterwards they file", async () => {
+    await singleStepRoute();
+    // Exempt across the work date; the exemption ends a week later, and they file a week after
+    // that. Exemption is a property of the WORK, so filing late must not launder it.
+    await store.grantExemption(worker, APR, JUL + 7 * DAY_MS);
+
+    await expect(() => store.submitOvertime({
+      employeeId: worker, requestedFor: "2026-07-03", minutes: 120,
+      reason: "site overrun", now: JUL + 14 * DAY_MS,
+      department: "CONSTRUCTION", employmentType: null,
+    })).rejects.toThrow(/KINTAI_EXEMPT_EMPLOYEE/);
+  });
+
+  // `requestedFor` is a JST calendar date, and `workDateStart` is what turns it into the instant
+  // that date BEGINS. `Date.parse("2026-07-03")` is UTC midnight -- 09:00 JST, mid-morning of the
+  // day it claims to start -- so both of these read the wrong nine hours, in opposite directions,
+  // and neither was covered by anything.
+  describe("a window that moves inside the 00:00-09:00 JST band", () => {
+    it("refuses a day whose exemption lapsed during that morning", async () => {
+      await singleStepRoute();
+      // Exempt until 03:00 JST on the work date. The employee WAS 管理監督者 when that work date
+      // began, so the day is exempt work and the request is refused. Anchored at 09:00 JST the
+      // exemption reads as already over and the request would be accepted.
+      await store.grantExemption(worker, APR, Date.parse("2026-07-03T03:00:00+09:00"));
+
+      await expect(() => submit()).rejects.toThrow(/KINTAI_EXEMPT_EMPLOYEE/);
+    });
+
+    it("allows a day whose exemption only began during that morning", async () => {
+      await singleStepRoute();
+      // 管理監督者 from 03:00 JST on the work date. The date began before that, so it is not an
+      // exempt work date and the request stands. Anchored at 09:00 JST the exemption reads as
+      // covering the whole day and the request would be refused -- credit denied for a day the
+      // determination did not cover.
+      await store.grantExemption(worker, Date.parse("2026-07-03T03:00:00+09:00"));
+
+      await expect(submit()).resolves.toEqual(expect.any(Number));
+    });
   });
 });
 
@@ -940,5 +1013,37 @@ describe("no reachable approver", () => {
     // Confirm no submission was left behind: this is the first submission this store would ever
     // create, so if the guard let it through it would be id 1.
     await expect(() => store.getSubmission(1)).rejects.toThrow(/KINTAI_NOT_FOUND/);
+  });
+
+  /**
+   * The gap `938639c` opened, reproduced end to end.
+   *
+   * Exemption is asked about the work date; reachability is asked about `now`. While both used
+   * the same instant, an employee whose only claim to an approver was their own exemption had
+   * already been refused by `ExemptEmployeeError` before reachability was consulted, so
+   * reachability's exemption arm was unreachable from here. Splitting the instants uncoupled them:
+   * not exempt on the day worked, exempt by the time they file, and the exemption arm then answers
+   * "reachable" for an employee no route can ever name.
+   *
+   * The result was a `pending` submission in nobody's queue -- `requiredApprovers` never counts an
+   * exemption, and `authorize` has no edge and no designated approver to fall back on -- clearable
+   * only by withdrawing it. Exactly what `assertApproverReachable` was wired in to prevent.
+   */
+  it("refuses a day worked before an exemption the employee has since been granted", async () => {
+    await singleStepRoute();
+    const officer = await employee("O6");
+    // Not 管理監督者 on 2026-07-03, so nothing refuses the day itself...
+    await store.grantExemption(officer, Date.parse("2026-08-01T00:00:00Z"));
+
+    // ...and no manager, no designated approver, ever. Nobody can approve this, at any instant.
+    await expect(() => store.submitOvertime({
+      employeeId: officer, requestedFor: "2026-07-03", minutes: 120,
+      reason: "site overrun", now: Date.parse("2026-08-10T00:00:00Z"),
+      department: "CONSTRUCTION", employmentType: null,
+    })).rejects.toThrow(/KINTAI_NO_APPROVER/);
+
+    // And nothing was left behind to strand: the first submission this store would create is id 1.
+    await expect(() => store.getSubmission(1)).rejects.toThrow(/KINTAI_NOT_FOUND/);
+    expect(await store.pendingApprovalsFor(boss, Date.parse("2026-08-10T00:00:00Z"))).toEqual([]);
   });
 });

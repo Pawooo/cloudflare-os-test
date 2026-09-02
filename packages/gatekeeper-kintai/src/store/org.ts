@@ -1,5 +1,5 @@
 import type { EmployeeId } from "../types.js";
-import { designatedApproverOf, isExempt } from "./employees.js";
+import { designatedApproverOf } from "./employees.js";
 
 // The org graph is temporal because audits ask "was this person actually X's manager on 3 July?".
 // A non-temporal table cannot answer that after any reorganisation, and every company reorganises.
@@ -137,18 +137,39 @@ export class NoApproverError extends Error {
   readonly code = "KINTAI_NO_APPROVER";
   constructor(employeeId: EmployeeId) {
     super(
-      `KINTAI_NO_APPROVER: employee ${employeeId} has no manager, no designated approver, and ` +
-      `no 管理監督者 exemption. Give them one before saving this organisation.`,
+      `KINTAI_NO_APPROVER: employee ${employeeId} has no manager and no designated approver, so ` +
+      `nobody could approve anything they file -- a punch correction included, which a 管理監督者 ` +
+      `exemption does not excuse them from needing. Ask an administrator to set a reporting line, ` +
+      `or a designated approver if they report to nobody.`,
     );
   }
 }
 
 /**
- * Whether this employee could ever have a submission approved. Self-approval is forbidden, so an
- * employee at the root of the org graph needs either an exemption (they raise no requests — see
- * `submitOvertime`'s own guard) or an explicit designated approver. Checked when organisation data
- * is written, so a misconfiguration surfaces then rather than when someone's request strands in
- * the queue.
+ * Whether somebody could approve what this employee files. Self-approval is forbidden, so an
+ * employee at the root of the org graph needs an explicit designated approver — see
+ * `setDesignatedApprover`, which is how one is given to somebody created before anybody existed
+ * to point at. Checked at every write that depends on the answer, so a misconfiguration surfaces
+ * there rather than when someone's request strands in a queue nobody can see.
+ *
+ * AN EXEMPTION IS NOT AN APPROVER, and this function used to say it was. 管理監督者 answers a
+ * different question — "is this employee's overtime premium-bearing?" — and `submitOvertime`
+ * refuses an exempt filer outright because of it, so for a while the two questions could not be
+ * told apart from here: an exempt employee never reached this function with anything to approve.
+ *
+ * Two things broke that coincidence. `938639c` split the instants, asking about exemption on the
+ * work date and about reachability at `now`, so an employee not exempt on the day they worked but
+ * exempt by the day they filed passed both gates and stranded. And amendments arrived: a
+ * correction to an exempt officer's punches is an ordinary request needing an ordinary human,
+ * `requiredApprovers` never counts an exemption towards a step, and `authorize` has neither an
+ * edge nor a designated approver to fall back on — so the request was accepted into nobody's
+ * queue, on the record of the person whose hours most warrant a second reader.
+ *
+ * The arm is gone rather than made conditional. One function that answers one question is the
+ * whole point of this one existing: `authorize`, `requiredApprovers`, `hasReachableApprover` and
+ * `pendingApprovalsFor` all answer a version of "who may approve for this employee", and this
+ * package has already shipped a bug from one of them quietly disagreeing. A second variant here,
+ * or a flag saying which caller is asking, is that bug's next opportunity.
  *
  * This must stay in lockstep with `submissions.ts`'s `requiredApprovers`/`authorize`, which decide
  * what an *actual* submission needs and who may act on it. Three deliberate departures from a
@@ -166,12 +187,11 @@ export class NoApproverError extends Error {
  *    data error that can never actually be used to sign — it must not read as "approvable".
  *  - the designated-approver check goes through `designatedApproverOf` and rejects a self-
  *    reference, mirroring `requiredApprovers`'s "an employee recorded as their own designated
- *    approver collapses to the empty set and fails closed" rule.
+ *    approver collapses to the empty set and fails closed" rule. `setDesignatedApprover` refuses
+ *    to write one; this stays as the backstop, because the column predates that method.
  *
- * The 管理監督者 arm has no counterpart in `requiredApprovers`, and that asymmetry is deliberate,
- * not a bug: an exemption grants nobody authority to sign anything, so it can never contribute a
- * *required* approver. It answers a different question here — an exempt employee has no overtime
- * to approve in the first place, so needing zero approvers is fine.
+ * Every arm now has a counterpart in `requiredApprovers`, which is what it means for the two to be
+ * in lockstep: this answers "is that set ever non-empty?", nothing more.
  */
 export function hasReachableApprover(
   sql: SqlStorage, employeeId: EmployeeId, at: number,
@@ -179,8 +199,6 @@ export function hasReachableApprover(
   const managers = managersAt(sql, employeeId, at, "report")
     .filter((id) => id !== employeeId);
   if (managers.length > 0) return true;
-
-  if (isExempt(sql, employeeId, at)) return true;
 
   const designated = designatedApproverOf(sql, employeeId);
   return designated !== null && designated !== employeeId;

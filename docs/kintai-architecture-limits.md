@@ -84,12 +84,31 @@ store can route an approval. That unblocks the flow; it does not make routes con
 route management — department rules, minute thresholds, multi-step escalation — still belongs on
 the HR screen and is unbuilt.
 
+## The root of the org chart could not be given an approver — WAS REAL, now closed
+
+`designated_approver_id` is described in `store/employees.ts` as "the escape hatch for employees at
+the root of the reporting tree". It was settable **only** in `createEmployee`'s INSERT, with no
+update path anywhere — and the employee who needs it is typically employee 1, created when the
+table is empty and there is nobody to point at. Implemented, documented, and unreachable by exactly
+the person it was written for.
+
+It looked survivable only because `hasReachableApprover` counted a 管理監督者 exemption as "needs
+nobody", so HR could make the row green by recording an exemption. That was the wrong green: an
+exemption grants nobody authority to sign, and a punch correction for an exempt officer needs a
+person like anyone else's. The exemption arm is gone and
+`KintaiAdminApi.setDesignatedApprover(employeeId, approverId)` is the update path, with a form on
+the HR screen beside "Set a reporting line".
+
+Still open in the same area: there is no way to CLEAR a designated approver, close a reporting
+line, or end an exemption. All three are de-authorisations, all three belong together, and none
+exists.
+
 ## The pattern worth noticing
 
-Three of the four limits above are the same shape: **a capability implemented on the store, tested,
-and reachable from nowhere.** `createRoute` was one. `correctPunch` was another — it is what the
-amendment work exists to reach. `recordPunch`'s historical-write ability is a third, and that one
-should stay unreachable.
+Four of the five limits above are the same shape: **a capability implemented on the store, tested,
+and reachable from nowhere.** `createRoute` was one. `designated_approver_id`'s escape hatch was
+another. `correctPunch` is a third — it is what the amendment work exists to reach.
+`recordPunch`'s historical-write ability is a fourth, and that one should stay unreachable.
 
 A store method with no caller is not a feature. It is either a gap that will surface as
 "the system cannot do X and nothing can fix it", or a hole waiting for someone in a hurry.

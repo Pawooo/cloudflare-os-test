@@ -243,6 +243,44 @@ export function designatedApproverOf(
 }
 
 /**
+ * Point `employeeId` at the person who may approve for them, replacing whatever was there.
+ *
+ * The escape hatch this column was written for was reachable by nobody. `designated_approver_id`
+ * was settable only in `createEmployee`'s INSERT, and the employee who needs it most — the one at
+ * the root of the reporting tree — is typically employee 1, created when there is nobody in the
+ * table to point at. Implemented, documented, and impossible to use for exactly the person it was
+ * written for. This is the update path.
+ *
+ * AN UPDATE, and it is worth saying why that is not a violation. `punches`, `approval_events` and
+ * `audit_log` are append-only and stay so; `employees` is not, and never was — `setWorkDatePolicy`
+ * and `status` are updates too. What makes an update safe here is that this column is not history:
+ * it says who may approve for this employee NOW. Who actually approved a given submission is
+ * recorded on `approval_events`, in the same row as the action, and is unaffected by re-pointing
+ * this. The only thing lost by overwriting is the previous value, which is why the admin boundary
+ * writes an audit entry carrying `before` and `after` — read `audit_log` for the history, not this
+ * column.
+ *
+ * Deliberately no validity window, unlike `exemption_periods` and `org_edges`. Those answer "was
+ * this true on 3 July?" because a premium or an authority is judged as of the moment it was used.
+ * This is a fallback consulted only when an employee has no reporting line at all, and giving it a
+ * timeline would create a fourth temporal graph to keep in step with the other three for a column
+ * whose whole job is to be the one simple answer when the graph is empty.
+ *
+ * The value is not validated here. Self-designation and a non-existent approver are both refused
+ * at the admin boundary, in a sentence, exactly as `setReportingLine`'s self-edge is — and both
+ * have a backstop behind them regardless: the foreign key refuses an id that names no employee,
+ * and `hasReachableApprover`/`requiredApprovers` both already collapse a self-reference to "no
+ * approver" and fail closed.
+ */
+export function setDesignatedApprover(
+  sql: SqlStorage, employeeId: EmployeeId, approverId: EmployeeId,
+): void {
+  sql.exec(
+    `UPDATE employees SET designated_approver_id = ? WHERE id = ?`, approverId, employeeId,
+  );
+}
+
+/**
  * Records a 管理監督者 period and returns its id.
  *
  * The id is returned for the same reason `setReportingLine` returns its edge id: this is an

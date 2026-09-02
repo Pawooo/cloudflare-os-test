@@ -40,9 +40,14 @@ const TANAKA = person({
 const STRANDED = person({
   id: 3, display_name: "Stranded", employee_number: "E-1003", linked: true,
 });
+/**
+ * 管理監督者, and approvable because somebody was DESIGNATED to sign for her — not because of the
+ * exemption. The two used to be the same row on this screen, which is the thing being pinned:
+ * an exemption exempts overtime from a premium, it does not make anybody able to approve.
+ */
 const SUZUKI = person({
   id: 2, display_name: "Suzuki", employee_number: "E-1002", exempt: true,
-  approverReachable: true, linked: true,
+  designated_approver_id: 1, approverReachable: true, linked: true,
 });
 
 /** An admin's capability: every method answers. Overrides replace individual methods. */
@@ -55,6 +60,7 @@ function adminApi(overrides: Partial<KintaiAdminClient> = {}, roster: RosterEntr
     createEmployee: vi.fn<KintaiAdminClient["createEmployee"]>(async () => 42),
     linkAccount: vi.fn<KintaiAdminClient["linkAccount"]>(async () => {}),
     setReportingLine: vi.fn<KintaiAdminClient["setReportingLine"]>(async () => {}),
+    setDesignatedApprover: vi.fn<KintaiAdminClient["setDesignatedApprover"]>(async () => {}),
     grantExemption: vi.fn<KintaiAdminClient["grantExemption"]>(async () => {}),
     setWorkDatePolicy: vi.fn<KintaiAdminClient["setWorkDatePolicy"]>(async () => {}),
     ...overrides,
@@ -78,6 +84,9 @@ function viewerApi(overrides: Partial<KintaiAdminClient> = {}) {
     }),
     setReportingLine: vi.fn<KintaiAdminClient["setReportingLine"]>(async () => {
       throw REFUSED("setReportingLine");
+    }),
+    setDesignatedApprover: vi.fn<KintaiAdminClient["setDesignatedApprover"]>(async () => {
+      throw REFUSED("setDesignatedApprover");
     }),
     grantExemption: vi.fn<KintaiAdminClient["grantExemption"]>(async () => {
       throw REFUSED("grantExemption");
@@ -216,10 +225,35 @@ describe("AdminPage", () => {
       const stranded = row(STRANDED.id);
       expect(stranded.querySelector('[data-issue="no-approver"]')).not.toBeNull();
       expect(stranded.querySelector('[data-issue="unlinked"]')).toBeNull();
-      expect(stranded.textContent).toContain("overtime they file will be refused");
+      // Not "overtime": a punch correction needs approval too, and saying only overtime is what
+      // let an exempt officer look finished.
+      expect(stranded.textContent).toContain("anything they file will be refused");
       expect(stranded.textContent).not.toContain("Ready");
-      // And the row offers the fix, next to the problem.
+      // And the row offers both fixes, next to the problem.
       expect(stranded.querySelector('[data-action="manager-for-this"]')).not.toBeNull();
+      expect(stranded.querySelector('[data-action="approver-for-this"]')).not.toBeNull();
+    });
+
+    /**
+     * The row HR most needs told about, and the one this whole change is for.
+     *
+     * Observed live on 2026-09-01: Admin displayed "Ready · 管理監督者" and could not have had a
+     * punch correction approved by anybody. The exemption is real and stays on the row; what it
+     * no longer does is answer the readiness question, and the row has to say so in terms HR can
+     * act on rather than just flipping to red.
+     */
+    it("tells HR that an exemption is not an approver, and names what would fix it", async () => {
+      const officer = person({
+        id: 11, display_name: "Officer", linked: true, exempt: true, approverReachable: false,
+      });
+      await render(<AdminPage api={adminApi({}, [TANAKA, officer])} />);
+
+      const issue = row(11).querySelector('[data-issue="no-approver"]')!;
+      expect(issue.textContent).toContain("管理監督者 exempts their overtime");
+      expect(issue.textContent).toContain("a punch correction still needs a person");
+      expect(issue.textContent).toContain("designated approver");
+      expect(row(11).textContent).not.toContain("Ready");
+      expect(row(11).querySelector('[data-action="approver-for-this"]')).not.toBeNull();
     });
 
     it("shows an unlinked employee as incomplete for that reason too", async () => {
@@ -236,7 +270,11 @@ describe("AdminPage", () => {
       await render(<AdminPage api={adminApi({}, [TANAKA, SUZUKI, STRANDED])} />);
 
       expect(row(TANAKA.id).textContent).toContain("Ready · reports to Suzuki");
-      expect(row(SUZUKI.id).textContent).toContain("Ready · 管理監督者");
+      // Ready on the designated approver, never on the exemption: 管理監督者 is not a reason
+      // anybody can approve, so it must not be offered as one.
+      expect(row(SUZUKI.id).textContent).toContain("Ready · approver Tanaka");
+      expect(text(`[data-employee="${SUZUKI.id}"] [data-testid="status"]`))
+        .not.toContain("管理監督者");
       expect(row(STRANDED.id).textContent).not.toContain("Ready");
     });
 
@@ -263,9 +301,11 @@ describe("AdminPage", () => {
         expect(row(9).querySelector('[data-action="manager-for-this"]')).toBeNull();
         expect(container!.textContent)
           .toContain("Two employee records are needed before anyone can report to anyone.");
-        // The other route out is still offered, and it is the right one for a first hire who is
-        // genuinely at the top of the organisation.
-        expect(row(9).querySelector('[data-action="exempt-this"]')).not.toBeNull();
+        // Nor 'Set approver': a designated approver is another employee, and there is exactly one
+        // record on the roster. Both fixes genuinely need a second person, and a button that
+        // scrolled to a form with nothing in its dropdown is the silent no-op this page keeps
+        // going out of its way not to ship.
+        expect(row(9).querySelector('[data-action="approver-for-this"]')).toBeNull();
       });
 
     it("offers 'Set manager' again as soon as there is somebody to report to", async () => {
@@ -370,6 +410,35 @@ describe("AdminPage", () => {
         .toBe("Stranded now reports to Tanaka.");
     });
 
+    // The escape hatch for whoever sits at the top of the org chart. Until this form existed,
+    // `designated_approver_id` was settable only when the record was created -- so employee 1,
+    // created when there is nobody to point at, could never be given one.
+    it("designates an approver for an employee who reports to nobody", async () => {
+      const api = adminApi({}, [TANAKA, STRANDED]);
+      await render(<AdminPage api={api} />);
+
+      await choose('[data-form="set-designated-approver"] [name="employeeId"]', "3");
+      await choose('[data-form="set-designated-approver"] [name="approverId"]', "1");
+      await submit("set-designated-approver");
+
+      expect(api.setDesignatedApprover).toHaveBeenCalledWith(3, 1);
+      expect(text('[data-testid="set-designated-approver-notice"]'))
+        .toBe("Tanaka can now approve for Stranded.");
+      // Re-read afterwards: this is one of the two things that make a row ready.
+      expect(api.listEmployees).toHaveBeenCalledTimes(2);
+    });
+
+    it("preselects the employee whose row asked for a designated approver", async () => {
+      const api = adminApi({}, [TANAKA, STRANDED]);
+      await render(<AdminPage api={api} />);
+
+      await click('[data-employee="3"] [data-action="approver-for-this"]');
+      await choose('[data-form="set-designated-approver"] [name="approverId"]', "1");
+      await submit("set-designated-approver");
+
+      expect(api.setDesignatedApprover).toHaveBeenCalledWith(3, 1);
+    });
+
     // The row's own button is the shortest path from seeing the problem to fixing it, and the
     // reason the forms take their employee from state rather than owning it.
     it("preselects the employee whose row asked for the fix", async () => {
@@ -401,12 +470,16 @@ describe("AdminPage", () => {
       expect(api.listEmployees).toHaveBeenCalledTimes(2);
     });
 
-    it("offers the exemption from the row of anyone who has no approver, and preselects them",
+    // Offered on EVERY row now, and no longer as a repair. 管理監督者 is a determination about
+    // an employee's authority and pay, not a way to finish an unfinished row -- it does not make
+    // anybody approvable, so hanging it off "this row has no approver" pointed HR at a button that
+    // would not have fixed what they were looking at.
+    it("offers the 管理監督者 determination from every row, ready or not, and preselects them",
       async () => {
         const officer = person({ id: 9, display_name: "Officer", linked: true });
         const api = adminApi({}, [TANAKA, officer]);
         await render(<AdminPage api={api} />);
-        expect(row(TANAKA.id).querySelector('[data-action="exempt-this"]')).toBeNull();
+        expect(row(TANAKA.id).querySelector('[data-action="exempt-this"]')).not.toBeNull();
 
         await click('[data-employee="9"] [data-action="exempt-this"]');
         await submit("grant-exemption");
@@ -414,14 +487,16 @@ describe("AdminPage", () => {
         expect(api.grantExemption).toHaveBeenCalledWith(9);
       });
 
-    it("shows an exempt employee as ready, on the exemption rather than a manager", async () => {
+    // The row that is genuinely finished: exempt AND with somebody to sign for them.
+    it("shows an exempt employee as ready only on the approver that was designated", async () => {
       const officer = person({
-        id: 9, display_name: "Officer", linked: true, exempt: true, approverReachable: true,
+        id: 9, display_name: "Officer", linked: true, exempt: true,
+        designated_approver_id: 1, approverReachable: true,
       });
-      await render(<AdminPage api={adminApi({}, [officer])} />);
+      await render(<AdminPage api={adminApi({}, [TANAKA, officer])} />);
 
-      expect(row(9).textContent).toContain("Ready · 管理監督者");
-      expect(row(9).querySelector('[data-action="exempt-this"]')).toBeNull();
+      expect(row(9).textContent).toContain("Ready · approver Tanaka");
+      expect(row(9).querySelector('[data-action="approver-for-this"]')).toBeNull();
       expect(row(9).querySelector('[data-action="manager-for-this"]')).toBeNull();
     });
 

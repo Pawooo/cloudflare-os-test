@@ -24,11 +24,16 @@ import { hasReachableApprover, managersAt } from "./org.js";
  * Every computed field delegates to the function that already owns its rule: `linkedEmployeeIds`
  * shares its validity window with `resolveAccount`, `managersAt(…, "report")` and `isExempt` are
  * the same calls the approval path makes, and `approverReachable` is `hasReachableApprover`
- * itself — the function `submitOvertime` enforces through `assertApproverReachable`. Nothing here
- * re-derives a verdict from the parts, deliberately: `hasReachableApprover` has three careful
- * departures from a literal reading of the org tables (see its comment), and a roster that
- * recomputed the answer from `managerIds` and `exempt` would be a second implementation of the
- * rule that decides whether an employee can work at all.
+ * itself — the function `submitOvertime` and `fileAmendment` both enforce through
+ * `assertApproverReachable`. Nothing here re-derives a verdict from the parts, deliberately:
+ * `hasReachableApprover` has three careful departures from a literal reading of the org tables
+ * (see its comment), and a roster that recomputed the answer from `managerIds` would be a second
+ * implementation of the rule that decides whether an employee can work at all.
+ *
+ * `exempt` in particular is NOT an input to that verdict, and was mistaken for one on the screen
+ * that reads this: an exemption says the employee's overtime bears no premium, not that anybody
+ * can approve for them. It is reported beside the verdict so HR can see the whole row, never as
+ * part of it.
  *
  * Unpaged, exactly as `listEmployees` is unpaged and for the same reason: this is one company's
  * headcount, the surface is admin-only, and under ~200 employees a page boundary costs more than

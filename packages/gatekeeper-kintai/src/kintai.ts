@@ -821,8 +821,13 @@ export class KintaiSession extends RpcTarget {
     // the *record* — punches and allocations — and `periods.ts` frames the amendment path as the
     // way to change a closed period. A submission IS that channel: it is a request for approval,
     // not an edit to the ledger, and refusing it would leave an employee who missed the cutoff with
-    // no way to raise the overtime at all. `submitOvertime` already pins its own checks (exemption,
-    // approver reachability) to `requestedFor` rather than to now, for the same reason.
+    // no way to raise the overtime at all. `submitOvertime` pins its EXEMPTION check to
+    // `requestedFor` rather than to now for the same reason: what is being judged is the work, on
+    // the day it was done, however late the request about it arrives. (Its approver-reachability
+    // check is asked at `now` instead, and deliberately — see `store/submissions.ts`. That one is
+    // not about the work: it asks who exists to decide the request, which is a question about
+    // today. It does not weaken the argument above, because it refuses a request nobody could ever
+    // act on rather than one that merely arrived late.)
     return this.#store.submitOvertime({
       employeeId, requestedFor, minutes, reason, now,
       department: profile.department, employmentType: profile.employment_type,

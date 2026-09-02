@@ -752,7 +752,7 @@ pnpm exec vitest run __tests__/amendments.test.ts
 
 Expected: PASS, all five.
 
-- [ ] **Step 6: Run every gate, then commit**
+- [x] **Step 6: Run every gate, then commit** — 407 worker, 68 app.
 
 ```bash
 pnpm exec vitest run && pnpm exec vitest run -c vitest.app.config.ts && pnpm exec tsc --noEmit && pnpm run typecheck:app
@@ -771,7 +771,25 @@ nothing let a human choose a punch time. This is that path."
 
 **Why its own task:** this is the authority change, and it is the finding most likely to be quietly lost in a later refactor. It deserves a reviewer who is looking at nothing else.
 
-> **PARTLY DONE.** The `checkMayAct` refusal was pulled forward onto branch `fix/kintai-filed-by-approver` (commit `a944e0f`), because it does not depend on amendments and is correct on its own terms — `NewSubmission.createdBy` already lets the filer and the employee differ. That branch adds `FiledBySelfError`, the refusal, and six tests covering approve, reject, return, `previewAct`, a null `created_by`, and that self-filed overtime still reports `KINTAI_SELF_APPROVAL`. **What remains in this task is `assertAmendmentSatisfiable` only** — the filing-time route check, which needs `fileAmendment` from Task 4. Do not re-implement the refusal; verify it is present and pin it against an amendment.
+> **DONE** — implemented on branch `feat/kintai-amendment-approvability`. Read this section for
+> the reasoning, but read the code for what landed; three things differ from the text below.
+>
+> 1. **`assertAmendmentSatisfiable` does not exist.** The filer arm went into `assertSatisfiable`
+>    itself, which now takes `createdBy` as a required (nullable) third parameter and is called
+>    from BOTH `fileAmendment` and `submitOvertime`. The shape is not amendment-specific: the
+>    store's `submitOvertime` takes `createdBy` too, and only the session facet's habit of setting
+>    it to the employee kept overtime out of reach. A rule two write paths need, written twice, is
+>    the drift this task exists to prevent.
+> 2. **The exemption arm was REMOVED from `hasReachableApprover`, not made conditional.** Part 2 of
+>    this section says overtime's behaviour must not move; it moves in exactly one shape, and that
+>    shape was a live bug — see the test "refuses a day worked before an exemption the employee has
+>    since been granted" in `__tests__/submissions.test.ts`. Everywhere else the arm was already
+>    unreachable from `submitOvertime`, because `ExemptEmployeeError` fires first.
+> 3. **The 管理監督者 button moved on the roster** from "shown when the row has no approver" to
+>    "shown on every row". It is no longer a repair, so offering it as one pointed HR at a control
+>    that would not have fixed what they were looking at.
+>
+> **PARTLY DONE (superseded by the note above).** The `checkMayAct` refusal was pulled forward onto branch `fix/kintai-filed-by-approver` (commit `a944e0f`), because it does not depend on amendments and is correct on its own terms — `NewSubmission.createdBy` already lets the filer and the employee differ. That branch adds `FiledBySelfError`, the refusal, and six tests covering approve, reject, return, `previewAct`, a null `created_by`, and that self-filed overtime still reports `KINTAI_SELF_APPROVAL`. **What remains in this task is `assertAmendmentSatisfiable` only** — the filing-time route check, which needs `fileAmendment` from Task 4. Do not re-implement the refusal; verify it is present and pin it against an amendment.
 
 **Files:**
 - Modify: `packages/gatekeeper-kintai/src/store/submissions.ts`
@@ -832,7 +850,7 @@ routing concept, and it reduces to "designate someone", which already exists.
 
 `created_by` and `employee_id` are the same person for every overtime submission today, so the new refusal is a no-op there and cannot regress it. Pin that with a test rather than asserting it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `__tests__/amendments.test.ts`:
 
@@ -912,7 +930,7 @@ In `__tests__/submissions.test.ts`, add one test asserting an ordinary overtime 
 
 > Fill in the second test's body by copying the first test's setup verbatim. Do not write "same as above" in the code.
 
-- [ ] **Step 2: Run and watch them fail**
+- [x] **Step 2: Run and watch them fail**
 
 ```bash
 pnpm exec vitest run __tests__/amendments.test.ts
@@ -920,7 +938,7 @@ pnpm exec vitest run __tests__/amendments.test.ts
 
 Expected: FAIL — the foreman's approval succeeds.
 
-- [ ] **Step 3: Add the refusal to `checkMayAct`**
+- [x] **Step 3: Add the refusal to `checkMayAct`** (landed earlier, in `a944e0f`)
 
 In `src/store/submissions.ts`, add the error class beside `SelfApprovalError`:
 
@@ -950,7 +968,8 @@ And in `checkMayAct`, immediately after the existing self-approval check:
   }
 ```
 
-- [ ] **Step 4: Refuse at filing time when the filer is the only possible approver**
+- [x] **Step 4: Refuse at filing time when the filer is the only possible approver** — landed as
+the third arm of `assertSatisfiable` rather than as a separate function; see the note at the top.
 
 A request nobody can approve should be refused where the person can still do something about it — the employee files it themselves instead. In `src/store/amendments.ts`:
 
@@ -985,7 +1004,7 @@ Replace the `assertSatisfiable` call in `fileAmendment` with `assertAmendmentSat
 
 > **Note for the implementer:** this catches only a step *pinned* to a named employee. A `manager_of` step whose only live manager happens to be the filer is not caught here, because the set of managers is evaluated at approval time and can change. That request will be refused at approval instead, with `KINTAI_FILED_BY_APPROVER`. Say so in your report; do not try to close it by re-resolving the org at filing time, which would make filing depend on state the snapshot deliberately freezes.
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 ```bash
 pnpm exec vitest run __tests__/amendments.test.ts __tests__/submissions.test.ts
@@ -993,7 +1012,7 @@ pnpm exec vitest run __tests__/amendments.test.ts __tests__/submissions.test.ts
 
 Expected: PASS. Every prior submissions test must still pass unchanged — if any needed editing, `created_by` was not what you assumed and you should stop and report.
 
-- [ ] **Step 6: Run every gate, then commit**
+- [x] **Step 6: Run every gate, then commit** — 407 worker, 68 app.
 
 ```bash
 pnpm exec vitest run && pnpm exec vitest run -c vitest.app.config.ts && pnpm exec tsc --noEmit && pnpm run typecheck:app
@@ -1263,7 +1282,7 @@ This is agent-facing behaviour. It must say:
 - That an amendment is the way through `KINTAI_PERIOD_LOCKED`, which the existing text already promises.
 - That filing for another employee requires authority over them.
 
-- [ ] **Step 6: Run every gate, then commit**
+- [x] **Step 6: Run every gate, then commit** — 407 worker, 68 app.
 
 ```bash
 pnpm exec vitest run && pnpm exec vitest run -c vitest.app.config.ts && pnpm exec tsc --noEmit && pnpm run typecheck:app && pnpm exec capnweb-validate build --out .wrangler/validate

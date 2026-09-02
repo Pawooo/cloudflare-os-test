@@ -76,12 +76,32 @@ describe("the roster", () => {
     await store.assertApproverReachable(worker, JUL);
   });
 
-  it("completes a 管理監督者 who reports to nobody, and says so", async () => {
+  // An exemption is not an approver, and the roster is where HR finds that out. It exempts the
+  // employee's overtime from a premium -- `submitOvertime` refuses them, so there is nothing to
+  // approve there -- but a correction to their punches is still a request that needs a human, and
+  // for a 代表取締役 that is exactly the record most worth a second pair of eyes. Reported exempt
+  // AND not ready, which is the truth: the determination is recorded, the row is not finished.
+  it("does not complete a 管理監督者 who reports to nobody", async () => {
     const id = await employee("E040");
     await store.grantExemption(id, APR);
 
     expect(await entry(id, JUL))
-      .toMatchObject({ managerIds: [], exempt: true, approverReachable: true });
+      .toMatchObject({ managerIds: [], exempt: true, approverReachable: false });
+    await expect(() => store.assertApproverReachable(id, JUL)).rejects.toThrow(/KINTAI_NO_APPROVER/);
+  });
+
+  // What actually completes the root of the org chart. Same row, same instant, one designated
+  // approver later.
+  it("completes that same 管理監督者 once they are given a designated approver", async () => {
+    const id = await employee("E041");
+    const chair = await employee("E042");
+    await store.grantExemption(id, APR);
+    await store.setDesignatedApprover(id, chair);
+
+    expect(await entry(id, JUL)).toMatchObject({
+      managerIds: [], exempt: true, designated_approver_id: chair, approverReachable: true,
+    });
+    await store.assertApproverReachable(id, JUL);
   });
 
   it("completes an employee whose only route is a designated approver", async () => {

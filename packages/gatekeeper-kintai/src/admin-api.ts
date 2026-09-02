@@ -83,13 +83,31 @@ export interface KintaiAdminApi {
   setReportingLine(employeeId: EmployeeId, managerId: EmployeeId): Promise<void>;
 
   /**
+   * Name the person who may approve for an employee who reports to nobody. Admin only.
+   *
+   * The other half of `setReportingLine`, and the only one that reaches the top of the org chart.
+   * `hasReachableApprover` accepts two answers — a manager, or this — and whoever sits at the root
+   * has no manager by definition. `designated_approver_id` was written for exactly them and was
+   * settable only in `createEmployee`'s INSERT, so employee 1, created when there is nobody in the
+   * table to point at, could never be given one: implemented, documented, and unreachable by the
+   * person it was for. This is the update path — see `AdminKintaiApi.setDesignatedApprover`.
+   *
+   * NOT interchangeable with `grantExemption`, which used to look like the fix for the same row.
+   * 管理監督者 says an employee's overtime bears no premium; it grants nobody authority to sign,
+   * and a correction to that employee's punches still needs a person.
+   */
+  setDesignatedApprover(employeeId: EmployeeId, approverId: EmployeeId): Promise<void>;
+
+  /**
    * Record that `employeeId` is 管理監督者, from now, open-ended. Admin only.
    *
-   * Here because it is the only way to complete an employee at the top of the organisation
-   * honestly. `hasReachableApprover` accepts three answers, and the other two both require someone
-   * above them: a reporting line, or a designated approver. For a company officer there is nobody,
-   * so without this the only route to a usable record is a reporting line that does not exist —
-   * writing a fiction into the org chart to get a green tick, in the table an audit reads.
+   * Here because 管理監督者 is a determination HR has to be able to record, and NOT because it
+   * completes an employee at the top of the organisation — it used to read that way, and that was
+   * the bug. `hasReachableApprover` accepts two answers, a reporting line or a designated
+   * approver, and an exemption is neither: it grants nobody authority to sign. An exempt officer
+   * files no overtime (`submitOvertime` refuses them), but their punches are still the record of
+   * when they worked, and correcting one is a request that needs a human. `setDesignatedApprover`
+   * is what finishes that row.
    *
    * 管理監督者 is also the status this is really about. It is a determination under 労働基準法 §41
    * about a specific person's authority and treatment, and it decides whether their overtime bears
@@ -292,6 +310,71 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
     await this.#store.appendAudit({
       at: now, actorEmployeeId, action: "set_reporting_line", entity: "org_edges",
       entityId: edgeId, after: { employeeId, managerId, validFrom: now },
+    });
+  }
+
+  /**
+   * Name the person who may approve for an employee who reports to nobody.
+   *
+   * The escape hatch that could not be reached. `designated_approver_id` is documented in
+   * `store/employees.ts` as "the escape hatch for employees at the root of the reporting tree" and
+   * was settable only when the record was created — so employee 1, created before anybody exists
+   * to name, could never be given one, and after an exemption stopped counting as an approver they
+   * could file nothing at all. Same shape as `setReportingLine`: opens now, audited, and it is
+   * granting signing authority over somebody else's payroll input.
+   *
+   * An UPDATE rather than a new row, unlike `setReportingLine` and `grantExemption`. Justified at
+   * length on `store/employees.ts`'s `setDesignatedApprover`: this column says who may approve
+   * NOW, who actually approved a submission is recorded on `approval_events` beside the action,
+   * and the previous value is preserved here in `audit_log`.
+   *
+   * Two refusals, and only two:
+   *
+   *  - SELF-DESIGNATION, refused for the reason `setReportingLine` refuses a self-edge. Nobody may
+   *    approve their own submissions, so `hasReachableApprover` and `requiredApprovers` both
+   *    already collapse a self-reference to "no approver" and fail closed. Writing one would leave
+   *    HR looking at a filled-in field, a row still not ready, and no clue why.
+   *  - AN APPROVER WHO DOES NOT EXIST. The foreign key would refuse it anyway; this refuses it in
+   *    a sentence, as `#assertNewEmployee` already does for the same column at creation.
+   *
+   * Deliberately NOT refused, and each considered:
+   *
+   *  - an approver who is themselves unreachable. Whether B can have their OWN requests approved
+   *    has nothing to do with whether B can approve A's — the two are different questions about
+   *    different people, and conflating them would refuse a perfectly good arrangement (a 代表
+   *    signing for the 専務 who signs for nobody) on the strength of an unrelated gap.
+   *  - a cycle. Two officers designated as each other's approver is a real arrangement and breaks
+   *    nothing: nothing in this package walks `designated_approver_id` transitively. `authorize`
+   *    and `requiredApprovers` each take exactly one hop, and the only shape that strands is the
+   *    zero-length one — self-designation — which is refused above. A cycle check would be code
+   *    defending against a traversal that does not exist.
+   *  - clearing it. There is no way here to set it back to nobody, exactly as there is no way to
+   *    close a reporting line or end an exemption; removing an approver is a de-authorisation and
+   *    belongs with those when they land. Re-pointing it at somebody else works today.
+   */
+  async setDesignatedApprover(employeeId: EmployeeId, approverId: EmployeeId): Promise<void> {
+    const now = Date.now();
+    assertEmployeeId("employee", employeeId);
+    assertEmployeeId("approver", approverId);
+    if (employeeId === approverId) {
+      throw new InvalidInputError(
+        "an employee cannot be their own designated approver: nobody may approve their own " +
+        "submissions, so it would grant no authority and leave them unable to file.",
+      );
+    }
+    await this.#assertEmployeeExists(employeeId);
+    await this.#assertEmployeeExists(approverId);
+    const actorEmployeeId = await this.#actor(now);
+    // Read before the write, for the reason `linkAccount` and `setWorkDatePolicy` both do it: this
+    // is an overwrite, so "who could sign for them before" is unrecoverable from the row once it
+    // is gone, and it is the first question asked of a change to who may approve.
+    const previous = await this.#store.designatedApproverOf(employeeId);
+    await this.#store.setDesignatedApprover(employeeId, approverId);
+    await this.#store.appendAudit({
+      at: now, actorEmployeeId, action: "set_designated_approver", entity: "employees",
+      entityId: employeeId,
+      before: { employeeId, approverId: previous },
+      after: { employeeId, approverId },
     });
   }
 
@@ -517,6 +600,15 @@ export class ViewerKintaiApi extends RpcTarget implements KintaiAdminApi {
    */
   setReportingLine(_employeeId: EmployeeId, _managerId: EmployeeId): never {
     throw new AdminRequiredError("setReportingLine");
+  }
+
+  /**
+   * Refused: naming a designated approver hands one person authority to sign for another, and the
+   * employee it names an approver FOR is the one at the root of the org chart, whose record nobody
+   * else reviews. Reachable by them, it would be a way to appoint whoever is most likely to agree.
+   */
+  setDesignatedApprover(_employeeId: EmployeeId, _approverId: EmployeeId): never {
+    throw new AdminRequiredError("setDesignatedApprover");
   }
 
   /**

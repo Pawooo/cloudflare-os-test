@@ -10,9 +10,9 @@ import {
   type AllocationEntry, type AllocationRow, type Reconciliation,
 } from "./allocations.js";
 import {
-  createEmployee, employeeExists, employeeProfile, grantExemption, isExempt, linkAccount,
-  listEmployees, openAccountLink, resolveAccount, setWorkDatePolicy, unlinkAccount,
-  workDatePolicyOf,
+  createEmployee, designatedApproverOf, employeeExists, employeeProfile, grantExemption, isExempt,
+  linkAccount, listEmployees, openAccountLink, resolveAccount, setDesignatedApprover,
+  setWorkDatePolicy, unlinkAccount, workDatePolicyOf,
   type AccountLinkRow, type EmployeeProfile, type EmployeeRow, type NewEmployee,
 } from "./employees.js";
 import { listRoster } from "./roster.js";
@@ -137,6 +137,16 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
 
   async employeeProfile(employeeId: EmployeeId): Promise<EmployeeProfile> {
     return employeeProfile(this.sql, employeeId);
+  }
+
+  /** Point an employee at their fallback approver. See `setDesignatedApprover`. */
+  async setDesignatedApprover(employeeId: EmployeeId, approverId: EmployeeId): Promise<void> {
+    setDesignatedApprover(this.sql, employeeId, approverId);
+  }
+
+  /** Who may approve for this employee when they have no reporting line. See `designatedApproverOf`. */
+  async designatedApproverOf(employeeId: EmployeeId): Promise<EmployeeId | null> {
+    return designatedApproverOf(this.sql, employeeId);
   }
 
   /** Records a 管理監督者 period and returns its id. See `grantExemption`. */

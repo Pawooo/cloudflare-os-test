@@ -124,6 +124,17 @@ export type NewAddition = AmendmentFiling & {
 
 export type NewAmendment = NewCorrection | NewAddition;
 
+/**
+ * The named punch is not one this employee can amend.
+ *
+ * TASK 7 MUST COLLAPSE ITS TWO MESSAGES INTO ONE before any agent-reachable surface can file.
+ * "There is no punch with id N" and "punch N does not belong to employee E" are distinguishable,
+ * which makes this an oracle: a caller who can file amendments can walk the id space and learn
+ * exactly which punch ids exist. Not reachable today — nothing outside this package's own tests
+ * calls `fileAmendment` — which is the only reason it is recorded here rather than fixed now. The
+ * detail is genuinely useful to an administrator and genuinely dangerous to an employee, so the
+ * fix is one message on this path, not a cleverer one.
+ */
 export class AmendmentTargetError extends Error {
   readonly code = "KINTAI_AMENDMENT_TARGET";
   constructor(detail: string) {
@@ -239,14 +250,27 @@ function undecidedAdditionOf(
  *    month, and refusing to even ask would leave a locked month permanently wrong.
  *  - `isExempt`. `submitOvertime` refuses an exempt employee because there is no premium to
  *    approve; a 管理監督者's punches are still the record of when they worked and still need to be
- *    correctable. NOTE the consequence: `hasReachableApprover` counts an exemption as "needs
- *    nobody", so an exempt employee with no manager and no designated approver passes
- *    `assertApproverReachable` and their amendment then strands, because `requiredApprovers` never
- *    counts an exemption towards a step. Overtime cannot reach that shape (it refuses the exempt
- *    employee first); amendments can. Fixing it means teaching reachability that the exemption arm
- *    is overtime-specific, which is a change to a function overtime also depends on.
+ *    correctable. This is why `hasReachableApprover` no longer counts an exemption as "needs
+ *    nobody": an exempt employee with no manager and no designated approver used to pass
+ *    `assertApproverReachable` here and then strand, because no step of the seeded `any_of`
+ *    manager route can be satisfied for them — `authorize` finds no org edge and no designated
+ *    approver to fall back on, so every actor is refused. (`requiredApprovers` returns an empty
+ *    set too, which strands an `all_of` step for the same reason; on the seeded route it is
+ *    `authorize` that does the refusing.) They are now refused at filing, where an administrator
+ *    can still be asked for a designated approver.
  *  - who may file for whom. `createdBy` is recorded, not authorised: authority over another
  *    employee is the session's question, and this function is handed the answer.
+ *
+ * KNOWN, AND TASK 6's TO CLOSE — neither is caught here, and both must be re-validated at APPLY
+ * time, where one Durable Object turn can see the day as it actually stands:
+ *  - CONVERGING REQUESTS. An addition of `out` at 18:00 and a correction moving an existing `out`
+ *    to 18:00 both pass filing: the two uniqueness queries look at different things (one at
+ *    punches, one at undecided additions) and neither can see the other. Approve both and the day
+ *    ends up with two identical punches.
+ *  - A TARGET SUPERSEDED OUT OF BAND. `describeCorrection` refuses a target that is already
+ *    superseded, but nothing stops a direct `correctPunch` from superseding it AFTER the request
+ *    is filed. The request stays queued and approvable and can never apply, because
+ *    `punches_supersedes_unique` refuses the second successor.
  */
 export function fileAmendment(sql: SqlStorage, input: NewAmendment): number {
   // The only account of why history differs from what was recorded, so it may not be blank; and
@@ -278,11 +302,10 @@ export function fileAmendment(sql: SqlStorage, input: NewAmendment): number {
     employmentType: input.employmentType,
     minutes: 0,
   });
-  // Task 5 replaces this with `assertAmendmentSatisfiable`, which also refuses a step pinned to
-  // the FILER. Until it does, a manager filing for their own report against a route pinned to
-  // themselves produces a submission nobody can decide -- `checkMayAct` already refuses them for
-  // being `created_by`, but only when they try.
-  assertSatisfiable(snapshot, input.employeeId);
+  // `createdBy` is passed, not omitted: a step pinned to the FILER can never be satisfied either,
+  // because `checkMayAct` refuses them for being `created_by`. Filing on behalf of a report is
+  // what makes that shape reachable, and this is the path that introduced it.
+  assertSatisfiable(snapshot, input.employeeId, input.createdBy);
 
   const submission = sql
     .exec<{ id: number }>(
