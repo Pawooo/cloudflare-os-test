@@ -10,10 +10,11 @@ import {
   type AllocationEntry, type AllocationRow, type Reconciliation,
 } from "./allocations.js";
 import {
-  createEmployee, designatedApproverOf, employeeExists, employeeProfile, grantExemption, isExempt,
-  linkAccount, listEmployees, openAccountLink, resolveAccount, setDesignatedApprover,
-  setWorkDatePolicy, unlinkAccount, workDatePolicyOf,
-  type AccountLinkRow, type EmployeeProfile, type EmployeeRow, type NewEmployee,
+  createEmployee, designatedApproverOf, employeeExists, employeeLabel, employeeProfile,
+  grantExemption, isExempt, linkAccount, listEmployees, openAccountLink, resolveAccount,
+  setDesignatedApprover, setWorkDatePolicy, unlinkAccount, workDatePolicyOf,
+  type AccountLinkRow, type EmployeeLabel, type EmployeeProfile, type EmployeeRow,
+  type NewEmployee,
 } from "./employees.js";
 import { listRoster } from "./roster.js";
 import {
@@ -133,6 +134,18 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
   /** The account's open link row, or null. Test-only introspection. */
   async openAccountLink(accountId: string): Promise<AccountLinkRow | null> {
     return openAccountLink(this.sql, accountId);
+  }
+
+  /**
+   * An employee's display name and number, for text a human will read.
+   *
+   * Separate from `employeeProfile`, which carries the two fields route selection needs and
+   * nothing anybody would recognise. This one exists so an observation description can name whose
+   * record is being reached into -- "File a punch correction for Yamada (W1)" rather than for an
+   * id, which tells the person authorizing it nothing.
+   */
+  async employeeLabel(employeeId: EmployeeId): Promise<EmployeeLabel> {
+    return employeeLabel(this.sql, employeeId);
   }
 
   async employeeProfile(employeeId: EmployeeId): Promise<EmployeeProfile> {

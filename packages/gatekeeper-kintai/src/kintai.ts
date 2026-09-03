@@ -31,6 +31,9 @@ import type { PunchLocation, PunchRow } from "./store/punches.js";
 import type { ActPreview, SubmissionRow } from "./store/submissions.js";
 import type { KintaiStore } from "./store/kintai-store.js";
 import { UnlinkedAccountError } from "./store/employees.js";
+// The refusal for "you have no authority over this employee". Shared with the approval stack
+// rather than restated: the two are the same answer to the same question about the org chart.
+import { NotAuthorizedError } from "./store/submissions.js";
 // The store decides a punch's work date under its own write gate and refuses when the answer
 // moved between the facet reading it and the write landing; `punch()` reads that refusal back
 // through this predicate, because the error class itself does not survive the RPC boundary.
@@ -40,7 +43,8 @@ import { isWorkDateRaced } from "./store/punches.js";
 import { hasColumn } from "./store/schema.js";
 import { AdminKintaiApi, ViewerKintaiApi } from "./admin-api.js";
 import {
-  assertMinutes, assertText, assertWorkDate, InvalidInputError, LIMITS,
+  assertEmployeeId, assertMinutes, assertPunchKind, assertRequiredText, assertText,
+  assertWorkDate, InvalidInputError, LIMITS,
 } from "./input.js";
 import { jstClockTime } from "./work-date.js";
 import TYPES_CODE from "./types.txt";
@@ -746,11 +750,24 @@ export class KintaiVerifier
  * all. Identity arrives out of band as an opaque `accountId` in `ctx.props`, bound to the class by
  * `KintaiAccount.getSingletonGatekeeperClass` and handed to this session by
  * `KintaiGatekeeper.startSession`. Every method below resolves the employee from that capability,
- * and NO method accepts an employee identifier as an argument — an employee can freely rewrite
- * their own Gadget's code, so the absence of such a parameter is the boundary, not any check a
- * caller could route around. For the same reason `now` is always `Date.now()` here and never a
- * parameter: a caller-supplied clock would let a Gadget punch into a closed period or backdate a
- * submission past an exemption window.
+ * and almost no method accepts an employee identifier as an argument — an employee can freely
+ * rewrite their own Gadget's code, so the absence of such a parameter is the boundary, not any
+ * check a caller could route around. For the same reason `now` is always `Date.now()` here and
+ * never a parameter: a caller-supplied clock would let a Gadget punch into a closed period or
+ * backdate a submission past an exemption window.
+ *
+ * THE EXCEPTION, and why it is one: `requestCorrectionFor` and `requestMissingPunchFor` do take an
+ * `employeeId`, because a foreman filing a correction for a worker who has no phone on site is the
+ * ordinary case this feature exists for. Read the rule above precisely — it rejects a check a
+ * caller could ROUTE AROUND, not every check. What gates these two is `hasAuthorityOver`, a query
+ * against `org_edges`, and the org chart is a fact the server owns: no Gadget can grant itself an
+ * edge, and rewriting the calling code changes nothing about the answer. That is categorically
+ * unlike trusting a caller's own claim about who they are, which is what `#accountId` still
+ * decides and what no argument can override. Whose punch it is may be named; WHO IS ASKING may not.
+ *
+ * Note the pair that follows from it: `submissions.created_by` records the filer, and `checkMayAct`
+ * refuses an approver who is either the employee or the filer. Filing for somebody else therefore
+ * costs the filer the ability to decide it, which is the point rather than a side effect.
  *
  * The dependencies are `#`-private, deliberately. `#store` is an UNAUTHENTICATED handle on the
  * whole company's ledger — it takes an `employeeId` on nearly every method — so if it were a public
@@ -967,6 +984,149 @@ export class KintaiSession extends RpcTarget {
     const employeeId = await this.#requireEmployee(now);
     await this.#store.assertWritable(workDate);
     return this.#store.setAllocations(employeeId, workDate, entries);
+  }
+
+  /**
+   * Ask for a recorded punch to say a different time. Returns the submission id.
+   *
+   * A REQUEST, not an edit, and that distinction is the whole shape of this feature. Nothing about
+   * the punch changes when this returns; it changes when somebody with authority approves the
+   * request, and `punches` is append-only so even then the original stays permanently readable
+   * beside its replacement. A caller — human or agent — that reports "fixed" on the strength of
+   * this returning is reporting something that has not happened.
+   *
+   * Four methods rather than one with nullable fields, and the split is deliberate twice over.
+   * Correcting a punch and adding one that was never recorded are different intentions with
+   * different validation, and this surface is read by an agent through `types.txt`: choosing
+   * between named methods errs less often than filling in a discriminating field. Filing for
+   * SOMEBODY ELSE is then split again, because that is an authority decision and it should be
+   * visible as one at the call site rather than implied by an argument.
+   */
+  async requestPunchCorrection(
+    punchId: number, occurredAt: number, reason: string,
+  ): Promise<number> {
+    assertRequiredText("reason", reason, LIMITS.reason);
+    const now = Date.now();
+    const employeeId = await this.#requireEmployee(now);
+    // Names nobody but the caller, so it stays shareable — exactly as `punch` and `getDay` do.
+    // The on-behalf forms below are the ones that reach into another record and say so.
+    return this.#fileCorrection(employeeId, employeeId, punchId, occurredAt, reason, now);
+  }
+
+  /**
+   * Ask for a punch that was never recorded to be added. The forgotten clock-out.
+   *
+   * `correctPunch` cannot express this — it supersedes an existing row and there is no row to
+   * supersede — which is why this is a separate method rather than a correction with no target.
+   */
+  async requestMissingPunch(
+    workDate: string, kind: PunchKind, occurredAt: number, reason: string,
+  ): Promise<number> {
+    assertWorkDate("workDate", workDate);
+    assertPunchKind("kind", kind);
+    assertRequiredText("reason", reason, LIMITS.reason);
+    const now = Date.now();
+    const employeeId = await this.#requireEmployee(now);
+    return this.#fileAddition(employeeId, employeeId, workDate, kind, occurredAt, reason, now);
+  }
+
+  /**
+   * File a correction on behalf of somebody you have authority over.
+   *
+   * The case this exists for: a worker tells their foreman they clocked in before the terminal
+   * woke up, and the worker has no device on site. Refusing that would push the fix onto an
+   * administrator with no first-hand knowledge of the day.
+   *
+   * Authority is `hasAuthorityOver` — an `org_edges` query the caller cannot influence. Passing
+   * your OWN id is refused rather than accommodated: nobody holds an edge to themselves, and
+   * `requestPunchCorrection` is the method for that, so the two intentions stay distinct instead
+   * of one silently covering both.
+   */
+  async requestCorrectionFor(
+    employeeId: EmployeeId, punchId: number, occurredAt: number, reason: string,
+  ): Promise<number> {
+    assertEmployeeId("employeeId", employeeId);
+    assertRequiredText("reason", reason, LIMITS.reason);
+    const now = Date.now();
+    const filerId = await this.#requireEmployee(now);
+    await this.#assertMayFileFor(filerId, employeeId, now);
+    return this.#fileCorrection(employeeId, filerId, punchId, occurredAt, reason, now);
+  }
+
+  /** File a missing punch on behalf of somebody you have authority over. */
+  async requestMissingPunchFor(
+    employeeId: EmployeeId, workDate: string, kind: PunchKind,
+    occurredAt: number, reason: string,
+  ): Promise<number> {
+    assertEmployeeId("employeeId", employeeId);
+    assertWorkDate("workDate", workDate);
+    assertPunchKind("kind", kind);
+    assertRequiredText("reason", reason, LIMITS.reason);
+    const now = Date.now();
+    const filerId = await this.#requireEmployee(now);
+    await this.#assertMayFileFor(filerId, employeeId, now);
+    return this.#fileAddition(employeeId, filerId, workDate, kind, occurredAt, reason, now);
+  }
+
+  /**
+   * Refuse a filing for an employee this caller has no authority over, and record the reach as an
+   * observation when they do.
+   *
+   * Two things, together, because they are one decision. Filing for somebody else reads into a
+   * record that is not the caller's own — which punch ids are theirs, what their day already holds
+   * — and that is the same class of data `listPendingApprovals` protects, so it is authorized the
+   * same way and with every observer excluded: `KintaiVerifier` has no members, so an observer id
+   * cannot be resolved to an employee and "may this collaborator see Tanaka's punches?" is not a
+   * question anything here can answer.
+   *
+   * The observation is authorized BEFORE the store is asked. An observation the Overseer refuses
+   * has to be able to prevent the filing; authorizing it after the write would make it a
+   * notification rather than a decision.
+   *
+   * Workshop admin is NOT a bypass. This is the session facet, whose whole contract is one
+   * employee's own record plus whatever the org chart adds; admin capability lives on
+   * `AdminKintaiApi` and arrives through `startAppUi`, not here.
+   */
+  async #assertMayFileFor(filerId: EmployeeId, employeeId: EmployeeId, now: number): Promise<void> {
+    const edge = await this.#store.hasAuthorityOver(filerId, employeeId, now);
+    if (edge === null) throw new NotAuthorizedError();
+    const employee = await this.#store.employeeLabel(employeeId);
+    await this.#authorize(
+      "Kintai record of an employee you manage",
+      `File a punch correction for ${employee.display_name} (${employee.employee_number}), whose ` +
+      "attendance record you have approval authority over in the organisation chart. This reads " +
+      "which punches their day holds and files a request against one of them; it changes no punch " +
+      "until somebody else approves it.",
+      this.#listObservers(),
+    );
+  }
+
+  /** The two filing paths, sharing everything after "who is asking, and for whom". */
+  async #fileCorrection(
+    employeeId: EmployeeId, filerId: EmployeeId,
+    punchId: number, occurredAt: number, reason: string, now: number,
+  ): Promise<number> {
+    const profile = await this.#store.employeeProfile(employeeId);
+    return this.#store.fileAmendment({
+      employeeId, targetPunchId: punchId, occurredAt, reason, now,
+      department: profile.department, employmentType: profile.employment_type,
+      // Never defaulted. The origination rule — `checkMayAct` refusing an approver who filed the
+      // request — is only as strong as this column being populated, and a filing path that forgot
+      // it would let its filer approve their own request with nothing anywhere saying so.
+      createdBy: filerId,
+    });
+  }
+
+  async #fileAddition(
+    employeeId: EmployeeId, filerId: EmployeeId, workDate: string, kind: PunchKind,
+    occurredAt: number, reason: string, now: number,
+  ): Promise<number> {
+    const profile = await this.#store.employeeProfile(employeeId);
+    return this.#store.fileAmendment({
+      employeeId, targetPunchId: null, workDate, kind, occurredAt, reason, now,
+      department: profile.department, employmentType: profile.employment_type,
+      createdBy: filerId,
+    });
   }
 
   async submitOvertime(requestedFor: string, minutes: number, reason: string): Promise<number> {
