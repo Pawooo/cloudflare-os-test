@@ -48,6 +48,30 @@
 // - `KINTAI_INVALID_TRANSITION` — the submission is not in a state that allows this.
 // - `KINTAI_WORK_DATE_RACED` — two punches for this employee landed at once and the day this one
 //   belongs to changed underneath it. Nothing was recorded; see `punch()`.
+//
+// Filing a punch correction adds these. All of them mean nothing was recorded:
+//
+// - `KINTAI_AMENDMENT_TARGET` — that punch is not one this employee can amend. Re-read the day
+//   with `getDay()` and name a punch it shows.
+// - `KINTAI_PUNCH_ALREADY_AMENDED` — the punch has already been corrected, so the id names
+//   history. Amend the correction instead: `getDay()` shows the row that is current.
+// - `KINTAI_FUTURE_OCCURRENCE` — a punch cannot be dated in the future. Give the time it should
+//   have been made, not one still to come.
+// - `KINTAI_AMENDMENT_WORK_DATE` — the time given is not on the work date the punch is filed
+//   against. A night-shift employee's day may run into the following morning and that is allowed;
+//   beyond one shift's length past the end of the day is not.
+// - `KINTAI_DUPLICATE_AMENDMENT` — an undecided request already asks to change that punch.
+//   Withdraw it before filing another.
+// - `KINTAI_DUPLICATE_PUNCH` — refused at FILING: the day already records that punch at that
+//   time. Correct the existing punch instead of adding a second one.
+// - `KINTAI_AMENDMENT_DUPLICATE_PUNCH` — refused at APPROVAL: the punch was not there when the
+//   request was filed, but is now, so applying it would record one event twice. Reject the
+//   request.
+// - `KINTAI_AMENDMENT_TARGET_SUPERSEDED` — the punch was corrected by somebody else while this
+//   request was waiting, so it can no longer be applied. Reject it; a fresh correction can be
+//   filed against the punch that is now current.
+// - `KINTAI_FILED_BY_APPROVER` — you filed this request, and nobody may decide a request they
+//   filed themselves. Somebody else in its approval route must decide it.
 
 /** A clock event. `break_start`/`break_end` bracket unpaid time inside a shift. */
 export type PunchKind = "in" | "out" | "break_start" | "break_end";
@@ -80,7 +104,7 @@ export type PunchRow = {
   kind: PunchKind;
   occurred_at: number;
   recorded_at: number;
-  source: "gadget" | "admin" | "import";
+  source: "gadget" | "admin" | "import" | "amendment";
   latitude: number | null;
   longitude: number | null;
   accuracy_m: number | null;
@@ -168,6 +192,15 @@ export type KintaiDay = {
 /** Lifecycle of an overtime request. `return` puts it back to `draft` for the employee to amend. */
 export type SubmissionState = "draft" | "pending" | "approved" | "rejected" | "withdrawn";
 
+/**
+ * What a submission is asking for.
+ *
+ * `overtime` claims minutes. `amendment` asks for one punch to be corrected or added and carries
+ * no minutes at all — `minutes` is 0 on those rows and means nothing, so never present it as a
+ * quantity. Both travel the same approval route and appear in the same queues.
+ */
+export type SubmissionKind = "overtime" | "amendment";
+
 /** What an approver can do to a submission at its current step. */
 export type ApprovalAction = "approve" | "reject" | "return";
 
@@ -179,7 +212,7 @@ export type ApprovalAction = "approve" | "reject" | "return";
 export type SubmissionRow = {
   id: number;
   employee_id: number;
-  kind: "overtime";
+  kind: SubmissionKind;
   requested_for: string;
   state: SubmissionState;
   submitted_at: number | null;
@@ -267,6 +300,57 @@ export interface KintaiSession {
    * raise it.
    */
   submitOvertime(requestedFor: string, minutes: number, reason: string): Promise<number>;
+
+  /**
+   * Ask for a recorded punch to say a different time. Returns the new submission's id.
+   *
+   * A REQUEST, NOT AN EDIT. Nothing about the punch changes when this returns. It changes when
+   * somebody with authority approves the request, and not before — so do not tell the user their
+   * punch is fixed, tell them a correction has been filed and is waiting for approval. You can
+   * see it in `listMySubmissions()` while it waits.
+   *
+   * `punchId` comes from `getDay()`. `occurredAt` is the epoch-millisecond instant the punch
+   * should carry; it must be in the past and must fall on the work date the punch belongs to.
+   * `reason` is required and is the only account of why the record differs from what was
+   * recorded — a person will read it when deciding, so pass the user's own words, not a summary.
+   *
+   * This is also the way through `KINTAI_PERIOD_LOCKED`. An approved correction is the one write
+   * allowed into a month that has been closed for payroll.
+   */
+  requestPunchCorrection(punchId: number, occurredAt: number, reason: string): Promise<number>;
+
+  /**
+   * Ask for a punch that was never recorded to be added — the forgotten clock-out.
+   *
+   * Use this and not `requestPunchCorrection` when the day has no punch to fix: a correction
+   * replaces an existing punch and there is nothing to replace. `getDay()`'s `anomalies` is how
+   * you tell — `unpaired_in` means a clock-in with no clock-out after it.
+   *
+   * Same terms as a correction: a request, decided by a person, taking effect only on approval.
+   */
+  requestMissingPunch(
+    workDate: string, kind: PunchKind, occurredAt: number, reason: string,
+  ): Promise<number>;
+
+  /**
+   * File a correction for an employee you manage, rather than for yourself.
+   *
+   * For the case where the employee cannot file it themselves — no device on site, already gone
+   * home. Requires approval authority over them in the organisation chart; anybody else gets
+   * `KINTAI_NOT_AUTHORIZED`. Passing your own id is refused: use `requestPunchCorrection`.
+   *
+   * NOTE WHAT IT COSTS YOU: filing a request means you may no longer decide it
+   * (`KINTAI_FILED_BY_APPROVER`). Somebody else in the approval route has to. If you are the only
+   * approver, ask the employee to file it themselves instead.
+   */
+  requestCorrectionFor(
+    employeeId: number, punchId: number, occurredAt: number, reason: string,
+  ): Promise<number>;
+
+  /** Add a missing punch for an employee you manage. Same terms as `requestCorrectionFor`. */
+  requestMissingPunchFor(
+    employeeId: number, workDate: string, kind: PunchKind, occurredAt: number, reason: string,
+  ): Promise<number>;
 
   /** Take back one of the caller's own pending submissions. */
   withdrawSubmission(submissionId: number): Promise<void>;
