@@ -1,7 +1,9 @@
 import React, { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AnomalousDay, PendingItem, PunchRow, RosterEntry } from "../src/types";
+import type {
+  AnomalousDay, MonthlyReport, MonthlyTotalRow, PendingItem, PunchRow, RosterEntry,
+} from "../src/types";
 import AdminPage, { type KintaiAdminClient } from "./AdminPage";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -70,6 +72,12 @@ function adminApi(overrides: Partial<KintaiAdminClient> = {}, roster: RosterEntr
     getEmployeeDay: vi.fn<KintaiAdminClient["getEmployeeDay"]>(async () => ({
       punches: [], anomalies: [], workedMinutes: 0,
     })),
+    // An open month with nobody in it, so every test that is not about 月次 renders that tab in
+    // its "no punches" state rather than having to say so.
+    monthlyReport: vi.fn<KintaiAdminClient["monthlyReport"]>(async (period) => ({
+      period, locked: false, rows: [],
+    })),
+    lockPeriod: vi.fn<KintaiAdminClient["lockPeriod"]>(async () => {}),
     ...overrides,
   };
 }
@@ -109,6 +117,12 @@ function viewerApi(overrides: Partial<KintaiAdminClient> = {}) {
     }),
     getEmployeeDay: vi.fn<KintaiAdminClient["getEmployeeDay"]>(async () => {
       throw REFUSED("getEmployeeDay");
+    }),
+    monthlyReport: vi.fn<KintaiAdminClient["monthlyReport"]>(async () => {
+      throw REFUSED("monthlyReport");
+    }),
+    lockPeriod: vi.fn<KintaiAdminClient["lockPeriod"]>(async () => {
+      throw REFUSED("lockPeriod");
     }),
     ...overrides,
   });
@@ -168,6 +182,24 @@ function correction(overrides: Partial<PendingItem> = {}): PendingItem {
     },
     ...overrides,
   });
+}
+
+/** One employee's month: 20 days, 162h 30m credited, one day flagged. */
+function totals(overrides: Partial<MonthlyTotalRow> = {}): MonthlyTotalRow {
+  return {
+    employeeId: TANAKA.id,
+    displayName: "Tanaka",
+    employeeNumber: "E-1001",
+    daysWorked: 20,
+    workedMinutes: 162 * 60 + 30,
+    anomalousDays: 1,
+    ...overrides,
+  };
+}
+
+/** A month's report, open unless said otherwise. */
+function report(overrides: Partial<MonthlyReport> = {}): MonthlyReport {
+  return { period: "2026-09", locked: false, rows: [totals()], ...overrides };
 }
 
 function flagged(overrides: Partial<AnomalousDay> = {}): AnomalousDay {
@@ -913,6 +945,314 @@ describe("AdminPage", () => {
     });
   });
 
+  /**
+   * 月次: the month an administrator reads, and the one write that closes it.
+   *
+   * Scoped to `[data-testid="panel-monthly"]` throughout, for the reason the 要対応 block above
+   * is: all three panels are mounted at once, so an unscoped query can pass about the wrong tab.
+   *
+   * `Date.now` is stubbed to one instant because the picker's DEFAULT and its future bound both
+   * read it. Nothing else on this tab reads a clock — the numbers arrive already computed.
+   */
+  describe("月次, the month read and the close that ends it", () => {
+    beforeEach(() => {
+      vi.spyOn(Date, "now").mockReturnValue(NOW);
+    });
+
+    describe("the month picker", () => {
+      // JST, not UTC: `toISOString().slice(0, 7)` reports the previous month for the first nine
+      // hours of every Japanese day, which is the window `workDateStart` exists because of.
+      it("opens on the current JST month and reads it", async () => {
+        const api = adminApi({}, [TANAKA]);
+        await render(<AdminPage api={api} />);
+
+        expect(monthlyText('[data-testid="month-label"]')).toBe("2026-09");
+        expect(api.monthlyReport).toHaveBeenCalledWith("2026-09");
+      });
+
+      it("walks backwards a month at a time, across a year boundary", async () => {
+        const api = adminApi({}, [TANAKA]);
+        await render(<AdminPage api={api} />);
+
+        await click('[data-testid="panel-monthly"] [data-action="prev-month"]');
+        expect(monthlyText('[data-testid="month-label"]')).toBe("2026-08");
+        expect(api.monthlyReport).toHaveBeenLastCalledWith("2026-08");
+
+        for (let i = 0; i < 8; i++) {
+          await click('[data-testid="panel-monthly"] [data-action="prev-month"]');
+        }
+        expect(monthlyText('[data-testid="month-label"]')).toBe("2025-12");
+      });
+
+      /**
+       * The bound that keeps the picker out of a refusal it can predict.
+       *
+       * `lockPeriod` throws `KINTAI_FUTURE_PERIOD` for a month that has not started, and a next
+       * button that walked into October would offer a reader a month with no punches in it and a
+       * close control that could only fail. Browsing PAST months has no such bound.
+       */
+      it("will not walk into a month that has not started", async () => {
+        const api = adminApi({}, [TANAKA]);
+        await render(<AdminPage api={api} />);
+
+        expect(monthlyField<HTMLButtonElement>('[data-action="next-month"]').disabled).toBe(true);
+
+        await click('[data-testid="panel-monthly"] [data-action="prev-month"]');
+        expect(monthlyField<HTMLButtonElement>('[data-action="next-month"]').disabled).toBe(false);
+
+        await click('[data-testid="panel-monthly"] [data-action="next-month"]');
+        expect(monthlyText('[data-testid="month-label"]')).toBe("2026-09");
+        expect(api.monthlyReport).not.toHaveBeenCalledWith("2026-10");
+      });
+    });
+
+    describe("the table", () => {
+      it("names each employee and reports their days, hours and flagged days", async () => {
+        const api = adminApi({
+          monthlyReport: vi.fn(async () => report({
+            rows: [totals(), totals({
+              employeeId: SUZUKI.id, displayName: "Suzuki", employeeNumber: "E-1002",
+              daysWorked: 3, workedMinutes: 24 * 60, anomalousDays: 0,
+            })],
+          })),
+        }, [TANAKA, SUZUKI]);
+        await render(<AdminPage api={api} />);
+
+        const tanaka = monthlyRow(TANAKA.id);
+        expect(tanaka.textContent).toContain("Tanaka");
+        expect(tanaka.textContent).toContain("E-1001");
+        expect(within(tanaka, '[data-testid="days"]')).toBe("20");
+        expect(within(tanaka, '[data-testid="hours"]')).toBe("162h 30m");
+        expect(within(monthlyRow(SUZUKI.id), '[data-testid="hours"]')).toBe("24h 0m");
+      });
+
+      it("says a month has no punches rather than showing an empty table", async () => {
+        await render(<AdminPage api={adminApi({}, [TANAKA])} />);
+
+        expect(monthlyText('[data-testid="monthly-empty"]')).toContain("打刻がありません");
+      });
+
+      // Beside what failed, and NOT a dead end: the only other control on this panel is the
+      // picker, so a month whose read failed would be unreadable for the life of the page.
+      it("says a month could not be read, and offers the read again", async () => {
+        let attempt = 0;
+        const api = adminApi({
+          monthlyReport: vi.fn<KintaiAdminClient["monthlyReport"]>(async (period) => {
+            if (attempt++ === 0) throw new Error("connection lost");
+            return report({ period });
+          }),
+        }, [TANAKA]);
+        await render(<AdminPage api={api} />);
+
+        expect(monthlyText('[data-testid="monthly-error"]')).toBe("Couldn’t read that month.");
+
+        await click('[data-testid="panel-monthly"] [data-action="retry-month"]');
+
+        expect(monthlyMaybe('[data-testid="monthly-error"]')).toBeNull();
+        expect(monthlyRow(TANAKA.id).textContent).toContain("Tanaka");
+      });
+    });
+
+    describe("the flagged-day count", () => {
+      /**
+       * The count is a way INTO 要対応, not a second rendering of it.
+       *
+       * 要対応 already lists every flagged day with its punches one press away, and a second copy
+       * of that on this tab would be two screens to keep in agreement about the same query.
+       */
+      it("takes the reader to 要対応 rather than expanding here", async () => {
+        const api = adminApi({ monthlyReport: vi.fn(async () => report()) }, [TANAKA]);
+        await render(<AdminPage api={api} />);
+
+        await click(
+          '[data-testid="panel-monthly"] [data-action="show-anomalies"]',
+        );
+
+        expect(field<HTMLButtonElement>('[data-testid="tab-overview"]').getAttribute("aria-selected"))
+          .toBe("true");
+        expect(field<HTMLElement>('[data-testid="panel-overview"]').hidden).toBe(false);
+      });
+
+      /**
+       * And it is NOT offered for a month 要対応 is not showing.
+       *
+       * That panel reads `listAnomalousDays` once, for the month the page opened in, and never
+       * again — so a button on a row from August would switch tabs to September's flagged days and
+       * look like it had done nothing. This page has gone out of its way not to ship a control
+       * that is clickable and inert; the count still reads, it just is not a link.
+       */
+      it("does not offer the jump for a month 要対応 is not reading", async () => {
+        const api = adminApi({
+          monthlyReport: vi.fn<KintaiAdminClient["monthlyReport"]>(async (period) =>
+            report({ period })),
+        }, [TANAKA]);
+        await render(<AdminPage api={api} />);
+
+        await click('[data-testid="panel-monthly"] [data-action="prev-month"]');
+
+        expect(within(monthlyRow(TANAKA.id), '[data-testid="anomalies"]')).toContain("1");
+        expect(monthlyMaybe('[data-action="show-anomalies"]')).toBeNull();
+      });
+
+      it("offers no jump when nothing in the month is flagged", async () => {
+        const api = adminApi({
+          monthlyReport: vi.fn(async () => report({ rows: [totals({ anomalousDays: 0 })] })),
+        }, [TANAKA]);
+        await render(<AdminPage api={api} />);
+
+        expect(within(monthlyRow(TANAKA.id), '[data-testid="anomalies"]')).toBe("0");
+        expect(monthlyMaybe('[data-action="show-anomalies"]')).toBeNull();
+      });
+    });
+
+    describe("closing the month", () => {
+      it("shows 締め済み and no close control at all once a month is closed", async () => {
+        const api = adminApi({
+          monthlyReport: vi.fn(async () => report({ locked: true })),
+        }, [TANAKA]);
+        await render(<AdminPage api={api} />);
+
+        expect(monthlyText('[data-testid="monthly-locked"]')).toContain("締め済み");
+        expect(monthlyMaybe('[data-action="close-month"]')).toBeNull();
+        expect(monthlyMaybe('[data-action="confirm-close-month"]')).toBeNull();
+      });
+
+      it("offers 「この月を締める」 on an open month, and closes nothing until it is confirmed",
+        async () => {
+          const api = adminApi({ monthlyReport: vi.fn(async () => report()) }, [TANAKA]);
+          await render(<AdminPage api={api} />);
+
+          expect(monthlyText('[data-action="close-month"]')).toBe("この月を締める");
+          expect(monthlyMaybe('[data-testid="close-confirm"]')).toBeNull();
+
+          await click('[data-testid="panel-monthly"] [data-action="close-month"]');
+
+          expect(monthlyMaybe('[data-testid="close-confirm"]')).not.toBeNull();
+          expect(api.lockPeriod).not.toHaveBeenCalled();
+        });
+
+      /**
+       * The three facts the confirmation must state, pinned.
+       *
+       * "Closed" in this system does NOT mean frozen, and that is the single most misreadable
+       * thing about the button: `assertWritable` refuses ordinary writes, but an approved
+       * amendment is still applied into a closed month (`actOnAmendment`) and the next
+       * `monthlyTotals` walks the punches it wrote. An administrator who read "closed" as "these
+       * numbers are final" would hand payroll a total that can still move. All three sentences are
+       * asserted rather than a substring of one, because dropping any of them leaves the other two
+       * misleading.
+       */
+      it("states that edits stop, that approved corrections do not, and that totals can still move",
+        async () => {
+          const api = adminApi({ monthlyReport: vi.fn(async () => report()) }, [TANAKA]);
+          await render(<AdminPage api={api} />);
+
+          await click('[data-testid="panel-monthly"] [data-action="close-month"]');
+          const confirm = monthlyText('[data-testid="close-confirm"]');
+
+          expect(confirm).toContain("2026-09");
+          expect(confirm).toContain(
+            "通常の打刻や修正は拒否されます — ordinary edits into this month stop here.",
+          );
+          expect(confirm).toContain(
+            "承認された修正申請は引き続き反映されます — approval is the one way in that stays open.",
+          );
+          expect(confirm).toContain(
+            "だから合計はまだ動きます — closing a month does not freeze these numbers.",
+          );
+          expect(confirm).toContain("締めを解除する方法はありません");
+        });
+
+      it("puts the month back the way it was when the confirmation is dismissed", async () => {
+        const api = adminApi({ monthlyReport: vi.fn(async () => report()) }, [TANAKA]);
+        await render(<AdminPage api={api} />);
+
+        await click('[data-testid="panel-monthly"] [data-action="close-month"]');
+        await click('[data-testid="panel-monthly"] [data-action="cancel-close-month"]');
+
+        expect(monthlyMaybe('[data-testid="close-confirm"]')).toBeNull();
+        expect(monthlyMaybe('[data-action="close-month"]')).not.toBeNull();
+        expect(api.lockPeriod).not.toHaveBeenCalled();
+      });
+
+      it("closes the month on the second press, and re-reads it so the badge is the truth",
+        async () => {
+          let locked = false;
+          const api = adminApi({
+            monthlyReport: vi.fn<KintaiAdminClient["monthlyReport"]>(async (period) =>
+              report({ period, locked })),
+            lockPeriod: vi.fn<KintaiAdminClient["lockPeriod"]>(async () => { locked = true; }),
+          }, [TANAKA]);
+          await render(<AdminPage api={api} />);
+
+          await click('[data-testid="panel-monthly"] [data-action="close-month"]');
+          await click('[data-testid="panel-monthly"] [data-action="confirm-close-month"]');
+
+          expect(api.lockPeriod).toHaveBeenCalledWith("2026-09");
+          expect(monthlyText('[data-testid="monthly-locked"]')).toContain("締め済み");
+          expect(monthlyMaybe('[data-action="close-month"]')).toBeNull();
+          expect(monthlyMaybe('[data-testid="close-confirm"]')).toBeNull();
+        });
+
+      /**
+       * The race the store refuses, rendered like every other failure on this page.
+       *
+       * `AlreadyLockedError` is raised inside the same synchronous run as the INSERT — it is not a
+       * check this screen could have made — so two administrators pressing the button together is
+       * exactly the case it exists for. `describeFailure` strips the `KINTAI_` prefix and shows
+       * the detail, which names the closer as "employee 3": a raw id where a name belongs, and a
+       * known, ledgered defect in the message rather than in this rendering of it.
+       */
+      it("shows the refusal when somebody else closed the month first", async () => {
+        const api = adminApi({
+          monthlyReport: vi.fn(async () => report()),
+          lockPeriod: vi.fn<KintaiAdminClient["lockPeriod"]>(async () => {
+            throw new Error(
+              "KINTAI_ALREADY_LOCKED: 2026-09 is already closed — employee 3 closed it on " +
+              "2026-09-04 at 12:00 JST. It stays closed, and this call changed nothing.",
+            );
+          }),
+        }, [TANAKA]);
+        await render(<AdminPage api={api} />);
+
+        await click('[data-testid="panel-monthly"] [data-action="close-month"]');
+        await click('[data-testid="panel-monthly"] [data-action="confirm-close-month"]');
+
+        expect(monthlyText('[data-testid="close-error"]'))
+          .toContain("2026-09 is already closed — employee 3 closed it");
+        expect(monthlyText('[data-testid="close-error"]')).not.toContain("KINTAI_");
+      });
+
+      // An armed confirmation names one month. Walking the picker while it is armed would leave a
+      // confirmation about September in front of a reader now looking at August.
+      it("disarms the confirmation when the month is changed under it", async () => {
+        const api = adminApi({
+          monthlyReport: vi.fn<KintaiAdminClient["monthlyReport"]>(async (period) =>
+            report({ period })),
+        }, [TANAKA]);
+        await render(<AdminPage api={api} />);
+
+        await click('[data-testid="panel-monthly"] [data-action="close-month"]');
+        await click('[data-testid="panel-monthly"] [data-action="prev-month"]');
+
+        expect(monthlyMaybe('[data-testid="close-confirm"]')).toBeNull();
+      });
+
+      // The panel is mounted from the first admin render like the other two, so its read must not
+      // wait for the tab to be looked at — and must not fire again on every flip.
+      it("reads the month once on mount, and not again on a tab flip", async () => {
+        const api = adminApi({}, [TANAKA]);
+        await render(<AdminPage api={api} />);
+
+        await click('[data-testid="tab-monthly"]');
+        await click('[data-testid="tab-roster"]');
+        await click('[data-testid="tab-monthly"]');
+
+        expect(api.monthlyReport).toHaveBeenCalledTimes(1);
+      });
+    });
+  });
+
   describe("the forms", () => {
     it("creates an employee with what was typed, trimmed", async () => {
       const api = adminApi();
@@ -1399,6 +1739,23 @@ describe("AdminPage", () => {
     return [...container!.querySelectorAll<HTMLElement>(
       `[data-testid="panel-overview"] ${selector}`,
     )];
+  }
+
+  /** Anything inside the 月次 panel. Nothing on that tab is queried unscoped, for the same reason. */
+  function monthlyField<T extends Element>(selector: string): T {
+    return field<T>(`[data-testid="panel-monthly"] ${selector}`);
+  }
+
+  function monthlyText(selector: string): string {
+    return monthlyField(selector).textContent ?? "";
+  }
+
+  function monthlyMaybe(selector: string): HTMLElement | null {
+    return container!.querySelector<HTMLElement>(`[data-testid="panel-monthly"] ${selector}`);
+  }
+
+  function monthlyRow(employeeId: number): HTMLElement {
+    return monthlyField<HTMLElement>(`[data-monthly-employee="${employeeId}"]`);
   }
 
   function pendingRow(submissionId: number): HTMLElement {

@@ -14,8 +14,8 @@ import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 
  * See the note in `src/types.ts`.
  */
 import type {
-  AnomalousDay, EmployeeDay, EmployeeId, KintaiIdentity, NewEmployee, PendingItem, RosterEntry,
-  WorkDatePolicy,
+  AnomalousDay, EmployeeDay, EmployeeId, KintaiIdentity, MonthlyReport, NewEmployee, PendingItem,
+  RosterEntry, WorkDatePolicy,
 } from "../src/types";
 import { WORK_DATE_POLICIES, WORK_DATE_POLICY_LABELS } from "../src/work-date";
 import { describeFailure, isAdminRequired } from "./errors";
@@ -45,6 +45,17 @@ export type KintaiAdminClient = {
   listAnomalousDays(period: string): Promise<AnomalousDay[]>;
   /** One employee's one day: the punches, the flags they raise, the minutes they credit. */
   getEmployeeDay(employeeId: EmployeeId, workDate: string): Promise<EmployeeDay>;
+  /** One month per employee — days, minutes, flagged days — plus whether the month is closed. */
+  monthlyReport(period: string): Promise<MonthlyReport>;
+  /**
+   * Close `period`. ONE-WAY: there is no unlock anywhere in this package.
+   *
+   * Refuses a month already closed (`KINTAI_ALREADY_LOCKED`, a race no caller can pre-empt), a
+   * month that has not started (`KINTAI_FUTURE_PERIOD`), a malformed one, and an administrator
+   * whose own account is not linked to an employee record (`KINTAI_ADMIN_NOT_LINKED` — the close
+   * records who performed it).
+   */
+  lockPeriod(period: string): Promise<void>;
 };
 
 /**
