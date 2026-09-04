@@ -1302,10 +1302,34 @@ describe("amendment detail in the lists", () => {
     // Named, not flagged: an approver triaging a queue has to read WHICH month they are about to
     // reopen, and applying an approved amendment is the only write in this system allowed in.
     expect(row?.amendment?.lockedPeriod).toBe("2026-07");
-    // The lock is a fact about the month, not about the request, so it must not leak onto rows
-    // whose month is open.
-    const july = await store.pendingApprovalsFor(boss, LATER);
-    expect(july.every((r) => r.kind !== "overtime" || r.amendment === undefined)).toBe(true);
+  });
+
+  it("marks only the requests whose month is closed, in one queue read", async () => {
+    // The lock is a fact about the MONTH, not about the request. One queue holding a July
+    // correction and an August one, July locked: the first must carry the period and the second
+    // must not, read together, because a per-row leak in either direction misleads a triaging
+    // approver about which approvals reopen a paid month.
+    await singleStepRoute();
+    const julyPunch = await clockIn();
+    const julySubmission = await fileCorrection(julyPunch);
+    const AUG_DAY = "2026-08-03";
+    const AUG_NINE = Date.parse("2026-08-03T00:00:00Z");
+    const augustPunch = await store.recordPunch({
+      employeeId: worker, workDate: AUG_DAY, kind: "in", now: AUG_NINE, source: "gadget",
+    });
+    const augustSubmission = await store.fileAmendment({
+      employeeId: worker, targetPunchId: augustPunch, occurredAt: AUG_NINE - 1800_000,
+      reason: "started early on site", now: AUG_NINE + 3600_000,
+      department: "CONSTRUCTION", employmentType: null, createdBy: worker,
+    });
+    await store.lockPeriod("2026-07", boss, AUG_NINE + 7200_000);
+
+    const queue = await store.pendingApprovalsFor(boss, AUG_NINE + 7200_000);
+    const july = queue.find((r) => r.id === julySubmission);
+    const august = queue.find((r) => r.id === augustSubmission);
+
+    expect(july?.amendment?.lockedPeriod).toBe("2026-07");
+    expect(august?.amendment?.lockedPeriod).toBeNull();
   });
 
   it("says the same thing in the queue as the confirmation dialog does", async () => {

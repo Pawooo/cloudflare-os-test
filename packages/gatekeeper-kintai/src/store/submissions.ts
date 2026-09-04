@@ -715,7 +715,7 @@ export type AmendmentDetail = {
  * The alias `a` is assumed to be `amendment_requests`; `t`, `c` and `pl` are this fragment's own.
  */
 const AMENDMENT_DETAIL_COLUMNS = `
-  a.target_punch_id,
+  a.target_punch_id AS amendment_target_punch_id,
   COALESCE(c.occurred_at, t.occurred_at) AS current_occurred_at,
   a.occurred_at AS requested_occurred_at,
   a.work_date AS amendment_work_date,
@@ -727,9 +727,17 @@ const AMENDMENT_DETAIL_JOINS = `
   LEFT JOIN punches c ON c.supersedes_id = a.target_punch_id
   LEFT JOIN period_locks pl ON pl.period = ${periodOfSql("a.work_date")}`;
 
-/** The row `AMENDMENT_DETAIL_COLUMNS` selects. Column names, not the type's field names. */
+/**
+ * The row `AMENDMENT_DETAIL_COLUMNS` selects. Column names, not the type's field names.
+ *
+ * Every joined column is alias-prefixed, uniformly. `s.*` brings the whole submissions table
+ * along in the list reads, and a duplicate column name in a SqlStorage result resolves
+ * last-wins with no error -- so an unprefixed name here is one future submissions column away
+ * from silently clobbering, or being clobbered, on every row. The prefix is the rule, not a
+ * per-collision fix.
+ */
 type AmendmentDetailColumns = {
-  target_punch_id: number | null;
+  amendment_target_punch_id: number | null;
   current_occurred_at: number | null;
   requested_occurred_at: number;
   /** Aliased away from `submissions.requested_for`/`kind`, which `s.*` also brings along. */
@@ -740,7 +748,7 @@ type AmendmentDetailColumns = {
 
 function toAmendmentDetail(row: AmendmentDetailColumns): AmendmentDetail {
   return {
-    targetPunchId: row.target_punch_id,
+    targetPunchId: row.amendment_target_punch_id,
     currentOccurredAt: row.current_occurred_at,
     requestedOccurredAt: row.requested_occurred_at,
     workDate: row.amendment_work_date,
@@ -1038,16 +1046,30 @@ export const PENDING_APPROVALS_QUERY =
 function withAmendmentDetail(row: SubmissionListRow): SubmissionRow {
   const {
     amendment_submission_id: amendmentId,
-    target_punch_id, current_occurred_at, requested_occurred_at,
+    amendment_target_punch_id, current_occurred_at, requested_occurred_at,
     amendment_work_date, amendment_kind, locked_period,
     ...submission
   } = row;
-  // Absent, not empty: whatever reads these rows branches on the property's presence.
-  if (amendmentId === null) return submission;
+  if (amendmentId === null) {
+    // An amendment row with no request row is a broken record, not an overtime submission -- and
+    // rendering it as one is the exact zero-minutes misreading this field exists to prevent.
+    // `amendmentPreview` throws on the same broken invariant; a queue that silently disagreed with
+    // the dialog would give an agent two answers about one request. Loud, and uncoded on purpose:
+    // `isDomainRefusal` must not read a corrupt record as a clean refusal.
+    if (submission.kind === "amendment") {
+      throw new Error(
+        `withAmendmentDetail: submission ${submission.id} is an amendment with no request row`,
+      );
+    }
+    // Absent, not empty: whatever reads these rows branches on the property's presence, which the
+    // guard above keeps equivalent to `kind === 'amendment'` -- or a loud failure, never a quiet
+    // third state.
+    return submission;
+  }
   return {
     ...submission,
     amendment: toAmendmentDetail({
-      target_punch_id, current_occurred_at, requested_occurred_at,
+      amendment_target_punch_id, current_occurred_at, requested_occurred_at,
       amendment_work_date, amendment_kind, locked_period,
     }),
   };
