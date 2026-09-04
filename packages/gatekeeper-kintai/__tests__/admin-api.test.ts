@@ -121,10 +121,10 @@ const CALL_ARGS: Record<string, unknown[]> = {
   listAnomalousDays: ["2026-07"],
   monthlyReport: ["2026-07"],
   getEmployeeDay: [1, "2026-07-03"],
-  // A month nothing else in this file closes. A non-admin's call never reaches the write, but a
-  // period named here must still be one no later test wants open, because a refusal that stopped
-  // working would silently close it.
-  lockPeriod: ["2026-11"],
+  // A past month nothing else in this file closes. A non-admin's call never reaches the write, but
+  // a period named here must still be one no later test wants open, because a refusal that stopped
+  // working would silently close it. See the note on "closing a month" for the 2025 convention.
+  lockPeriod: ["2025-11"],
 };
 
 /**
@@ -352,9 +352,10 @@ describe("the capability a non-admin receives", () => {
     expect(Object.keys(correction.amendment).toSorted())
       .toEqual(NESTED_RETURN_SHAPES.amendmentDetail);
 
-    // The one new write answers with nothing, like every other write here. Its own month, because
-    // closing one is permanent for the rest of this file.
-    expect(await hr.lockPeriod("2026-12")).toBeUndefined();
+    // The one new write answers with nothing, like every other write here. Its own month, and a
+    // past one: see the note on "closing a month" for why every month closed in this file is a
+    // 2025 month.
+    expect(await hr.lockPeriod("2025-12")).toBeUndefined();
   });
 
   it("still answers whoAmI, which is how an employee reads their code for HR", async () => {
@@ -984,6 +985,12 @@ describe("the attendance an admin can now read", () => {
   });
 });
 
+// EVERY MONTH CLOSED IN THIS FILE IS A 2025 MONTH, and that is not decoration. This file shares
+// one store, there is no unlock, and the end-to-end at the bottom has to close the LIVE month —
+// the only one an ordinary punch can land in. A test that closed a fixed 2026 month would
+// therefore be a time bomb: run the suite in that month and the end-to-end finds it already
+// closed and fails on `KINTAI_ALREADY_LOCKED`. A month in the past can never be the live one.
+// (The attendance seeds below stay in 2026; nothing closes those.)
 describe("closing a month", () => {
   /** An admin whose own account is linked, which closing a month requires. */
   async function closer(tag: string) {
@@ -1006,13 +1013,13 @@ describe("closing a month", () => {
     const { adminEmployee, hr } = await closer("Closer");
     const before = Date.now();
 
-    expect(await hr.lockPeriod("2026-01")).toBeUndefined();
+    expect(await hr.lockPeriod("2025-01")).toBeUndefined();
 
-    const lock = await store.periodLock("2026-01");
+    const lock = await store.periodLock("2025-01");
     expect(lock).toMatchObject({ lockedBy: adminEmployee });
     expect(lock!.lockedAt).toBeGreaterThanOrEqual(before);
     // And the report says so, from the same table rather than from a second opinion.
-    expect(await hr.monthlyReport("2026-01")).toMatchObject({ locked: true });
+    expect(await hr.monthlyReport("2025-01")).toMatchObject({ locked: true });
   });
 
   // Who closed a month is the first question asked of a closed month, and it is taken from the
@@ -1021,17 +1028,17 @@ describe("closing a month", () => {
     const { adminEmployee, hr } = await closer("Auditing Closer");
     const before = Date.now();
 
-    await hr.lockPeriod("2026-02");
+    await hr.lockPeriod("2025-02");
 
-    const [entry] = await lockEntries("2026-02");
+    const [entry] = await lockEntries("2025-02");
     expect(entry).toMatchObject({ entity: "period_locks", actor_employee_id: adminEmployee });
     // `period_locks` is keyed on the period, which is TEXT; `audit_log.entity_id` is an INTEGER,
     // so the period travels in before/after and this column stays null rather than carrying a
     // number that would join back to the wrong table.
     expect(entry.entity_id).toBeNull();
-    expect(JSON.parse(entry.before!)).toEqual({ period: "2026-02", locked: false });
+    expect(JSON.parse(entry.before!)).toEqual({ period: "2025-02", locked: false });
     expect(JSON.parse(entry.after!)).toMatchObject({
-      period: "2026-02", lockedBy: adminEmployee,
+      period: "2025-02", lockedBy: adminEmployee,
     });
     expect(JSON.parse(entry.after!).lockedAt).toBeGreaterThanOrEqual(before);
   });
@@ -1041,16 +1048,16 @@ describe("closing a month", () => {
   // instruction to correct a record they never meant to touch.
   it("refuses a second close, and keeps the first one intact", async () => {
     const { adminEmployee, hr } = await closer("Double Closer");
-    await hr.lockPeriod("2026-08");
-    const first = await store.periodLock("2026-08");
+    await hr.lockPeriod("2025-08");
+    const first = await store.periodLock("2025-08");
     const { hr: other } = await closer("Late Closer");
 
-    const refusal: Error = await other.lockPeriod("2026-08").catch((error: Error) => error);
+    const refusal: Error = await other.lockPeriod("2025-08").catch((error: Error) => error);
 
     // The period, who closed it and when: enough for the admin to see whether it was them a
     // moment ago or a colleague last week.
     expect(refusal.message).toMatch(/KINTAI_ALREADY_LOCKED/);
-    expect(refusal.message).toContain("2026-08");
+    expect(refusal.message).toContain("2025-08");
     expect(refusal.message).toContain(`employee ${adminEmployee}`);
     expect(refusal.message).toContain(jstWorkDate(first!.lockedAt));
     // And NOT `PeriodLockedError`'s instruction, which is written for whoever tried to write into
@@ -1060,8 +1067,8 @@ describe("closing a month", () => {
 
     // Nothing written: the row still names the first admin and the first instant, and the refused
     // calls left no audit entry claiming a second close happened.
-    expect(await store.periodLock("2026-08")).toEqual(first);
-    expect(await lockEntries("2026-08")).toHaveLength(1);
+    expect(await store.periodLock("2025-08")).toEqual(first);
+    expect(await lockEntries("2025-08")).toHaveLength(1);
   });
 
   // `period_locks.locked_by` is NOT NULL, so there is no honest row to write for an admin who has
@@ -1070,12 +1077,12 @@ describe("closing a month", () => {
   it("refuses an admin with no employee record, naming the fix", async () => {
     const hr = appUi(`acct-admin-nolink-${seq}`, true);
 
-    await expect(() => hr.lockPeriod("2026-09"))
+    await expect(() => hr.lockPeriod("2025-09"))
       .rejects.toThrow(/KINTAI_ADMIN_NOT_LINKED/);
-    await expect(() => hr.lockPeriod("2026-09")).rejects.toThrow(/whoAmI/);
+    await expect(() => hr.lockPeriod("2025-09")).rejects.toThrow(/whoAmI/);
     // Refused before anything was written, audit entry included.
-    expect(await store.periodLock("2026-09")).toBeNull();
-    expect(await lockEntries("2026-09")).toEqual([]);
+    expect(await store.periodLock("2025-09")).toBeNull();
+    expect(await lockEntries("2025-09")).toEqual([]);
   });
 
   it("writes nothing for a malformed period", async () => {
@@ -1090,10 +1097,10 @@ describe("closing a month", () => {
   // Closing a month is the write that makes every punch in it final. Reachable by an employee, it
   // would be a way to freeze a month before a colleague's correction could be filed against it.
   it("is refused to a non-administrator", async () => {
-    await expect(() => appUi(`acct-nonadmin-lock-${seq}`, false).lockPeriod("2026-10"))
+    await expect(() => appUi(`acct-nonadmin-lock-${seq}`, false).lockPeriod("2025-10"))
       .rejects.toThrow(/KINTAI_ADMIN_REQUIRED/);
 
-    expect(await store.periodLock("2026-10")).toBeNull();
+    expect(await store.periodLock("2025-10")).toBeNull();
   });
 });
 
