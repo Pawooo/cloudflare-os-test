@@ -1421,9 +1421,17 @@ open, and a per-row lookup turns a queue of twenty into twenty-one calls."
 
 ## Task 9: Live verification over real RPC
 
+> **DONE** — driven 2026-09-04 against `main` at `5a3eac1`. Observations are recorded in
+> `2026-09-01-kintai-punch-amendments-verification.md`, beside this file. Scenarios 1, 2, 3, 4 and
+> 6 passed; the work-date cross-check, the `long_span`-clearing correction, the terminal-refusal
+> path and the admin gate were driven too. **Scenario 5 could not be driven: there is no way to
+> lock a period through any public surface** — `KintaiStore.lockPeriod` has no caller in `src/` at
+> all, so `KintaiDay.locked`, `KINTAI_PERIOD_LOCKED` and `AmendmentDetail.lockedPeriod` are
+> permanently in their open branch for every real caller. See §5 of the record.
+
 Not a code task. Nothing here has been exercised through a real Cap'n Web session, and in this package live verification has repeatedly found defects that green tests missed — a sandbox attribute that made a form unusable behind 46 passing tests, and a concurrency bug behind 300.
 
-- [ ] **Step 1: Start the stack**
+- [x] **Step 1: Start the stack**
 
 ```bash
 pnpm run-local --port 8799
@@ -1431,20 +1439,20 @@ pnpm run-local --port 8799
 
 If it fails on stale validate output, `rm -rf packages/*/.wrangler/validate` and retry.
 
-- [ ] **Step 2: Drive the loop over `ws://localhost:8799/api`**
+- [x] **Step 2: Drive the loop over `ws://localhost:8799/api`**
 
 Two users, one admin, the real `startAppUi` capability, the gatekeeper session reached as a Gadget reaches it (`newGadget` → `openGadget` → the Kintai capsule → `openSession()`). Follow the procedure in the work-date policy task's verification, which did this successfully.
 
 Verify, and record what you observed for each:
 
-1. A worker files a missing clock-out; the manager sees it and approves; `getDay` changes.
-2. The worker cannot approve their own request — `KINTAI_SELF_APPROVAL`.
-3. A foreman files for their worker and **cannot** approve it — `KINTAI_FILED_BY_APPROVER`. The foreman's own manager can.
-4. A future-dated `occurredAt` is refused by `@validateRpc()` or by `assertNotFuture`, and nothing is written.
-5. A correction into a locked month is applied, and an ordinary punch to that day is still refused.
-6. A second request against the same punch is refused while the first is undecided.
+1. [x] A worker files a missing clock-out; the manager sees it and approves; `getDay` changes.
+2. [x] The worker cannot approve their own request — `KINTAI_SELF_APPROVAL`.
+3. [x] A foreman files for their worker and **cannot** approve it — `KINTAI_FILED_BY_APPROVER`. The foreman's own manager can.
+4. [x] A future-dated `occurredAt` is refused by `@validateRpc()` or by `assertNotFuture`, and nothing is written.
+5. [ ] A correction into a locked month is applied, and an ordinary punch to that day is still refused. **UNREACHABLE LIVE** — nothing can lock a period; see the record's §5.
+6. [x] A second request against the same punch is refused while the first is undecided.
 
-- [ ] **Step 3: Rebuild the app bundle before committing**
+- [x] **Step 3: Rebuild the app bundle before committing**
 
 The dev server rewrites `src/generated/app.txt` unminified.
 
@@ -1453,7 +1461,7 @@ rm -rf packages/gatekeeper-kintai/dist-app && cd packages/gatekeeper-kintai && p
 git status  # app.txt must be either unchanged or the minified production build
 ```
 
-- [ ] **Step 4: Write the verification into the branch**
+- [x] **Step 4: Write the verification into the branch**
 
 Commit the observations as a short section in the plan file or a note beside the spec. A verification nobody can find is a verification that did not happen.
 
