@@ -36,6 +36,13 @@ type FormKey = "create" | "link" | "report" | "approver" | "exempt" | "policy";
 type Notice = { kind: "ok" | "error"; text: string };
 
 /**
+ * The admin dashboard's three panels. 要対応 ("needs attention") is the default: it is the queue
+ * an administrator opening this page is most likely here for, not the roster they only visit to
+ * onboard or repair somebody.
+ */
+type Tab = "overview" | "monthly" | "roster";
+
+/**
  * The Kintai HR screens.
  *
  * Two views in one component, deliberately. Which one a person gets is a single piece of state
@@ -53,6 +60,7 @@ type Notice = { kind: "ok" | "error"; text: string };
  */
 export default function AdminPage({ api }: { api: KintaiAdminClient }) {
   const [view, setView] = useState<View>({ status: "loading" });
+  const [tab, setTab] = useState<Tab>("overview");
   const [pending, setPending] = useState<FormKey>();
   const [notices, setNotices] = useState<Partial<Record<FormKey, Notice>>>({});
   // Set by the roster's row actions so a form opens on the employee whose row was clicked.
@@ -174,121 +182,186 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
 
       {view.status === "admin" && (
         <>
-          <Roster
-            roster={view.roster}
-            // A reporting line needs somebody to report TO, so with one employee on the roster the
-            // form has nothing to offer and says so. The row's button is hidden to match: rendering
-            // it would leave a control that looks like the fix, is clickable, and does nothing —
-            // the same silent no-op this page went to some trouble to stop producing.
-            canSetManager={view.roster.length >= 2}
-            onLink={(employee) => {
-              setLinkTarget(String(employee.id));
-              reveal(linkCodeRef.current, "link-account");
-            }}
-            onSetManager={(employee) => {
-              setReportTarget(String(employee.id));
-              reveal(managerRef.current, "set-reporting-line");
-            }}
-            onSetApprover={(employee) => {
-              setApproverTarget(String(employee.id));
-              reveal(approverRef.current, "set-designated-approver");
-            }}
-            onExempt={(employee) => {
-              setExemptTarget(String(employee.id));
-              reveal(exemptRef.current, "grant-exemption");
-            }}
-            onSetPolicy={(employee) => {
-              setPolicyTarget(String(employee.id));
-              reveal(policyRef.current, "set-work-date-policy");
-            }}
-          />
+          <TabBar tab={tab} onSelect={setTab} />
 
-          <div className="flex flex-col gap-4">
-            <LinkAccountForm
+          <div hidden={tab !== "overview"}>
+            <OverviewTab api={api} />
+          </div>
+
+          <div hidden={tab !== "monthly"}>
+            <MonthlyTab api={api} />
+          </div>
+
+          <div hidden={tab !== "roster"} className="flex flex-col gap-8">
+            <Roster
               roster={view.roster}
-              employeeId={linkTarget}
-              onEmployeeId={setLinkTarget}
-              codeRef={linkCodeRef}
-              busy={pending === "link"}
-              notice={notices.link}
-              onSubmit={(accountId, employeeId) =>
-                submit("link", "Couldn’t link that account code.", async () => {
-                  await api.linkAccount(accountId, employeeId);
-                  return `Linked ${nameOf(view.roster, employeeId)} to that account code.`;
-                })}
+              // A reporting line needs somebody to report TO, so with one employee on the roster the
+              // form has nothing to offer and says so. The row's button is hidden to match: rendering
+              // it would leave a control that looks like the fix, is clickable, and does nothing —
+              // the same silent no-op this page went to some trouble to stop producing.
+              canSetManager={view.roster.length >= 2}
+              onLink={(employee) => {
+                setLinkTarget(String(employee.id));
+                reveal(linkCodeRef.current, "link-account");
+              }}
+              onSetManager={(employee) => {
+                setReportTarget(String(employee.id));
+                reveal(managerRef.current, "set-reporting-line");
+              }}
+              onSetApprover={(employee) => {
+                setApproverTarget(String(employee.id));
+                reveal(approverRef.current, "set-designated-approver");
+              }}
+              onExempt={(employee) => {
+                setExemptTarget(String(employee.id));
+                reveal(exemptRef.current, "grant-exemption");
+              }}
+              onSetPolicy={(employee) => {
+                setPolicyTarget(String(employee.id));
+                reveal(policyRef.current, "set-work-date-policy");
+              }}
             />
-            <ReportingLineForm
-              roster={view.roster}
-              employeeId={reportTarget}
-              onEmployeeId={setReportTarget}
-              managerRef={managerRef}
-              busy={pending === "report"}
-              notice={notices.report}
-              onSubmit={(employeeId, managerId) =>
-                submit("report", "Couldn’t set that reporting line.", async () => {
-                  await api.setReportingLine(employeeId, managerId);
-                  return `${nameOf(view.roster, employeeId)} now reports to ` +
-                    `${nameOf(view.roster, managerId)}.`;
-                })}
-            />
-            <DesignatedApproverForm
-              roster={view.roster}
-              employeeId={approverTarget}
-              onEmployeeId={setApproverTarget}
-              approverRef={approverRef}
-              busy={pending === "approver"}
-              notice={notices.approver}
-              onSubmit={(employeeId, approverId) =>
-                submit("approver", "Couldn’t set that designated approver.", async () => {
-                  await api.setDesignatedApprover(employeeId, approverId);
-                  return `${nameOf(view.roster, approverId)} can now approve for ` +
-                    `${nameOf(view.roster, employeeId)}.`;
-                })}
-            />
-            <ExemptionForm
-              roster={view.roster}
-              employeeId={exemptTarget}
-              onEmployeeId={setExemptTarget}
-              selectRef={exemptRef}
-              busy={pending === "exempt"}
-              notice={notices.exempt}
-              onSubmit={(employeeId) =>
-                submit("exempt", "Couldn’t record that exemption.", async () => {
-                  await api.grantExemption(employeeId);
-                  return `${nameOf(view.roster, employeeId)} is recorded as 管理監督者 from now.`;
-                })}
-            />
-            <WorkDatePolicyForm
-              roster={view.roster}
-              employeeId={policyTarget}
-              onEmployeeId={setPolicyTarget}
-              selectRef={policyRef}
-              busy={pending === "policy"}
-              notice={notices.policy}
-              onSubmit={(employeeId, policy) =>
-                submit("policy", "Couldn’t change that work-date policy.", async () => {
-                  await api.setWorkDatePolicy(employeeId, policy);
-                  return `${nameOf(view.roster, employeeId)}: new punches will be filed ` +
-                    `${policy === "shift_start" ? "against the date their shift started" : "against the date they happen on"}.` +
-                    " Punches already recorded are unchanged.";
-                })}
-            />
-            <CreateEmployeeForm
-              roster={view.roster}
-              busy={pending === "create"}
-              notice={notices.create}
-              onSubmit={(input) =>
-                submit("create", "Couldn’t create that employee.", async () => {
-                  await api.createEmployee(input);
-                  return `Added ${input.displayName}. They still need an account code` +
-                    " and someone who can approve for them.";
-                })}
-            />
+
+            <div className="flex flex-col gap-4">
+              <LinkAccountForm
+                roster={view.roster}
+                employeeId={linkTarget}
+                onEmployeeId={setLinkTarget}
+                codeRef={linkCodeRef}
+                busy={pending === "link"}
+                notice={notices.link}
+                onSubmit={(accountId, employeeId) =>
+                  submit("link", "Couldn’t link that account code.", async () => {
+                    await api.linkAccount(accountId, employeeId);
+                    return `Linked ${nameOf(view.roster, employeeId)} to that account code.`;
+                  })}
+              />
+              <ReportingLineForm
+                roster={view.roster}
+                employeeId={reportTarget}
+                onEmployeeId={setReportTarget}
+                managerRef={managerRef}
+                busy={pending === "report"}
+                notice={notices.report}
+                onSubmit={(employeeId, managerId) =>
+                  submit("report", "Couldn’t set that reporting line.", async () => {
+                    await api.setReportingLine(employeeId, managerId);
+                    return `${nameOf(view.roster, employeeId)} now reports to ` +
+                      `${nameOf(view.roster, managerId)}.`;
+                  })}
+              />
+              <DesignatedApproverForm
+                roster={view.roster}
+                employeeId={approverTarget}
+                onEmployeeId={setApproverTarget}
+                approverRef={approverRef}
+                busy={pending === "approver"}
+                notice={notices.approver}
+                onSubmit={(employeeId, approverId) =>
+                  submit("approver", "Couldn’t set that designated approver.", async () => {
+                    await api.setDesignatedApprover(employeeId, approverId);
+                    return `${nameOf(view.roster, approverId)} can now approve for ` +
+                      `${nameOf(view.roster, employeeId)}.`;
+                  })}
+              />
+              <ExemptionForm
+                roster={view.roster}
+                employeeId={exemptTarget}
+                onEmployeeId={setExemptTarget}
+                selectRef={exemptRef}
+                busy={pending === "exempt"}
+                notice={notices.exempt}
+                onSubmit={(employeeId) =>
+                  submit("exempt", "Couldn’t record that exemption.", async () => {
+                    await api.grantExemption(employeeId);
+                    return `${nameOf(view.roster, employeeId)} is recorded as 管理監督者 from now.`;
+                  })}
+              />
+              <WorkDatePolicyForm
+                roster={view.roster}
+                employeeId={policyTarget}
+                onEmployeeId={setPolicyTarget}
+                selectRef={policyRef}
+                busy={pending === "policy"}
+                notice={notices.policy}
+                onSubmit={(employeeId, policy) =>
+                  submit("policy", "Couldn’t change that work-date policy.", async () => {
+                    await api.setWorkDatePolicy(employeeId, policy);
+                    return `${nameOf(view.roster, employeeId)}: new punches will be filed ` +
+                      `${policy === "shift_start" ? "against the date their shift started" : "against the date they happen on"}.` +
+                      " Punches already recorded are unchanged.";
+                  })}
+              />
+              <CreateEmployeeForm
+                roster={view.roster}
+                busy={pending === "create"}
+                notice={notices.create}
+                onSubmit={(input) =>
+                  submit("create", "Couldn’t create that employee.", async () => {
+                    await api.createEmployee(input);
+                    return `Added ${input.displayName}. They still need an account code` +
+                      " and someone who can approve for them.";
+                  })}
+              />
+            </div>
           </div>
         </>
       )}
     </main>
   );
+}
+
+const TABS: { id: Tab; label: string }[] = [
+  { id: "overview", label: "要対応" },
+  { id: "monthly", label: "月次" },
+  { id: "roster", label: "Roster" },
+];
+
+/**
+ * The three panels, all mounted at once — see `hidden` on each panel above.
+ *
+ * Buttons, not links and not a `<select>`: nothing here navigates or submits, so there is no
+ * sandbox concern the way `FormCard`'s fields have one — a native `<button>` already answers
+ * Enter and Space without any extra handling, and `type="button"` only keeps it inert if it is
+ * ever moved inside a `<form>`.
+ */
+function TabBar({ tab, onSelect }: { tab: Tab; onSelect: (tab: Tab) => void }) {
+  return (
+    <div role="tablist" className="flex gap-2 border-b border-kumo-line pb-px">
+      {TABS.map(({ id, label }) => {
+        const active = tab === id;
+        return (
+          <button
+            key={id}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            data-testid={`tab-${id}`}
+            className={
+              active
+                ? "press rounded-t-lg border border-b-0 border-kumo-line bg-kumo-elevated px-3.5 py-2 text-sm font-medium text-kumo-default"
+                : "press rounded-t-lg border border-transparent px-3.5 py-2 text-sm font-medium text-kumo-subtle hover:bg-kumo-tint"
+            }
+            onClick={() => onSelect(id)}
+          >
+            {label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Placeholder until Task 5 wires the pending-approval queue in. */
+function OverviewTab({ api }: { api: KintaiAdminClient }) {
+  void api;
+  return <p className="text-sm text-kumo-subtle">要対応 is coming soon.</p>;
+}
+
+/** Placeholder until Task 6 wires the monthly report in. */
+function MonthlyTab({ api }: { api: KintaiAdminClient }) {
+  void api;
+  return <p className="text-sm text-kumo-subtle">月次 is coming soon.</p>;
 }
 
 /**
