@@ -1,10 +1,8 @@
 import React, { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { RosterEntry } from "../src/types";
-import AdminPage, {
-  type AnomalousDay, type KintaiAdminClient, type PendingItem, type PunchRow,
-} from "./AdminPage";
+import type { AnomalousDay, PendingItem, PunchRow, RosterEntry } from "../src/types";
+import AdminPage, { type KintaiAdminClient } from "./AdminPage";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 

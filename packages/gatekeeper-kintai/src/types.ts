@@ -165,3 +165,221 @@ export type RosterEntry = EmployeeRow & {
    */
   approverReachable: boolean;
 };
+
+// ---- the wire shapes the admin app renders -----------------------------------------------------
+//
+// Everything below this line is a row that crosses the RPC boundary into `app/`, and it lives here
+// for ONE reason, which is the same reason `EmployeeRow` and `KintaiIdentity` above do: `app/` is
+// compiled by `tsconfig.app.json`, which has the DOM lib and no worker types. The modules that
+// QUERY these rows -- `store/punches.ts`, `store/submissions.ts`, `store/overview.ts` -- all take
+// `SqlStorage`, so `import type` from any of them pulls those files into the app's type program
+// and reports every occurrence of that name (verified: ~40 errors across `src/store` and
+// `src/routes.ts`). `src/types.ts` imports nothing, so it is the one module both programs can
+// reach, and `pnpm run typecheck:app` is the proof that it still is.
+//
+// They were HAND-RESTATED in `app/AdminPage.tsx` until 2026-09-04, which is the thing this section
+// exists to have ended. Two copies of a row shape compile clean in both projects when a field is
+// renamed on the store side, and the dashboard then reads `undefined` at runtime -- a render throw
+// with no error boundary above it, i.e. a white screen, from a change TypeScript signed off on.
+// The store modules now import these and re-export them under the same names, so worker-side
+// callers still read each row type from the module that queries it and nothing there moved.
+//
+// A SECOND COPY STILL EXISTS AND IS NOT THIS ONE: `src/types.txt`, the hand-written description of
+// this package's wire surface for agents, restates `PunchRow`, `SubmissionRow` and
+// `AmendmentDetail` in prose. Nothing ties it to these declarations -- no generator, no test -- so
+// a field added or renamed here must be carried into that file by hand. See the TASK 7 note above,
+// which is the same hazard on the same file.
+
+export type PunchRow = {
+  id: number;
+  employee_id: number;
+  work_date: string;
+  kind: PunchKind;
+  occurred_at: number;
+  recorded_at: number;
+  source: PunchSource;
+  latitude: number | null;
+  longitude: number | null;
+  accuracy_m: number | null;
+  location_source: LocationSource | null;
+  matched_site_id: number | null;
+  supersedes_id: number | null;
+  amended_by: number | null;
+  amend_reason: string | null;
+};
+
+/**
+ * The `submissions` table's own columns, exactly as SQL hands them back.
+ *
+ * Separate from `SubmissionRow` because `SqlStorage.exec<T>` constrains `T` to a record of SQL
+ * VALUES, and `SubmissionRow.amendment` is an assembled object — a `SELECT *` cannot be typed as
+ * one. The split is worth having on its own terms too: that is what the write paths and the
+ * authority prologue work with, and none of them has any use for display detail.
+ */
+export type SubmissionColumns = {
+  id: number;
+  employee_id: number;
+  /**
+   * What kind of request this is. `overtime` until amendments landed; an amendment is a submission
+   * too, so that it inherits the approval stack rather than growing a second one beside it.
+   *
+   * Whatever reads a submission must not assume `overtime`. `minutes` and `calculation_inputs` are
+   * overtime's columns and carry 0 and NULL on an amendment; what an amendment asks for lives in
+   * `amendment_requests`, keyed on this row's id.
+   */
+  kind: SubmissionKind;
+  requested_for: string;
+  state: SubmissionState;
+  submitted_at: number | null;
+  current_step: number;
+  minutes: number;
+  reason: string;
+  calculation_inputs: string | null;
+  route_snapshot: string;
+  created_by: number | null;
+};
+
+/**
+ * What one amendment asks to change, as a reader deciding on it needs to see it.
+ *
+ * ONE TYPE FOR BOTH SURFACES: the confirmation dialog (`ActPreview.amendment`, via `previewAct`)
+ * and the list rows (`SubmissionRow.amendment`, via `listSubmissionsFor` and
+ * `pendingApprovalsFor`). They are assembled by the same code from the same columns, so a queue
+ * cannot summarise a request as one thing and the dialog confirm it as another.
+ *
+ * `currentOccurredAt` is what the target punch says NOW, read at the moment the reader is shown
+ * the question rather than copied at filing time: the whole judgement is "should this become that",
+ * and a stale left-hand side would be describing a comparison that is no longer the one being made.
+ * It is null exactly when `targetPunchId` is — the forgotten clock-out, where there is no punch to
+ * compare against and saying so is the honest answer.
+ *
+ * "WHAT THE PUNCH SAYS NOW" IS NOT THE TARGET ROW'S OWN COLUMN, and this is the subtle part.
+ * `punches` is append-only: a correction appends a SUCCESSOR carrying `supersedes_id`, so the
+ * target row's `occurred_at` is frozen from the instant it was written and reading it could never
+ * have detected anything. The live time is the successor's when one exists — which is exactly the
+ * case that matters, because a target superseded out of band (an admin correcting the same punch
+ * from the HR surface while the request sits in a queue) makes the request permanently
+ * unappliable: `actOnAmendment` refuses it with `KINTAI_AMENDMENT_TARGET_SUPERSEDED` whatever the
+ * approver decides. Nothing else in the row changes, so a current time that no longer matches what
+ * the request was filed against is the one signal a triaging approver gets.
+ *
+ * ONE HOP, deliberately, and it is the same hop `actOnAmendment` takes: it looks for a row whose
+ * `supersedes_id` is the target and names it in the refusal. A successor that has itself been
+ * superseded would leave this one revision behind — the request is doomed either way and the
+ * signal still fires — and resolving the whole chain would mean a recursive CTE on a query that
+ * runs on every queue open. `punches_supersedes_unique` guarantees at most one successor per
+ * punch, so the hop is single-valued.
+ *
+ * `lockedPeriod` is the one field here that is NOT a property of the request: it is the state of
+ * the month the write would land in, named rather than flagged because the reader needs to read
+ * WHICH month. Null means open. Applying an approved amendment is the only write in the system
+ * allowed into a closed period (see `actOnAmendment`), so this is the single thing about the
+ * decision an approver most needs told and is least able to infer.
+ *
+ * Every field is read off the tables rather than assembled from a caller's argument, like every
+ * other field of `ActPreview`.
+ */
+export type AmendmentDetail = {
+  targetPunchId: number | null;
+  /**
+   * What the punch says now — the successor's time once something has superseded the target, not
+   * the target row's own frozen column. Null when the request is to add a punch that was never
+   * recorded. See the type's own comment: this field is the reason it has one.
+   */
+  currentOccurredAt: number | null;
+  requestedOccurredAt: number;
+  workDate: string;
+  kind: PunchKind;
+  /** The closed month this would write into, or null when that month is open. */
+  lockedPeriod: string | null;
+};
+
+/**
+ * A submission as the LIST reads return it: every column of the table, plus an amendment's detail.
+ *
+ * This is the shape `listMySubmissions` and `listPendingApprovals` put on the wire, and the one
+ * `src/types.txt` describes to an agent.
+ */
+export type SubmissionRow = SubmissionColumns & {
+  /**
+   * What an amendment asks to change — present exactly on rows whose `kind` is `'amendment'`, and
+   * absent on every overtime row.
+   *
+   * ABSENT IS THE DISCRIMINATOR, matching `ActPreview.amendment` and carrying the same type from
+   * the same assembler. Without it a list row for an amendment is unreadable: `kind` says
+   * `amendment`, `minutes` says 0 and means nothing there (see `kind` above), and nothing else on
+   * the row says which punch, what it currently records, or what was asked for. An approver
+   * browsing the queue — or an agent summarising it for them — saw a request for zero minutes.
+   *
+   * Populated by the LIST reads, `listSubmissionsFor` and `pendingApprovalsFor`, which join it in
+   * the same query. `getSubmission` is a `SELECT *` used by the write paths and leaves it absent
+   * even on an amendment; the authority prologue runs it once per queue row and has no use for
+   * display data, so it does not pay for the joins. Ask `previewAct` (or `getAmendment`) for the
+   * detail of one submission.
+   */
+  amendment?: AmendmentDetail;
+};
+
+/** One (employee, day) in a month whose anomaly list is non-empty, with the flags themselves. */
+export type AnomalousDay = {
+  employeeId: number;
+  displayName: string;
+  employeeNumber: string;
+  workDate: string;
+  /** The flag strings `dayAnomalies` produces: `unpaired_in`, `orphan_out`, `long_span`, … */
+  anomalies: string[];
+};
+
+/** One employee's month: days worked, minutes credited, and how many of those days are flagged. */
+export type MonthlyTotalRow = {
+  employeeId: number;
+  displayName: string;
+  employeeNumber: string;
+  daysWorked: number;
+  workedMinutes: number;
+  anomalousDays: number;
+};
+
+/**
+ * `locked` sits on the report, not on a row: `period_locks` is keyed on the period alone, so every
+ * row in one `monthlyTotals` call describes the same month under the same lock and there is nothing
+ * for a per-row flag to disagree about. One report, one period, one lock verdict.
+ *
+ * It says the month is CLOSED, not that its numbers are frozen. A closed period accepts exactly
+ * one write — an approved amendment — and the next read walks the punches that write left behind.
+ */
+export type MonthlyReport = { period: string; locked: boolean; rows: MonthlyTotalRow[] };
+
+/** One employee's one day: the punches, the flags they raise, the minutes they credit. */
+export type EmployeeDay = {
+  punches: PunchRow[];
+  anomalies: string[];
+  workedMinutes: number;
+};
+
+/**
+ * One waiting request, as an administrator triaging the whole company's queue needs to read it.
+ *
+ * Every field of the underlying `SubmissionRow` is kept, amendment detail included, so this row is
+ * a superset of what the approver's own queue shows rather than a re-description of it. The added
+ * fields are the three things an administrator has that an approver does not: whose request it is
+ * in words, how long it has waited, and WHO COULD END THE WAIT.
+ */
+export type PendingItem = SubmissionRow & {
+  employeeName: string;
+  employeeNumber: string;
+  /**
+   * Who filed it, in words, or null when the row records no filer.
+   *
+   * Null is not "the employee themself": `created_by` is nullable and a null records that no filer
+   * was captured (an older row, or a `submitOvertime` call that omitted it). Conflating the two
+   * would misreport the one column that makes `FiledBySelfError` — and so most of the stranding
+   * the dashboard exists to find — legible.
+   */
+  filedByName: string | null;
+  /** epoch ms it has waited, from submitted_at to `now`. */
+  waitingMs: number;
+  /** Who can decide it right now. Empty means STRANDED — surface loudly, never hide. */
+  eligibleActorIds: EmployeeId[];
+  eligibleActorNames: string[];
+};

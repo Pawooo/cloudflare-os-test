@@ -1,7 +1,14 @@
-import type { EmployeeId, LocationSource, PunchKind, PunchSource } from "../types.js";
+import type {
+  EmployeeId, LocationSource, PunchKind, PunchRow, PunchSource,
+} from "../types.js";
 import { LONG_SPAN_MS, MAX_SHIFT_MS, jstWorkDate } from "../work-date.js";
 import { workDatePolicyOf } from "./employees.js";
 import { matchSite } from "./sites.js";
+
+// Re-exported so every worker-side caller still reads the row type from the module that
+// queries it. The declaration lives in `src/types.ts` because `app/` renders these rows and
+// cannot compile this file -- see that module's "wire shapes" section.
+export type { PunchRow };
 
 export type PunchLocation = {
   source: LocationSource;
@@ -24,24 +31,6 @@ export type NewPunch = {
   now: number;
   source: PunchSource;
   location?: PunchLocation;
-};
-
-export type PunchRow = {
-  id: number;
-  employee_id: number;
-  work_date: string;
-  kind: PunchKind;
-  occurred_at: number;
-  recorded_at: number;
-  source: PunchSource;
-  latitude: number | null;
-  longitude: number | null;
-  accuracy_m: number | null;
-  location_source: LocationSource | null;
-  matched_site_id: number | null;
-  supersedes_id: number | null;
-  amended_by: number | null;
-  amend_reason: string | null;
 };
 
 /** A repeat of the same kind inside this window is treated as a double-tap, not a new punch. */

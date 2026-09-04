@@ -1,7 +1,21 @@
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
+/*
+ * The wire shapes, imported for real — not restated here, which is what this file did until
+ * 2026-09-04.
+ *
+ * `src/types.ts` is the one module both TypeScript programs can reach: it imports nothing, so it
+ * pulls no `SqlStorage` into `tsconfig.app.json`'s graph, and every row shape the dashboard renders
+ * now lives there beside `EmployeeRow` and `KintaiIdentity`. The store modules that QUERY these
+ * rows re-export them under the same names, so a rename is one edit that breaks both sides at once
+ * — where the hand-written copies compiled clean in both projects and left this page rendering
+ * `undefined` at runtime, i.e. a white screen, with no error boundary above it.
+ *
+ * `src/types.txt` is still a hand-written copy of some of these and has no mechanical tie to them.
+ * See the note in `src/types.ts`.
+ */
 import type {
-  EmployeeId, KintaiIdentity, LocationSource, NewEmployee, PunchKind, PunchSource, RosterEntry,
-  SubmissionKind, SubmissionState, WorkDatePolicy,
+  AnomalousDay, EmployeeDay, EmployeeId, KintaiIdentity, NewEmployee, PendingItem, RosterEntry,
+  WorkDatePolicy,
 } from "../src/types";
 import { WORK_DATE_POLICIES, WORK_DATE_POLICY_LABELS } from "../src/work-date";
 import { describeFailure, isAdminRequired } from "./errors";
@@ -31,99 +45,6 @@ export type KintaiAdminClient = {
   listAnomalousDays(period: string): Promise<AnomalousDay[]>;
   /** One employee's one day: the punches, the flags they raise, the minutes they credit. */
   getEmployeeDay(employeeId: EmployeeId, workDate: string): Promise<EmployeeDay>;
-};
-
-/**
- * The dashboard's read shapes, restated on this side of the wire.
- *
- * NOT a preference. These types are `src/store/overview.ts`'s, and importing even a type from that
- * module fails `typecheck:app`: its functions take `SqlStorage`, a Workers global that
- * `tsconfig.app.json` does not declare, so TypeScript pulls the file into the app program and
- * reports every occurrence of the name (verified: ~40 errors across `src/store` and
- * `src/routes.ts`). `src/types.ts` and `src/work-date.ts` are clean leaves and ARE imported, which
- * is why every primitive below — `PunchKind`, `SubmissionState`, `PunchSource` — is the real one
- * and only the row envelopes are restated.
- *
- * What that costs, stated plainly: a field RENAMED in the store would compile here and arrive
- * `undefined` at runtime. Nothing in the type system catches that, and the mitigation is that
- * `src/store/overview.ts` is the single place these are defined and the place to change alongside
- * this one. `KintaiAdminClient` above carries exactly the same risk for exactly the same reason,
- * and has since this file was written.
- */
-export type PendingItem = {
-  id: number;
-  employee_id: number;
-  /** `overtime` or `amendment`. An amendment's `minutes` is 0 and means nothing — see below. */
-  kind: SubmissionKind;
-  requested_for: string;
-  state: SubmissionState;
-  submitted_at: number | null;
-  current_step: number;
-  minutes: number;
-  reason: string;
-  calculation_inputs: string | null;
-  route_snapshot: string;
-  created_by: number | null;
-  /**
-   * What a correction asks to change — PRESENT EXACTLY ON AMENDMENTS, absent on every overtime
-   * row, and absence is the discriminator. Read it rather than `kind`, the way `describeApproval`
-   * does: `minutes` is 0 on an amendment, so a row rendered through the overtime shape reports a
-   * request for zero minutes.
-   */
-  amendment?: AmendmentDetail;
-  employeeName: string;
-  employeeNumber: string;
-  /** Who filed it, or null when the row records NO filer. Null is not "the employee themself". */
-  filedByName: string | null;
-  /** How long it has waited, in ms, measured server-side against one instant for the whole read. */
-  waitingMs: number;
-  eligibleActorIds: EmployeeId[];
-  /** Who can decide it right now. EMPTY MEANS STRANDED — surface it loudly, never hide it. */
-  eligibleActorNames: string[];
-};
-
-export type AmendmentDetail = {
-  targetPunchId: number | null;
-  /** What the punch says now, or null when the request is to add one never recorded. */
-  currentOccurredAt: number | null;
-  requestedOccurredAt: number;
-  workDate: string;
-  kind: PunchKind;
-  /** The closed month this would write into, or null when that month is open. */
-  lockedPeriod: string | null;
-};
-
-export type AnomalousDay = {
-  employeeId: number;
-  displayName: string;
-  employeeNumber: string;
-  workDate: string;
-  /** The flag strings `dayAnomalies` produces: `unpaired_in`, `orphan_out`, `long_span`, … */
-  anomalies: string[];
-};
-
-export type PunchRow = {
-  id: number;
-  employee_id: number;
-  work_date: string;
-  kind: PunchKind;
-  occurred_at: number;
-  recorded_at: number;
-  source: PunchSource;
-  latitude: number | null;
-  longitude: number | null;
-  accuracy_m: number | null;
-  location_source: LocationSource | null;
-  matched_site_id: number | null;
-  supersedes_id: number | null;
-  amended_by: number | null;
-  amend_reason: string | null;
-};
-
-export type EmployeeDay = {
-  punches: PunchRow[];
-  anomalies: string[];
-  workedMinutes: number;
 };
 
 /**

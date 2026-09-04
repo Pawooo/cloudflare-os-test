@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
-import type { EmployeeId, RosterEntry } from "../src/types";
-import { jstClockTime, jstWorkDate } from "../src/work-date";
 import type {
-  AnomalousDay, EmployeeDay, KintaiAdminClient, PendingItem, RowFixes,
-} from "./AdminPage";
+  AnomalousDay, EmployeeDay, EmployeeId, PendingItem, RosterEntry,
+} from "../src/types";
+import { jstClockTime, jstWorkDate } from "../src/work-date";
+import type { KintaiAdminClient, RowFixes } from "./AdminPage";
 import { isReady, RosterRow } from "./RosterRow";
 import { describeFailure } from "./errors";
 

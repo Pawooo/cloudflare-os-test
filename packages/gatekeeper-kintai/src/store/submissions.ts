@@ -1,5 +1,6 @@
 import type {
-  ApprovalAction, EmployeeId, PunchKind, SubmissionKind, SubmissionState,
+  AmendmentDetail, ApprovalAction, EmployeeId, PunchKind, SubmissionColumns, SubmissionRow,
+  SubmissionState,
 } from "../types.js";
 import { NoRouteError, resolveRoute, type RouteSnapshot, type RouteStep } from "../routes.js";
 import { assertApproverReachable, hasAuthorityOver, managersAt } from "./org.js";
@@ -10,6 +11,18 @@ import { designatedApproverOf, employeeLabel, isExempt, listEmployees } from "./
 // HERE, in the same call as the authority check, or the approver is shown a period state that had
 // already moved by the time they saw it.
 import { periodOfSql } from "./periods.js";
+
+/*
+ * Re-exported so every worker-side caller still reads these row types from the module that queries
+ * them -- `kintai.ts`, `store/overview.ts` and the tests all import them from here, unchanged.
+ *
+ * The declarations moved to `src/types.ts` on 2026-09-04 for the reason `EmployeeRow`'s already
+ * lives there: `app/` renders these rows and cannot compile this file, because every function in
+ * it takes `SqlStorage`. See that module's "wire shapes" section, which also records that
+ * `src/types.txt` is a THIRD hand-written copy of `SubmissionRow` and `AmendmentDetail` and has no
+ * mechanical tie to either.
+ */
+export type { AmendmentDetail, SubmissionColumns, SubmissionRow };
 
 // The state machine, and the three invariants it exists to hold:
 //
@@ -63,63 +76,6 @@ export type ActInput = ActCheck & {
    * this is meant to close. Here the comparison and the `INSERT` are one synchronous run.
    */
   expectedAfterEventId?: number;
-};
-
-/**
- * The `submissions` table's own columns, exactly as SQL hands them back.
- *
- * Separate from `SubmissionRow` because `SqlStorage.exec<T>` constrains `T` to a record of SQL
- * VALUES, and `SubmissionRow.amendment` is an assembled object — a `SELECT *` cannot be typed as
- * one. The split is worth having on its own terms too: this is what the write paths and the
- * authority prologue work with, and none of them has any use for display detail.
- */
-export type SubmissionColumns = {
-  id: number;
-  employee_id: number;
-  /**
-   * What kind of request this is. `overtime` until amendments landed; an amendment is a submission
-   * too, so that it inherits the approval stack rather than growing a second one beside it.
-   *
-   * Whatever reads a submission must not assume `overtime`. `minutes` and `calculation_inputs` are
-   * overtime's columns and carry 0 and NULL on an amendment; what an amendment asks for lives in
-   * `amendment_requests`, keyed on this row's id.
-   */
-  kind: SubmissionKind;
-  requested_for: string;
-  state: SubmissionState;
-  submitted_at: number | null;
-  current_step: number;
-  minutes: number;
-  reason: string;
-  calculation_inputs: string | null;
-  route_snapshot: string;
-  created_by: number | null;
-};
-
-/**
- * A submission as the LIST reads return it: every column of the table, plus an amendment's detail.
- *
- * This is the shape `listMySubmissions` and `listPendingApprovals` put on the wire, and the one
- * `src/types.txt` describes to an agent.
- */
-export type SubmissionRow = SubmissionColumns & {
-  /**
-   * What an amendment asks to change — present exactly on rows whose `kind` is `'amendment'`, and
-   * absent on every overtime row.
-   *
-   * ABSENT IS THE DISCRIMINATOR, matching `ActPreview.amendment` and carrying the same type from
-   * the same assembler. Without it a list row for an amendment is unreadable: `kind` says
-   * `amendment`, `minutes` says 0 and means nothing there (see `kind` above), and nothing else on
-   * the row says which punch, what it currently records, or what was asked for. An approver
-   * browsing the queue — or an agent summarising it for them — saw a request for zero minutes.
-   *
-   * Populated by the LIST reads, `listSubmissionsFor` and `pendingApprovalsFor`, which join it in
-   * the same query. `getSubmission` is a `SELECT *` used by the write paths and leaves it absent
-   * even on an amendment; the authority prologue runs it once per queue row and has no use for
-   * display data, so it does not pay for the joins. Ask `previewAct` (or `getAmendment`) for the
-   * detail of one submission.
-   */
-  amendment?: AmendmentDetail;
 };
 
 export type ApprovalEventRow = {
@@ -640,61 +596,6 @@ export function checkMayAct(sql: SqlStorage, input: ActCheck): ActAuthority {
 
   return { submission, snapshot, step, authorizingEdge };
 }
-
-/**
- * What one amendment asks to change, as a reader deciding on it needs to see it.
- *
- * ONE TYPE FOR BOTH SURFACES: the confirmation dialog (`ActPreview.amendment`, via `previewAct`)
- * and the list rows (`SubmissionRow.amendment`, via `listSubmissionsFor` and
- * `pendingApprovalsFor`). They are assembled by the same code from the same columns, so a queue
- * cannot summarise a request as one thing and the dialog confirm it as another.
- *
- * `currentOccurredAt` is what the target punch says NOW, read at the moment the reader is shown
- * the question rather than copied at filing time: the whole judgement is "should this become that",
- * and a stale left-hand side would be describing a comparison that is no longer the one being made.
- * It is null exactly when `targetPunchId` is — the forgotten clock-out, where there is no punch to
- * compare against and saying so is the honest answer.
- *
- * "WHAT THE PUNCH SAYS NOW" IS NOT THE TARGET ROW'S OWN COLUMN, and this is the subtle part.
- * `punches` is append-only: a correction appends a SUCCESSOR carrying `supersedes_id`, so the
- * target row's `occurred_at` is frozen from the instant it was written and reading it could never
- * have detected anything. The live time is the successor's when one exists — which is exactly the
- * case that matters, because a target superseded out of band (an admin correcting the same punch
- * from the HR surface while the request sits in a queue) makes the request permanently
- * unappliable: `actOnAmendment` refuses it with `KINTAI_AMENDMENT_TARGET_SUPERSEDED` whatever the
- * approver decides. Nothing else in the row changes, so a current time that no longer matches what
- * the request was filed against is the one signal a triaging approver gets.
- *
- * ONE HOP, deliberately, and it is the same hop `actOnAmendment` takes: it looks for a row whose
- * `supersedes_id` is the target and names it in the refusal. A successor that has itself been
- * superseded would leave this one revision behind — the request is doomed either way and the
- * signal still fires — and resolving the whole chain would mean a recursive CTE on a query that
- * runs on every queue open. `punches_supersedes_unique` guarantees at most one successor per
- * punch, so the hop is single-valued.
- *
- * `lockedPeriod` is the one field here that is NOT a property of the request: it is the state of
- * the month the write would land in, named rather than flagged because the reader needs to read
- * WHICH month. Null means open. Applying an approved amendment is the only write in the system
- * allowed into a closed period (see `actOnAmendment`), so this is the single thing about the
- * decision an approver most needs told and is least able to infer.
- *
- * Every field is read off the tables rather than assembled from a caller's argument, like every
- * other field of `ActPreview`.
- */
-export type AmendmentDetail = {
-  targetPunchId: number | null;
-  /**
-   * What the punch says now — the successor's time once something has superseded the target, not
-   * the target row's own frozen column. Null when the request is to add a punch that was never
-   * recorded. See the type's own comment: this field is the reason it has one.
-   */
-  currentOccurredAt: number | null;
-  requestedOccurredAt: number;
-  workDate: string;
-  kind: PunchKind;
-  /** The closed month this would write into, or null when that month is open. */
-  lockedPeriod: string | null;
-};
 
 /**
  * The columns of an `AmendmentDetail`, and the joins that supply them, as SQL — written once and

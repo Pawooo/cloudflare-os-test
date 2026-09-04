@@ -22,10 +22,25 @@
 // and this project has already shipped that bug once (see `checkMayAct`).
 
 import { assertPeriod } from "../input.js";
-import { currentPunches, dayAnomalies, workedMinutes, type PunchRow } from "./punches.js";
+import { currentPunches, dayAnomalies, workedMinutes } from "./punches.js";
 import { periodLock } from "./periods.js";
-import { eligibleActors, pendingSubmissions, type SubmissionRow } from "./submissions.js";
-import type { EmployeeId } from "../types.js";
+import { eligibleActors, pendingSubmissions } from "./submissions.js";
+import type {
+  AnomalousDay, EmployeeDay, EmployeeId, MonthlyReport, MonthlyTotalRow, PendingItem,
+} from "../types.js";
+
+/*
+ * The four read shapes, re-exported so worker-side callers -- `admin-api.ts`, `KintaiStore` and
+ * the tests -- still read each one from the module that produces it.
+ *
+ * The declarations moved to `src/types.ts` on 2026-09-04. Until then `app/AdminPage.tsx` carried a
+ * SECOND, hand-written copy of all four, because `import type` from this module pulls it into the
+ * app's type program and every `SqlStorage` in this file becomes an error there. Two copies compile
+ * clean in both projects when a field is renamed here, and the dashboard then renders `undefined`
+ * -- see that module's "wire shapes" section. Nothing about how these rows are ASSEMBLED moved;
+ * that is still entirely below.
+ */
+export type { AnomalousDay, EmployeeDay, MonthlyReport, MonthlyTotalRow, PendingItem };
 
 /** Every (employee, day) in the month that holds punches -- the only days that can have state. */
 function daysWithPunches(
@@ -63,14 +78,6 @@ function labelsFor(
   return new Map(rows.map((row) => [row.id, row]));
 }
 
-export type AnomalousDay = {
-  employeeId: number;
-  displayName: string;
-  employeeNumber: string;
-  workDate: string;
-  anomalies: string[];
-};
-
 /**
  * Every (employee, day) in `period` whose anomaly list is non-empty, with the flags themselves.
  *
@@ -101,22 +108,6 @@ export function anomalousDays(sql: SqlStorage, period: string): AnomalousDay[] {
   }
   return result;
 }
-
-export type MonthlyTotalRow = {
-  employeeId: number;
-  displayName: string;
-  employeeNumber: string;
-  daysWorked: number;
-  workedMinutes: number;
-  anomalousDays: number;
-};
-
-/**
- * `locked` sits on the report, not on a row: `period_locks` is keyed on the period alone, so every
- * row in one `monthlyTotals` call describes the same month under the same lock and there is nothing
- * for a per-row flag to disagree about. One report, one period, one lock verdict.
- */
-export type MonthlyReport = { period: string; locked: boolean; rows: MonthlyTotalRow[] };
 
 /**
  * One row per employee who has punches in `period`: days worked, minutes credited, and how many of
@@ -160,12 +151,6 @@ export function monthlyTotals(sql: SqlStorage, period: string): MonthlyReport {
   return { period, locked, rows };
 }
 
-export type EmployeeDay = {
-  punches: PunchRow[];
-  anomalies: string[];
-  workedMinutes: number;
-};
-
 /**
  * One employee's one day, as an admin would need to see it to decide whether it needs fixing: the
  * current punches, the flags they raise, and the minutes they credit.
@@ -182,33 +167,6 @@ export function employeeDay(sql: SqlStorage, employeeId: EmployeeId, workDate: s
     workedMinutes: workedMinutes(sql, employeeId, workDate),
   };
 }
-
-/**
- * One waiting request, as an administrator triaging the whole company's queue needs to read it.
- *
- * Every field of the underlying `SubmissionRow` is kept, amendment detail included, so this row is
- * a superset of what the approver's own queue shows rather than a re-description of it. The added
- * fields are the three things an administrator has that an approver does not: whose request it is
- * in words, how long it has waited, and WHO COULD END THE WAIT.
- */
-export type PendingItem = SubmissionRow & {
-  employeeName: string;
-  employeeNumber: string;
-  /**
-   * Who filed it, in words, or null when the row records no filer.
-   *
-   * Null is not "the employee themself": `created_by` is nullable and a null records that no filer
-   * was captured (an older row, or a `submitOvertime` call that omitted it). Conflating the two
-   * would misreport the one column that makes `FiledBySelfError` — and so most of the stranding
-   * this screen exists to find — legible.
-   */
-  filedByName: string | null;
-  /** epoch ms it has waited, from submitted_at to `now`. */
-  waitingMs: number;
-  /** Who can decide it right now. Empty means STRANDED — surface loudly, never hide. */
-  eligibleActorIds: EmployeeId[];
-  eligibleActorNames: string[];
-};
 
 /**
  * Every submission waiting on somebody, with how long it has waited and who could act on it.
