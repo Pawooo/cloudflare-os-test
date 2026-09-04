@@ -327,8 +327,9 @@ function AnomaliesSection({ api }: { api: KintaiAdminClient }) {
  * Lazily, and the laziness is a privacy decision as much as a performance one: `getEmployeeDay` is
  * the punch-level read — the clock times one named person tapped in and out on one named day — and
  * a dashboard that prefetched it for every flagged row would pull the whole company's punches to
- * render a list of dates. Read once and kept: pressing the button again folds the detail away
- * without discarding it, so a reader comparing two days does not re-read either.
+ * render a list of dates. A SUCCESSFUL read is kept: pressing the button again folds the detail
+ * away without discarding it, so a reader comparing two days does not re-read either. A FAILED one
+ * is discarded on the way out, so re-expanding retries — see `toggle`.
  *
  * No decide or repair control here, and that is not an omission. A wrong punch is fixed by an
  * amendment, which belongs to the employee and to whoever may approve for them; a button here
@@ -342,7 +343,17 @@ function AnomalousDayRow({ day, api }: { day: AnomalousDay; api: KintaiAdminClie
   useEffect(() => () => { live.current = false; }, []);
 
   const toggle = () => {
-    setOpen((wasOpen) => !wasOpen);
+    if (open) {
+      setOpen(false);
+      // A failure is thrown away on the way out, and that asymmetry with a successful read is the
+      // whole point. The guard below skips the read whenever ANY state is stored for this day,
+      // and a stored error is state — so one transient blip used to make a day unreadable for the
+      // life of the page, on the section whose entire job is "look at this day". Collapsing is
+      // the only control the row has; it is therefore also the retry.
+      if (detail?.error !== undefined) setDetail(undefined);
+      return;
+    }
+    setOpen(true);
     if (detail !== undefined) return;
     // Marked as in flight before the await, so a double press cannot start two reads.
     setDetail({});

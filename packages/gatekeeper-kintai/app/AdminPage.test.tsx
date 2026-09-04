@@ -782,6 +782,46 @@ describe("AdminPage", () => {
         expect(overviewMaybe('[data-day="1:2026-09-02"] [data-testid="day-detail"]')).not.toBeNull();
       });
 
+      /**
+       * A failed read must not become a permanent dead end.
+       *
+       * On the section whose entire job is "look at this day", one transient blip used to make a
+       * day unreadable for the life of the page: the read was skipped whenever ANY state had been
+       * stored for it, and a failure is state. Collapse and re-expand had no effect — the same
+       * sentence came back for ever, from a call that had happened once.
+       */
+      it("retries a day whose read failed, rather than showing the same error for ever", async () => {
+        let attempt = 0;
+        const api = adminApi({
+          listAnomalousDays: vi.fn(async () => [flagged()]),
+          getEmployeeDay: vi.fn(async () => {
+            if (attempt++ === 0) throw new Error("connection lost");
+            return {
+              punches: [punch({
+                id: 1, kind: "in", occurred_at: Date.parse("2026-09-02T09:00:00+09:00"),
+              })],
+              anomalies: ["unpaired_in"],
+              workedMinutes: 480,
+            };
+          }),
+        }, [TANAKA]);
+        await render(<AdminPage api={api} />);
+        const button = '[data-testid="panel-overview"] [data-day="1:2026-09-02"] [data-action="expand-day"]';
+
+        await click(button);
+        expect(overview('[data-day="1:2026-09-02"] [data-testid="day-detail"]').textContent)
+          .toContain("Couldn’t read that day’s punches.");
+
+        // Fold it away and open it again — the only control the row has, and now the retry.
+        await click(button);
+        await click(button);
+
+        expect(api.getEmployeeDay).toHaveBeenCalledTimes(2);
+        const detail = overview('[data-day="1:2026-09-02"] [data-testid="day-detail"]');
+        expect(detail.textContent).toContain("09:00");
+        expect(detail.textContent).not.toContain("Couldn’t");
+      });
+
       // Reading a day is not deciding anything. The only writes this screen offers are the
       // roster repairs in section 3, and a "fix this" control here would be a promise the
       // amendment flow — which belongs to the employee and their approver — does not keep.
@@ -969,7 +1009,7 @@ describe("AdminPage", () => {
       const api = adminApi({}, [TANAKA, STRANDED]);
       await render(<AdminPage api={api} />);
 
-      await click('[data-employee="3"] [data-action="approver-for-this"]');
+      await click('[data-testid="panel-roster"] [data-employee="3"] [data-action="approver-for-this"]');
       await choose('[data-form="set-designated-approver"] [name="approverId"]', "1");
       await submit("set-designated-approver");
 
@@ -978,11 +1018,16 @@ describe("AdminPage", () => {
 
     // The row's own button is the shortest path from seeing the problem to fixing it, and the
     // reason the forms take their employee from state rather than owning it.
+    //
+    // Scoped to `panel-roster` for the reason `row()` is: 要対応's third section renders the SAME
+    // row for every employee who is not ready, and that panel comes first in the document. This
+    // test and the two around it were silently exercising the overview's copy — they passed with
+    // the Roster tab's `fixes` wiring removed entirely.
     it("preselects the employee whose row asked for the fix", async () => {
       const api = adminApi({}, [TANAKA, STRANDED]);
       await render(<AdminPage api={api} />);
 
-      await click(`[data-employee="3"] [data-action="manager-for-this"]`);
+      await click('[data-testid="panel-roster"] [data-employee="3"] [data-action="manager-for-this"]');
       await choose('[data-form="set-reporting-line"] [name="managerId"]', "1");
       await submit("set-reporting-line");
 
@@ -1018,7 +1063,7 @@ describe("AdminPage", () => {
         await render(<AdminPage api={api} />);
         expect(row(TANAKA.id).querySelector('[data-action="exempt-this"]')).not.toBeNull();
 
-        await click('[data-employee="9"] [data-action="exempt-this"]');
+        await click('[data-testid="panel-roster"] [data-employee="9"] [data-action="exempt-this"]');
         await submit("grant-exemption");
 
         expect(api.grantExemption).toHaveBeenCalledWith(9);
