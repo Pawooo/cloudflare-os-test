@@ -1180,3 +1180,153 @@ describe("the queue lists exactly what the act check accepts", () => {
     expect([...seen].sort()).toEqual([...REFUSALS].sort());
   });
 });
+
+/**
+ * What the LISTS say about an amendment, as opposed to what the confirmation dialog says.
+ *
+ * `previewAct` has answered this since the amendment work landed, but only for the one submission
+ * an approver has already singled out. The lists were left describing every row by its `minutes`,
+ * which is 0 on an amendment and means nothing there — so a queue of corrections read as a stack
+ * of zero-minute overtime requests, and neither a human nor an agent summarising the queue for one
+ * could tell what any of them asked for.
+ *
+ * These assert the row detail. The dialog's own text is covered in `__tests__/facet.test.ts`.
+ */
+describe("amendment detail in the lists", () => {
+  const DAY = "2026-07-03";
+  /** An hour after the punch: when the request is filed, and when the queue is read. */
+  const LATER = JUL + 3600_000;
+
+  /** A clock-in at 09:00 JST on `DAY`, the punch every correction below is filed against. */
+  async function clockIn() {
+    return store.recordPunch({
+      employeeId: worker, workDate: DAY, kind: "in", now: JUL, source: "gadget",
+    });
+  }
+
+  /** "That 09:00 punch should say 08:30." */
+  async function fileCorrection(targetPunchId: number, occurredAt = JUL - 1800_000) {
+    return store.fileAmendment({
+      employeeId: worker, targetPunchId, occurredAt,
+      reason: "started early on site", now: LATER,
+      department: "CONSTRUCTION", employmentType: null, createdBy: worker,
+    });
+  }
+
+  it("gives an approver the target punch, its current time and the requested one", async () => {
+    await singleStepRoute();
+    const punchId = await clockIn();
+    const submissionId = await fileCorrection(punchId);
+
+    const row = (await store.pendingApprovalsFor(boss, LATER))
+      .find((candidate) => candidate.id === submissionId);
+
+    expect(row?.amendment).toEqual({
+      targetPunchId: punchId,
+      currentOccurredAt: JUL,
+      requestedOccurredAt: JUL - 1800_000,
+      workDate: DAY,
+      kind: "in",
+      lockedPeriod: null,
+    });
+  });
+
+  it("carries a null current time for a punch that was never recorded", async () => {
+    await singleStepRoute();
+    const submissionId = await store.fileAmendment({
+      employeeId: worker, targetPunchId: null, workDate: DAY, kind: "out",
+      occurredAt: JUL + 9 * 3600_000, reason: "forgot to clock out",
+      now: JUL + 20 * 3600_000,
+      department: "CONSTRUCTION", employmentType: null, createdBy: worker,
+    });
+
+    const row = (await store.pendingApprovalsFor(boss, JUL + 20 * 3600_000))
+      .find((candidate) => candidate.id === submissionId);
+
+    expect(row?.amendment).toEqual({
+      targetPunchId: null,
+      currentOccurredAt: null,
+      requestedOccurredAt: JUL + 9 * 3600_000,
+      workDate: DAY,
+      kind: "out",
+      lockedPeriod: null,
+    });
+  });
+
+  it("leaves an overtime submission with no amendment detail at all", async () => {
+    await singleStepRoute();
+    const submissionId = await submit();
+
+    const row = (await store.pendingApprovalsFor(boss, LATER))
+      .find((candidate) => candidate.id === submissionId);
+
+    // Absence is the discriminator, exactly as it is on `ActPreview` — so a reader that branches
+    // on `row.amendment` cannot be fooled by an overtime row carrying an empty one.
+    expect(row).toBeDefined();
+    expect(row?.amendment).toBeUndefined();
+  });
+
+  it("shows the employee the same detail in their own list", async () => {
+    await singleStepRoute();
+    const punchId = await clockIn();
+    const submissionId = await fileCorrection(punchId);
+    const overtimeId = await submit();
+
+    const mine = await store.listSubmissionsFor(worker);
+
+    expect(mine.find((row) => row.id === submissionId)?.amendment).toEqual({
+      targetPunchId: punchId,
+      currentOccurredAt: JUL,
+      requestedOccurredAt: JUL - 1800_000,
+      workDate: DAY,
+      kind: "in",
+      lockedPeriod: null,
+    });
+    expect(mine.find((row) => row.id === overtimeId)?.amendment).toBeUndefined();
+  });
+
+  it("names the closed period a correction would write into", async () => {
+    await singleStepRoute();
+    const punchId = await clockIn();
+    const submissionId = await fileCorrection(punchId);
+    // Closed AFTER filing, which is the ordinary case: the month ends and payroll runs while
+    // requests for it are still in the queue. Filing does not check the lock, on purpose.
+    await store.lockPeriod("2026-07", boss, LATER);
+
+    const row = (await store.pendingApprovalsFor(boss, LATER))
+      .find((candidate) => candidate.id === submissionId);
+
+    // Named, not flagged: an approver triaging a queue has to read WHICH month they are about to
+    // reopen, and applying an approved amendment is the only write in this system allowed in.
+    expect(row?.amendment?.lockedPeriod).toBe("2026-07");
+    // The lock is a fact about the month, not about the request, so it must not leak onto rows
+    // whose month is open.
+    const july = await store.pendingApprovalsFor(boss, LATER);
+    expect(july.every((r) => r.kind !== "overtime" || r.amendment === undefined)).toBe(true);
+  });
+
+  it("shows the punch's new time when the target was superseded out of band", async () => {
+    await singleStepRoute();
+    const punchId = await clockIn();
+    const submissionId = await fileCorrection(punchId);
+    // Somebody else corrects the same punch directly — an admin from the HR surface, say — while
+    // the request sits in the queue. `punches` is append-only, so this writes a SUCCESSOR row and
+    // leaves the target's own `occurred_at` at 09:00 forever.
+    await store.correctPunch(
+      punchId,
+      { employeeId: worker, workDate: DAY, kind: "in", now: JUL + 600_000, source: "admin" },
+      boss, "corrected from the paper sheet", LATER,
+    );
+
+    const row = (await store.pendingApprovalsFor(boss, LATER))
+      .find((candidate) => candidate.id === submissionId);
+
+    // 09:10, the successor's time — not the 09:00 the target row still records. This is the ONE
+    // signal a triaging approver gets that the request is now doomed: `actOnAmendment` will refuse
+    // it with `KINTAI_AMENDMENT_TARGET_SUPERSEDED` whatever they decide, and nothing else in the
+    // row has changed. Reading the target's own frozen time would show them a comparison that has
+    // not been the live one since the moment the successor was written.
+    expect(row?.amendment?.currentOccurredAt).toBe(JUL + 600_000);
+    expect(row?.amendment?.targetPunchId).toBe(punchId);
+  });
+});

@@ -5,11 +5,11 @@ import { NoRouteError, resolveRoute, type RouteSnapshot, type RouteStep } from "
 import { assertApproverReachable, hasAuthorityOver, managersAt } from "./org.js";
 import { workDateStart } from "../work-date.js";
 import { designatedApproverOf, employeeLabel, isExempt } from "./employees.js";
-// Read for the amendment half of `previewAct` only. `periods.ts` imports nothing but the
-// shared types, so this closes no cycle -- and the lock verdict has to be read HERE, in the
-// same call as the authority check, or the approver is shown a period state that had already
-// moved by the time they saw it.
-import { isLocked, periodOf } from "./periods.js";
+// Read for the amendment detail on `ActPreview` and on the list rows. `periods.ts` imports
+// nothing but the shared types, so this closes no cycle -- and the lock verdict has to be read
+// HERE, in the same call as the authority check, or the approver is shown a period state that had
+// already moved by the time they saw it.
+import { periodOfSql } from "./periods.js";
 
 // The state machine, and the three invariants it exists to hold:
 //
@@ -65,7 +65,15 @@ export type ActInput = ActCheck & {
   expectedAfterEventId?: number;
 };
 
-export type SubmissionRow = {
+/**
+ * The `submissions` table's own columns, exactly as SQL hands them back.
+ *
+ * Separate from `SubmissionRow` because `SqlStorage.exec<T>` constrains `T` to a record of SQL
+ * VALUES, and `SubmissionRow.amendment` is an assembled object — a `SELECT *` cannot be typed as
+ * one. The split is worth having on its own terms too: this is what the write paths and the
+ * authority prologue work with, and none of them has any use for display detail.
+ */
+export type SubmissionColumns = {
   id: number;
   employee_id: number;
   /**
@@ -86,6 +94,32 @@ export type SubmissionRow = {
   calculation_inputs: string | null;
   route_snapshot: string;
   created_by: number | null;
+};
+
+/**
+ * A submission as the LIST reads return it: every column of the table, plus an amendment's detail.
+ *
+ * This is the shape `listMySubmissions` and `listPendingApprovals` put on the wire, and the one
+ * `src/types.txt` describes to an agent.
+ */
+export type SubmissionRow = SubmissionColumns & {
+  /**
+   * What an amendment asks to change — present exactly on rows whose `kind` is `'amendment'`, and
+   * absent on every overtime row.
+   *
+   * ABSENT IS THE DISCRIMINATOR, matching `ActPreview.amendment` and carrying the same type from
+   * the same assembler. Without it a list row for an amendment is unreadable: `kind` says
+   * `amendment`, `minutes` says 0 and means nothing there (see `kind` above), and nothing else on
+   * the row says which punch, what it currently records, or what was asked for. An approver
+   * browsing the queue — or an agent summarising it for them — saw a request for zero minutes.
+   *
+   * Populated by the LIST reads, `listSubmissionsFor` and `pendingApprovalsFor`, which join it in
+   * the same query. `getSubmission` is a `SELECT *` used by the write paths and leaves it absent
+   * even on an amendment; the authority prologue runs it once per queue row and has no use for
+   * display data, so it does not pay for the joins. Ask `previewAct` (or `getAmendment`) for the
+   * detail of one submission.
+   */
+  amendment?: AmendmentDetail;
 };
 
 export type ApprovalEventRow = {
@@ -203,11 +237,11 @@ export class StaleDecisionError extends Error {
   }
 }
 
-export function getSubmission(sql: SqlStorage, id: number): SubmissionRow {
+export function getSubmission(sql: SqlStorage, id: number): SubmissionColumns {
   // `.one()` would throw a raw SQLite error with no `code`, which the RPC boundary can only turn
   // into a 500. An unknown id is an ordinary client mistake and gets its own coded error.
   const row = sql
-    .exec<SubmissionRow>(`SELECT * FROM submissions WHERE id = ?`, id)
+    .exec<SubmissionColumns>(`SELECT * FROM submissions WHERE id = ?`, id)
     .toArray()[0];
   if (!row) throw new SubmissionNotFoundError(id);
   return row;
@@ -479,7 +513,7 @@ function designatedFallback(sql: SqlStorage, employeeId: EmployeeId): EmployeeId
  * question, and `ExemptEmployeeError` is where overtime answers it.
  */
 function requiredApprovers(
-  sql: SqlStorage, submission: SubmissionRow, step: RouteStep, now: number,
+  sql: SqlStorage, submission: SubmissionColumns, step: RouteStep, now: number,
 ): EmployeeId[] {
   if (step.approverKind === "employee") {
     return step.approverEmployeeId === null ? [] : [step.approverEmployeeId];
@@ -501,7 +535,7 @@ function requiredApprovers(
  * at that moment?" directly, rather than by inference against a later org chart.
  */
 function authorize(
-  sql: SqlStorage, submission: SubmissionRow, step: RouteStep, actorId: EmployeeId, now: number,
+  sql: SqlStorage, submission: SubmissionColumns, step: RouteStep, actorId: EmployeeId, now: number,
 ): number | null {
   if (step.approverKind === "employee") {
     if (step.approverEmployeeId === null || step.approverEmployeeId !== actorId) {
@@ -539,7 +573,7 @@ function authorize(
 
 /** Everything `checkMayAct` established, so its caller never has to re-derive any of it. */
 type ActAuthority = {
-  submission: SubmissionRow;
+  submission: SubmissionColumns;
   snapshot: RouteSnapshot;
   step: RouteStep;
   /** The org edge that granted authority, or null for a pinned step or the root fallback. */
@@ -608,25 +642,112 @@ export function checkMayAct(sql: SqlStorage, input: ActCheck): ActAuthority {
 }
 
 /**
- * What one amendment asks to change, as an approver needs to see it.
+ * What one amendment asks to change, as a reader deciding on it needs to see it.
  *
- * `currentOccurredAt` is what the target punch says NOW, read at the moment the approver is shown
+ * ONE TYPE FOR BOTH SURFACES: the confirmation dialog (`ActPreview.amendment`, via `previewAct`)
+ * and the list rows (`SubmissionRow.amendment`, via `listSubmissionsFor` and
+ * `pendingApprovalsFor`). They are assembled by the same code from the same columns, so a queue
+ * cannot summarise a request as one thing and the dialog confirm it as another.
+ *
+ * `currentOccurredAt` is what the target punch says NOW, read at the moment the reader is shown
  * the question rather than copied at filing time: the whole judgement is "should this become that",
  * and a stale left-hand side would be describing a comparison that is no longer the one being made.
  * It is null exactly when `targetPunchId` is — the forgotten clock-out, where there is no punch to
  * compare against and saying so is the honest answer.
  *
- * Read off the two tables rather than assembled from a caller's argument, like every other field
- * of `ActPreview`.
+ * "WHAT THE PUNCH SAYS NOW" IS NOT THE TARGET ROW'S OWN COLUMN, and this is the subtle part.
+ * `punches` is append-only: a correction appends a SUCCESSOR carrying `supersedes_id`, so the
+ * target row's `occurred_at` is frozen from the instant it was written and reading it could never
+ * have detected anything. The live time is the successor's when one exists — which is exactly the
+ * case that matters, because a target superseded out of band (an admin correcting the same punch
+ * from the HR surface while the request sits in a queue) makes the request permanently
+ * unappliable: `actOnAmendment` refuses it with `KINTAI_AMENDMENT_TARGET_SUPERSEDED` whatever the
+ * approver decides. Nothing else in the row changes, so a current time that no longer matches what
+ * the request was filed against is the one signal a triaging approver gets.
+ *
+ * ONE HOP, deliberately, and it is the same hop `actOnAmendment` takes: it looks for a row whose
+ * `supersedes_id` is the target and names it in the refusal. A successor that has itself been
+ * superseded would leave this one revision behind — the request is doomed either way and the
+ * signal still fires — and resolving the whole chain would mean a recursive CTE on a query that
+ * runs on every queue open. `punches_supersedes_unique` guarantees at most one successor per
+ * punch, so the hop is single-valued.
+ *
+ * `lockedPeriod` is the one field here that is NOT a property of the request: it is the state of
+ * the month the write would land in, named rather than flagged because the reader needs to read
+ * WHICH month. Null means open. Applying an approved amendment is the only write in the system
+ * allowed into a closed period (see `actOnAmendment`), so this is the single thing about the
+ * decision an approver most needs told and is least able to infer.
+ *
+ * Every field is read off the tables rather than assembled from a caller's argument, like every
+ * other field of `ActPreview`.
  */
 export type AmendmentDetail = {
   targetPunchId: number | null;
-  /** What the punch says now. Null when the request is to add a punch that was never recorded. */
+  /**
+   * What the punch says now — the successor's time once something has superseded the target, not
+   * the target row's own frozen column. Null when the request is to add a punch that was never
+   * recorded. See the type's own comment: this field is the reason it has one.
+   */
   currentOccurredAt: number | null;
   requestedOccurredAt: number;
   workDate: string;
   kind: PunchKind;
+  /** The closed month this would write into, or null when that month is open. */
+  lockedPeriod: string | null;
 };
+
+/**
+ * The columns of an `AmendmentDetail`, and the joins that supply them, as SQL — written once and
+ * spliced into every query that needs the detail.
+ *
+ * Shared rather than duplicated because there are two callers with genuinely different bases: the
+ * single-submission read starts from `amendment_requests`, and the two lists start from
+ * `submissions` and reach it through a `LEFT JOIN`. What they must not differ on is the DETAIL —
+ * which punch is "current", how the period is derived — so that part is one string and one
+ * assembler (`toAmendmentDetail`), and only the FROM clause varies.
+ *
+ * Every join is keyed on an index: `punches.id` is the primary key, `c.supersedes_id` has the
+ * partial unique index `punches_supersedes_unique`, and `period_locks.period` is that table's
+ * primary key. Nothing here scans, so adding the detail does not make the queue's cost grow with
+ * the size of `punches` — see "amendment detail in the lists" in `__tests__/submissions.test.ts`,
+ * which asserts the plan.
+ *
+ * The alias `a` is assumed to be `amendment_requests`; `t`, `c` and `pl` are this fragment's own.
+ */
+const AMENDMENT_DETAIL_COLUMNS = `
+  a.target_punch_id,
+  COALESCE(c.occurred_at, t.occurred_at) AS current_occurred_at,
+  a.occurred_at AS requested_occurred_at,
+  a.work_date AS amendment_work_date,
+  a.kind AS amendment_kind,
+  pl.period AS locked_period`;
+
+const AMENDMENT_DETAIL_JOINS = `
+  LEFT JOIN punches t ON t.id = a.target_punch_id
+  LEFT JOIN punches c ON c.supersedes_id = a.target_punch_id
+  LEFT JOIN period_locks pl ON pl.period = ${periodOfSql("a.work_date")}`;
+
+/** The row `AMENDMENT_DETAIL_COLUMNS` selects. Column names, not the type's field names. */
+type AmendmentDetailColumns = {
+  target_punch_id: number | null;
+  current_occurred_at: number | null;
+  requested_occurred_at: number;
+  /** Aliased away from `submissions.requested_for`/`kind`, which `s.*` also brings along. */
+  amendment_work_date: string;
+  amendment_kind: PunchKind;
+  locked_period: string | null;
+};
+
+function toAmendmentDetail(row: AmendmentDetailColumns): AmendmentDetail {
+  return {
+    targetPunchId: row.target_punch_id,
+    currentOccurredAt: row.current_occurred_at,
+    requestedOccurredAt: row.requested_occurred_at,
+    workDate: row.amendment_work_date,
+    kind: row.amendment_kind,
+    lockedPeriod: row.locked_period,
+  };
+}
 
 /**
  * What an approver reads before confirming a decision. Display only — nothing here is ever used to
@@ -652,13 +773,10 @@ export type ActPreview = {
    * `minutes` alone told the approver they were signing off zero minutes of overtime. There is no
    * value of `minutes` that could have carried this; the detail had to arrive.
    *
-   * `lockedPeriod` is the one fact here that is NOT a property of the request: it is the state of
-   * the month the write would land in, named rather than flagged because the approver needs to read
-   * which month. Null means open. Applying an approved amendment is the only write in the system
-   * allowed into a closed period (see `actOnAmendment`), so this is the single thing about the
-   * decision an approver most needs told and least able to infer.
+   * The same type, from the same assembler, as `SubmissionRow.amendment`: the queue an approver
+   * browsed and the dialog they confirm cannot describe one request two ways.
    */
-  amendment?: AmendmentDetail & { lockedPeriod: string | null };
+  amendment?: AmendmentDetail;
 };
 
 /**
@@ -717,32 +835,27 @@ export function previewAct(sql: SqlStorage, input: ActCheck): ActProbe {
  * NOT `getAmendment`, and the difference is the point. That function answers "what does the record
  * say this request is", from one table. This answers "what is the approver being asked to agree
  * to", which needs the target punch's CURRENT time joined in — the right-hand side of the
- * comparison lives on the request, the left-hand side lives on the punch, and only the punch knows
- * whether somebody has moved it since the request was filed.
+ * comparison lives on the request, the left-hand side lives on the punch (or on the punch that has
+ * since superseded it), and only `punches` knows whether somebody has moved it since the request
+ * was filed.
  *
  * `LEFT JOIN`, because the target is null for an addition, and a null `currentOccurredAt` is the
  * honest answer there rather than an absence to paper over.
  *
+ * One submission, so this could have called `isLocked` for the period rather than joining
+ * `period_locks`. It joins, because the lists cannot call `isLocked` per row and the two surfaces
+ * sharing `AMENDMENT_DETAIL_COLUMNS` is worth more than one saved join: a period derived two ways
+ * is a period that can be derived two ways.
+ *
  * Read here rather than in `amendments.ts` because that module imports this one; asking it for this
  * would close a cycle. The query is small and belongs to the question `previewAct` is answering.
  */
-function amendmentPreview(
-  sql: SqlStorage, submissionId: number,
-): AmendmentDetail & { lockedPeriod: string | null } {
+function amendmentPreview(sql: SqlStorage, submissionId: number): AmendmentDetail {
   const row = sql
-    .exec<{
-      target_punch_id: number | null;
-      current_occurred_at: number | null;
-      requested_occurred_at: number;
-      work_date: string;
-      kind: PunchKind;
-    }>(
-      `SELECT a.target_punch_id,
-              t.occurred_at AS current_occurred_at,
-              a.occurred_at AS requested_occurred_at,
-              a.work_date, a.kind
+    .exec<AmendmentDetailColumns>(
+      `SELECT ${AMENDMENT_DETAIL_COLUMNS}
        FROM amendment_requests a
-       LEFT JOIN punches t ON t.id = a.target_punch_id
+       ${AMENDMENT_DETAIL_JOINS}
        WHERE a.submission_id = ?`,
       submissionId,
     )
@@ -752,15 +865,7 @@ function amendmentPreview(
     // display problem. Uncoded on purpose: `isDomainRefusal` must not read this as a clean refusal.
     throw new Error(`previewAct: submission ${submissionId} is an amendment with no request row`);
   }
-  return {
-    targetPunchId: row.target_punch_id,
-    currentOccurredAt: row.current_occurred_at,
-    requestedOccurredAt: row.requested_occurred_at,
-    workDate: row.work_date,
-    kind: row.kind,
-    // Named, not flagged: the approver needs to read WHICH month. Null means open.
-    lockedPeriod: isLocked(sql, row.work_date) ? periodOf(row.work_date) : null,
-  };
+  return toAmendmentDetail(row);
 }
 
 export function actOnSubmission(sql: SqlStorage, input: ActInput): SubmissionState {
@@ -873,15 +978,76 @@ export function withdrawSubmission(
   sql.exec(`UPDATE submissions SET state = 'withdrawn' WHERE id = ?`, submissionId);
 }
 
-/** Every submission belonging to one employee, newest first. */
+/**
+ * One row of a list query: the submission's own columns, plus the amendment detail the LEFT JOIN
+ * supplies.
+ *
+ * The `AmendmentDetailColumns` half is all-NULL on an overtime row, and `requested_occurred_at`,
+ * `amendment_work_date` and `amendment_kind` are nonetheless typed non-null: they are non-null
+ * everywhere they are READ, which is only ever behind the `amendment_submission_id` check in
+ * `withAmendmentDetail`. Typing the half nullable would buy nothing but a `!` on each of them.
+ */
+type SubmissionListRow = SubmissionColumns & AmendmentDetailColumns & {
+  /** `amendment_requests.submission_id`. Non-null exactly on an amendment row: the discriminator. */
+  amendment_submission_id: number | null;
+};
+
+/** The submission columns, `${AMENDMENT_DETAIL_JOINS}`'s columns, and the discriminator. */
+const SUBMISSION_LIST_COLUMNS =
+  `s.*, a.submission_id AS amendment_submission_id, ${AMENDMENT_DETAIL_COLUMNS}`;
+
+const SUBMISSION_LIST_JOINS =
+  `LEFT JOIN amendment_requests a ON a.submission_id = s.id ${AMENDMENT_DETAIL_JOINS}`;
+
+/**
+ * Split one joined row back into a `SubmissionRow`, with `amendment` attached only when there was
+ * a request to attach.
+ *
+ * The joined columns are destructured OUT rather than left on the row. These rows cross the RPC
+ * boundary to agents and to the app, and a submission carrying both `amendment.workDate` and a
+ * stray snake_case `amendment_work_date` beside it would be two spellings of one fact, with
+ * nothing saying which is the contract. `src/types.txt` describes the row, and it must describe
+ * all of it.
+ */
+function withAmendmentDetail(row: SubmissionListRow): SubmissionRow {
+  const {
+    amendment_submission_id: amendmentId,
+    target_punch_id, current_occurred_at, requested_occurred_at,
+    amendment_work_date, amendment_kind, locked_period,
+    ...submission
+  } = row;
+  // Absent, not empty: whatever reads these rows branches on the property's presence.
+  if (amendmentId === null) return submission;
+  return {
+    ...submission,
+    amendment: toAmendmentDetail({
+      target_punch_id, current_occurred_at, requested_occurred_at,
+      amendment_work_date, amendment_kind, locked_period,
+    }),
+  };
+}
+
+/**
+ * Every submission belonging to one employee, newest first — with each amendment's detail, so an
+ * employee reviewing their own requests can see what they asked for.
+ *
+ * Joined in the same query as the list, not fetched per row. Same reason as `pendingApprovalsFor`,
+ * and the same reason `previewAct` reads its lock verdict in the call that checks authority: a
+ * second round trip per submission is a window as well as a cost.
+ */
 export function listSubmissionsFor(
   sql: SqlStorage, employeeId: EmployeeId,
 ): SubmissionRow[] {
   return sql
-    .exec<SubmissionRow>(
-      `SELECT * FROM submissions WHERE employee_id = ? ORDER BY id DESC`, employeeId,
+    .exec<SubmissionListRow>(
+      `SELECT ${SUBMISSION_LIST_COLUMNS}
+       FROM submissions s
+       ${SUBMISSION_LIST_JOINS}
+       WHERE s.employee_id = ? ORDER BY s.id DESC`,
+      employeeId,
     )
-    .toArray();
+    .toArray()
+    .map(withAmendmentDetail);
 }
 
 /**
@@ -952,19 +1118,32 @@ export function pendingApprovalsFor(
   sql: SqlStorage, approverId: EmployeeId, now: number,
 ): SubmissionRow[] {
   const pending = sql
-    .exec<SubmissionRow>(
+    .exec<SubmissionListRow>(
       // submitted_at is caller-supplied and so is not monotonic; id breaks ties in insertion order.
-      `SELECT * FROM submissions WHERE state = 'pending' ORDER BY submitted_at, id`,
+      `SELECT ${SUBMISSION_LIST_COLUMNS}
+       FROM submissions s
+       ${SUBMISSION_LIST_JOINS}
+       WHERE s.state = 'pending' ORDER BY s.submitted_at, s.id`,
     )
     .toArray();
 
-  return pending.filter((submission) => {
-    try {
-      checkMayAct(sql, { submissionId: submission.id, actorId: approverId, now });
-      return true;
-    } catch (err) {
-      if (isQueueRefusal(err)) return false;
-      throw err;
-    }
-  });
+  return pending
+    // The joins supply DISPLAY DATA AND NEVER AUTHORITY. The filter is untouched by them: it is
+    // still `checkMayAct` on the submission's id, so the property test in
+    // `__tests__/submissions.test.ts` still holds the queue and the act check together. A join
+    // that narrowed the rows would be a second, silent statement of who may approve — which is
+    // precisely the drift the whole comment above is about. `LEFT JOIN` throughout, so no row can
+    // be dropped by it either.
+    .filter((submission) => {
+      try {
+        checkMayAct(sql, { submissionId: submission.id, actorId: approverId, now });
+        return true;
+      } catch (err) {
+        if (isQueueRefusal(err)) return false;
+        throw err;
+      }
+    })
+    // After the filter, not before: assembling detail for rows the approver may not see would be
+    // work thrown away, and the queue's cost is already the pending set.
+    .map(withAmendmentDetail);
 }

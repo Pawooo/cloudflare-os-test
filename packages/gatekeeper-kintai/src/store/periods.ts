@@ -20,6 +20,21 @@ export function periodOf(workDate: string): string {
   return workDate.slice(0, 7);
 }
 
+/**
+ * `periodOf`, as a SQL expression over a `work_date` column.
+ *
+ * For the reads that need the period of MANY rows at once and so cannot call `isLocked` per row —
+ * the approval queue joins `period_locks` on this, because a lock lookup per pending amendment is
+ * a round trip per row on a query that runs on every queue open.
+ *
+ * A second statement of the same rule, and therefore a drift risk: it exists only because a
+ * TypeScript function cannot appear in a join condition. `__tests__/periods.test.ts` asserts the
+ * two agree on the same inputs, mechanically, so that changing one and not the other fails.
+ */
+export function periodOfSql(workDateColumn: string): string {
+  return `substr(${workDateColumn}, 1, 7)`;
+}
+
 export function isLocked(sql: SqlStorage, workDate: string): boolean {
   const row = sql
     .exec<{ n: number }>(

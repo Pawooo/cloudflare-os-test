@@ -32,7 +32,7 @@ import {
   actOnSubmission, approvalEvents, getSubmission, listSubmissionsFor, pendingApprovalsFor,
   previewAct, resubmit, submitOvertime, withdrawSubmission,
   type ActCheck, type ActInput, type ActProbe, type ApprovalEventRow, type NewSubmission,
-  type SubmissionRow,
+  type SubmissionColumns, type SubmissionRow,
 } from "./submissions.js";
 import {
   createRoute, resolveRoute,
@@ -378,7 +378,7 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
     return pendingApprovalsFor(this.sql, approverId, now);
   }
 
-  async getSubmission(id: number): Promise<SubmissionRow> {
+  async getSubmission(id: number): Promise<SubmissionColumns> {
     return getSubmission(this.sql, id);
   }
 

@@ -1,6 +1,6 @@
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import { periodOf } from "../src/store/periods.js";
+import { periodOf, periodOfSql } from "../src/store/periods.js";
 
 const JUL = Date.parse("2026-07-31T00:00:00Z");
 
@@ -19,6 +19,23 @@ describe("periodOf", () => {
   it("reduces a work date to its JST calendar month", () => {
     expect(periodOf("2026-07-03")).toBe("2026-07");
     expect(periodOf("2026-12-31")).toBe("2026-12");
+  });
+
+  /**
+   * `periodOfSql` is the same rule written twice — once in TypeScript, once as SQL, because the
+   * approval queue joins `period_locks` in the query rather than calling `isLocked` per row. Two
+   * statements of one rule drift, so the agreement is asserted rather than assumed: change one and
+   * not the other and this fails, which is the only thing standing between them.
+   */
+  it("agrees with its SQL form on every shape of work date", async () => {
+    const dates = ["2026-01-01", "2026-07-03", "2026-12-31", "2027-02-28"];
+    const inSql = await runInDurableObject(store, (instance) =>
+      dates.map((date) =>
+        instance.sql
+          .exec<{ period: string }>(`SELECT ${periodOfSql("?")} AS period`, date)
+          .one().period));
+
+    expect(inSql).toEqual(dates.map(periodOf));
   });
 });
 
