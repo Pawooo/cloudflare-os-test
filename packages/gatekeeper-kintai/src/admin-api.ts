@@ -4,9 +4,13 @@ import type { EmployeeId, KintaiIdentity, RosterEntry, WorkDatePolicy } from "./
 import type { NewEmployee } from "./store/employees.js";
 import { EmployeeNotFoundError } from "./store/employees.js";
 import type { ReportingLineRow } from "./store/org.js";
+import type {
+  AnomalousDay, EmployeeDay, MonthlyReport, PendingItem,
+} from "./store/overview.js";
 import type { KintaiStore } from "./store/kintai-store.js";
 import {
-  assertEmployeeId, assertRequiredText, assertText, assertWorkDate, InvalidInputError, LIMITS,
+  assertEmployeeId, assertPeriod, assertRequiredText, assertText, assertWorkDate,
+  InvalidInputError, LIMITS,
 } from "./input.js";
 
 /**
@@ -35,6 +39,32 @@ import {
  * Neither is caught by the compiler, so both are caught by the test instead: see "exposes exactly
  * the interface" in `__tests__/admin-api.test.ts`, which pins the callable surface of both classes
  * against a written-out list of these members. Add a member here and that list must change too.
+ *
+ * WHAT THIS CAPABILITY READS, as of 2026-09-04: all attendance, for everybody, down to individual
+ * punches. `listPendingOverview`, `listAnomalousDays`, `monthlyReport` and `getEmployeeDay` widen
+ * it from "administers the org" to "reads the whole company's worked hours", and `getEmployeeDay`
+ * is punch-level — the clock times one named person tapped in and out on one named day, and where
+ * they were standing when they did. That is a privacy decision and it was taken knowingly, with
+ * the project owner, on 2026-09-04: an administrator who cannot see a punch cannot see what is
+ * stuck, cannot read a month, and cannot responsibly close one — and closing one is the write this
+ * package needs most (`setAllocations` can rewrite a paid month until somebody can).
+ *
+ * It goes to HR and NOT to managers, who are the other party with a plausible claim on it. A
+ * manager's authority in this package is the org chart, and their surface is the session facet:
+ * scoped to their own reports, reached through the approval path, and nothing wider. Scoped
+ * manager views — a foreman reading their crew's days — are later work and need their own
+ * capability; nothing on this interface is that, and a manager holding a Workshop admin account is
+ * getting the HR capability, not a manager's one.
+ *
+ * `ViewerKintaiApi` is what holds that line, and it is the reason these members are on the
+ * interface rather than only on the admin class. It implements every member here and throws on all
+ * but `whoAmI`, so a non-admin's capability carries ZERO attendance reads — not a filtered view,
+ * not an empty list, nothing to call. A read added to `AdminKintaiApi` alone compiles perfectly
+ * well and leaves no written decision anywhere about whether a non-admin may have it; this
+ * interface is what forces that decision to be made, and the surface test is what pins the answer
+ * for both classes. The gap that stays uncaught by the compiler is still the one named above — a
+ * public method on `ViewerKintaiApi` that is absent from here — so a new read belongs on the
+ * interface first, never on a class first.
  */
 export interface KintaiAdminApi {
   /**
@@ -133,6 +163,57 @@ export interface KintaiAdminApi {
    * only an administrative correction can fix.
    */
   setWorkDatePolicy(employeeId: EmployeeId, policy: WorkDatePolicy): Promise<void>;
+
+  /**
+   * Every submission waiting on somebody, with how long it has waited and who could end the wait.
+   * Admin only — this is the whole company's queue.
+   *
+   * THE ONE READ IN THIS SYSTEM THAT CAN SEE A STRANDED REQUEST, and the reason the dashboard's
+   * first tab exists. Every other view of the queue is scoped to a person, so a submission nobody
+   * may act on — filed by its only possible approver, or left behind by an org change that closed
+   * the last edge reaching it — appears in nobody's list and waits forever. See `pendingOverview`.
+   *
+   * It carries no decide control, deliberately: the admin's move is to chase the person named in
+   * `eligibleActorNames`, or to repair the org so somebody is. An admin override would make every
+   * route guarantee conditional.
+   */
+  listPendingOverview(): Promise<PendingItem[]>;
+
+  /**
+   * Every (employee, day) in `period` that carries an anomaly flag, with the flags. Admin only.
+   *
+   * The exceptions queue: one row per day a human should look at, rather than one row per day
+   * worked. `period` is `YYYY-MM`.
+   */
+  listAnomalousDays(period: string): Promise<AnomalousDay[]>;
+
+  /**
+   * One month, per employee: days worked, minutes credited, flagged days, and whether it is
+   * closed. Admin only — this is every employee's hours.
+   *
+   * `locked` sits on the report rather than on each row, because one report describes one period
+   * under one lock. It says the month is CLOSED, not that the numbers are frozen: an approved
+   * amendment still writes into a closed month and the next read of this walks the punches it
+   * wrote. See `monthlyTotals`.
+   */
+  monthlyReport(period: string): Promise<MonthlyReport>;
+
+  /**
+   * One employee's one day — the punches, the flags they raise, the minutes they credit. Admin
+   * only, and the punch-level read the header's paragraph is about.
+   *
+   * The drill-down both tabs need: a flagged day and a suspicious total are both questions that
+   * can only be answered by looking at the punches. It is the same three calls `KintaiSession.
+   * getDay` makes for the employee's own view, so an administrator looking at somebody's day sees
+   * exactly what that person sees.
+   */
+  getEmployeeDay(employeeId: EmployeeId, workDate: string): Promise<EmployeeDay>;
+
+  /**
+   * Close `period`: from now on, ordinary writes into it are refused. Admin only, audited, and
+   * ONE-WAY — see `AdminKintaiApi.lockPeriod`.
+   */
+  lockPeriod(period: string): Promise<void>;
 }
 
 // Re-exported so worker-side callers of this API read its return type from the API's own module.
@@ -151,6 +232,37 @@ export class AdminRequiredError extends Error {
     super(
       `KINTAI_ADMIN_REQUIRED: ${method} is available to Workshop administrators only. ` +
       "Ask an administrator to make this change.",
+    );
+  }
+}
+
+/**
+ * Thrown when an administrator with no employee record of their own tries to close a month.
+ *
+ * `period_locks.locked_by` is NOT NULL, and that is the right shape rather than an oversight: a
+ * close is an act by a person, and "who closed this month" is the first thing anyone asks of a
+ * closed month. The nullable actor columns elsewhere on this surface —
+ * `audit_log.actor_employee_id`, `account_links.linked_by` — are nullable for a real case, the
+ * first administrator acting before anybody is onboarded. This is the one operation that cannot
+ * absorb it: there would be no row to write.
+ *
+ * NOT `UnlinkedAccountError`, which records the same fact with the wrong remedy. Its message says
+ * "Contact HR to be set up", which is the right instruction for an employee whose Gadget cannot
+ * resolve them and the wrong one here, because this caller IS HR. The fix is theirs to make and
+ * takes one step they already have: read their own account code off `whoAmI` and link it to their
+ * own employee record. So the message says that, and carries its own code, so an app can tell the
+ * two situations apart.
+ *
+ * The code is repeated in the message because `code` is a plain own property and does not survive
+ * the RPC boundary — the browser receives the message and nothing else.
+ */
+export class UnlinkedAdminError extends Error {
+  readonly code = "KINTAI_ADMIN_NOT_LINKED";
+  constructor(method: string) {
+    super(
+      `KINTAI_ADMIN_NOT_LINKED: ${method} records who performed it, and this account is not ` +
+      "linked to an employee record. Link your own account to your own employee record first — " +
+      "your account code is the one whoAmI() reports.",
     );
   }
 }
@@ -211,20 +323,23 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
   }
 
   /**
-   * KNOWN LIMITATION, recorded here rather than in a review document: the three mutating methods
-   * below write their audit entry in a SECOND RPC call to the store, so the mutation and its audit
-   * entry are serialized but NOT atomic. A DO eviction or isolate kill between the two round-trips
-   * persists the mutation with no audit record — on the identity-granting operations, which is the
-   * worst place for it.
+   * KNOWN LIMITATION, recorded here rather than in a review document: EVERY mutating method on
+   * this class writes its audit entry in a SECOND RPC call to the store, so the mutation and its
+   * audit entry are serialized but NOT atomic. A DO eviction or isolate kill between the two
+   * round-trips persists the mutation with no audit record — on the identity-granting operations,
+   * which is the worst place for it, and on `lockPeriod`, where it would leave a month closed with
+   * nothing recording who closed it (the `period_locks` row keeps `locked_by`, so the actor
+   * survives there even then — the same partial cover `linkAccount` has).
    *
    * Deferred deliberately. Closing it means threading an audit payload into the store primitives,
    * which also pulls `revoke()`'s `unlinkAccount` and every existing caller of `createEmployee`
-   * into the audit trail — a change to the store contract, not a fix. The exposure is small (all
-   * four calls target the same singleton DO, on an admin-only path) but it is real.
+   * into the audit trail — a change to the store contract, not a fix. The exposure is small (every
+   * call in the pair targets the same singleton DO, on an admin-only path) but it is real.
    *
    * `linkAccount` is partly covered regardless: `account_links.linked_by` is written in the same
    * statement as the link itself, so that one operation keeps its actor even if the audit write is
-   * lost. `createEmployee` and `setReportingLine` do not.
+   * lost, and `lockPeriod` the same way through `period_locks.locked_by`. `createEmployee`,
+ * `setReportingLine`, `setDesignatedApprover` and `setWorkDatePolicy` do not.
    *
    * If this is revisited: for `linkAccount` alone the audit write could move AHEAD of the mutation,
    * since its `entityId` is the caller-supplied `employeeId` and does not depend on the write's
@@ -465,6 +580,117 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
   }
 
   /**
+   * The whole company's waiting queue, judged at one instant.
+   *
+   * `Date.now()` is read here and passed down, for the reason `listEmployees` does it: `waitingMs`
+   * and "who may act on this" are both answers about a moment, and a screen whose rows disagreed
+   * about what time it is could age one row against one clock and decide another's authority
+   * against a different one. It is a server clock and never an argument — `now` decides which org
+   * edges and which account links are in force, so accepting one would let a caller ask who could
+   * have approved under a reporting line that has since been closed.
+   *
+   * Unaudited, like every read on this surface (see `listEmployees`). `audit_log` records
+   * authority-relevant CHANGES; a read of the queue changes nothing, and an entry per dashboard
+   * open would bury the entries that matter.
+   */
+  async listPendingOverview(): Promise<PendingItem[]> {
+    return this.#store.pendingOverview(Date.now());
+  }
+
+  /**
+   * The month's flagged days.
+   *
+   * `assertPeriod` here AND inside `anomalousDays`, and that is not two opinions: it is the same
+   * imported function called at the boundary that accepts a typed-in month, exactly as
+   * `createEmployee` calls the same `assertWorkDate` the session facet calls. The boundary check is
+   * what turns a form typo into a sentence before a round trip; the store's is what protects the
+   * `WHERE work_date LIKE ?` scan from a caller that is not this class.
+   */
+  async listAnomalousDays(period: string): Promise<AnomalousDay[]> {
+    assertPeriod("period", period);
+    return this.#store.anomalousDays(period);
+  }
+
+  /** One month's totals per employee, plus whether it is closed. See `monthlyTotals`. */
+  async monthlyReport(period: string): Promise<MonthlyReport> {
+    assertPeriod("period", period);
+    return this.#store.monthlyTotals(period);
+  }
+
+  /**
+   * One employee's one day, punch by punch.
+   *
+   * `assertWorkDate` IS LOAD-BEARING HERE, and this is the only place it can be. `employeeDay`
+   * takes its work date on trust — deliberately, matching every other store read, because every
+   * worker-side caller has already derived it from a policy or a punch row — and this method is
+   * the surface untrusted input reaches. A malformed date reaching the store is not refused by
+   * anything: `work_date` is TEXT with no CHECK, and a query for `"banana"` simply finds no rows,
+   * so the screen would report an employee with no punches on a day that does not exist rather
+   * than saying what was wrong.
+   *
+   * `assertEmployeeId` is shape only, and there is deliberately no existence check behind it. This
+   * is a read: no foreign key can fire, so there is no 500 to turn into a sentence (which is what
+   * `#assertEmployeeExists` exists for, ahead of the WRITES). An id that names nobody returns an
+   * empty day, which is also the honest answer for a real employee who did not work — and the
+   * caller got the id from a row this same surface handed it.
+   */
+  async getEmployeeDay(employeeId: EmployeeId, workDate: string): Promise<EmployeeDay> {
+    assertEmployeeId("employee", employeeId);
+    assertWorkDate("work date", workDate);
+    return this.#store.employeeDay(employeeId, workDate);
+  }
+
+  /**
+   * Close a month, and make every punch in it final.
+   *
+   * The fourth confirmed implemented-but-unreachable feature in this package, and the one with
+   * teeth: `period_locks` has been enforced by `KintaiSession.punch` and by `assertWritable` since
+   * the beginning, and nothing outside the worker could write a row into it — so no month could
+   * ever be closed, and `setAllocations`, the one write in this system with no approval behind it,
+   * could rewrite a paid month indefinitely. This is the call that closes that.
+   *
+   * ONE-WAY. There is no unlock here and none in the store, because reopening a month is a
+   * decision nobody has made: it would have to say what happens to the amendments filed against
+   * the closed month, and to a payroll run already made from it. The HR form says so at the point
+   * of pressing it.
+   *
+   * `lockedBy` is the CALLER's own employee id, resolved from their own capability and never an
+   * argument, exactly as `linkAccount`'s is. An administrator cannot record the close as somebody
+   * else's doing. Unlike `linkAccount` it cannot fall back to "unset" when the acting admin has no
+   * employee record — `period_locks.locked_by` is NOT NULL — so that case is refused instead; see
+   * `UnlinkedAdminError` for why the column is right and the refusal is not a workaround.
+   *
+   * ALREADY-CLOSED IS NOT CHECKED HERE. It is refused by `lockPeriod` in `store/periods.ts`, in
+   * the same synchronous run as the INSERT, and that placement is the point: a check in this body
+   * would read over one RPC and write over another, so two admins pressing the button together
+   * would both be told they closed the month. See that function's comment. What this body does is
+   * make sure the refusal can happen at all — the read below is the audit entry's, not the rule's.
+   *
+   * Read before the write, as `linkAccount`, `setDesignatedApprover` and `setWorkDatePolicy` all
+   * do. `before` records the state this call changed FROM, read rather than assumed: an audit
+   * entry is read years later by somebody who does not know that a second close is impossible, and
+   * an entry that asserted "it was open" without having looked would be a claim about a table
+   * rather than a reading of it. If a reopen flow ever lands, this entry stays honest.
+   *
+   * No `entityId`. `period_locks` is keyed on the period, which is TEXT, and
+   * `audit_log.entity_id` is an INTEGER — a number here would join back to the wrong table. The
+   * period travels in `before`/`after` instead, which is where a reader looks for it anyway.
+   */
+  async lockPeriod(period: string): Promise<void> {
+    const now = Date.now();
+    assertPeriod("period", period);
+    const actorEmployeeId = await this.#actor(now);
+    if (actorEmployeeId === null) throw new UnlinkedAdminError("lockPeriod");
+    const previous = await this.#store.periodLock(period);
+    await this.#store.lockPeriod(period, actorEmployeeId, now);
+    await this.#store.appendAudit({
+      at: now, actorEmployeeId, action: "lock_period", entity: "period_locks",
+      before: { period, locked: previous !== null },
+      after: { period, lockedBy: actorEmployeeId, lockedAt: now },
+    });
+  }
+
+  /**
    * Reject a `NewEmployee` that the schema would accept but HR could not live with.
    *
    * `@validateRpc()` already rejects anything of the wrong TYPE, which is why nothing here
@@ -628,5 +854,48 @@ export class ViewerKintaiApi extends RpcTarget implements KintaiAdminApi {
    */
   setWorkDatePolicy(_employeeId: EmployeeId, _policy: WorkDatePolicy): never {
     throw new AdminRequiredError("setWorkDatePolicy");
+  }
+
+  /**
+   * Refused: this is every waiting request in the company, whose employee, whose filer and whose
+   * eligible approvers are all named in words. An employee's own requests are on their session
+   * (`listMySubmissions`), and an approver's are on theirs (`listPendingApprovals`) — both scoped
+   * to the person holding the capability, which is the property this read deliberately drops.
+   */
+  listPendingOverview(): never {
+    throw new AdminRequiredError("listPendingOverview");
+  }
+
+  /**
+   * Refused: a flagged day names an employee and says something about how they worked — a missing
+   * clock-out, a fourteen-hour span. Company-wide, it is a list of who is having a bad month.
+   */
+  listAnomalousDays(_period: string): never {
+    throw new AdminRequiredError("listAnomalousDays");
+  }
+
+  /** Refused: this is every employee's hours for a month, which is payroll input. */
+  monthlyReport(_period: string): never {
+    throw new AdminRequiredError("monthlyReport");
+  }
+
+  /**
+   * Refused, and this is the punch-level one: the times a named person clocked in and out on a
+   * named day, and where they were standing. An employee reads their OWN day through
+   * `KintaiSession.getDay`, which is scoped to the employee their capability resolves to and takes
+   * no employee id at all. This one takes an id, which is exactly why it is admin-only.
+   */
+  getEmployeeDay(_employeeId: EmployeeId, _workDate: string): never {
+    throw new AdminRequiredError("getEmployeeDay");
+  }
+
+  /**
+   * Refused: closing a month makes every punch in it final, and it cannot be undone. Reachable by
+   * an employee, it would be a way to freeze a month before a colleague's correction could be filed
+   * against it — or to close the live month over everybody's heads, which stops the whole company
+   * from clocking in.
+   */
+  lockPeriod(_period: string): never {
+    throw new AdminRequiredError("lockPeriod");
   }
 }

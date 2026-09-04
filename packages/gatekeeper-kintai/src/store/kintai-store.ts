@@ -459,6 +459,14 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
     return isLocked(this.sql, workDate);
   }
 
+  /**
+   * Close `period`. Refuses one that is already closed, with `KINTAI_ALREADY_LOCKED`.
+   *
+   * `period` is taken on trust here, as `employeeDay`'s work date is: the boundary that accepts a
+   * typed-in month asserts its shape (`AdminKintaiApi.lockPeriod`, via `assertPeriod`). Nothing
+   * else in the package reaches this — a malformed period would insert a lock row no `periodOf`
+   * could ever match.
+   */
   async lockPeriod(period: string, lockedBy: EmployeeId, now: number): Promise<void> {
     lockPeriod(this.sql, period, lockedBy, now);
   }
@@ -467,7 +475,7 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
     assertWritable(this.sql, workDate);
   }
 
-  /** The lock record for `period`, or null if it isn't locked. Test-only introspection. */
+  /** The lock record for `period`, or null if it isn't locked. See `periodLock`. */
   async periodLock(period: string): Promise<PeriodLock | null> {
     return periodLock(this.sql, period);
   }

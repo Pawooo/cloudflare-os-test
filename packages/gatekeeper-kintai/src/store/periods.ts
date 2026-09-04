@@ -1,3 +1,4 @@
+import { jstClockTime, jstWorkDate } from "../work-date.js";
 import type { EmployeeId } from "../types.js";
 
 /**
@@ -11,6 +12,37 @@ export class PeriodLockedError extends Error {
     super(
       `KINTAI_PERIOD_LOCKED: ${period} is closed. Submit an amendment for approval instead of ` +
       `editing the record directly.`,
+    );
+  }
+}
+
+/**
+ * Thrown when a period that is already closed is closed again.
+ *
+ * A DIFFERENT AUDIENCE from `PeriodLockedError`, which is the whole reason it is a different error
+ * with its own code rather than a reuse of that one. `PeriodLockedError` answers somebody trying
+ * to WRITE into a closed month and tells them the one thing they can still do: file an amendment.
+ * This answers an administrator who has just pressed "close this month" on a month that is already
+ * closed — a double-click, or a screen a colleague has already acted on. Telling them to file an
+ * amendment would send them to correct a record they never meant to touch. What they need is that
+ * the close they asked for has already happened, by whom and when, so they can see whether it was
+ * them a moment ago or somebody else last week.
+ *
+ * The instant is rendered in JST, like every other instant this package shows a human (see
+ * `jstClockTime`): the record is a Japanese payroll record and a UTC timestamp in a message about
+ * a calendar month is nine hours of confusion.
+ *
+ * The code is repeated in the message, as every other error in this package does, because `code`
+ * is a plain own property and does not survive the RPC boundary — the browser receives the message
+ * and nothing else.
+ */
+export class AlreadyLockedError extends Error {
+  readonly code = "KINTAI_ALREADY_LOCKED";
+  constructor(period: string, lock: PeriodLock) {
+    super(
+      `KINTAI_ALREADY_LOCKED: ${period} is already closed — employee ${lock.lockedBy} closed it ` +
+      `on ${jstWorkDate(lock.lockedAt)} at ${jstClockTime(lock.lockedAt)} JST. It stays closed, ` +
+      `and this call changed nothing.`,
     );
   }
 }
@@ -44,17 +76,41 @@ export function isLocked(sql: SqlStorage, workDate: string): boolean {
   return row.n > 0;
 }
 
+/**
+ * Close `period`, recording who closed it and when. Refuses a period that is already closed.
+ *
+ * THE REFUSAL LIVES HERE, in the same synchronous run as the INSERT, and deliberately not at the
+ * admin boundary that calls it. Two reasons, and the first is a race no boundary can close: a
+ * check in `AdminKintaiApi.lockPeriod` would read `period_locks` over one RPC and write over
+ * another, so two administrators pressing the button at the same moment would both read "open" and
+ * both be told they closed the month — falsely for one of them, because there is only ever one
+ * row. Here the read and the write are one turn of the store's input gate and nothing can arrive
+ * between them. The second reason is ownership: whether a period is closed, and who closed it, is
+ * this module's fact, and the refusal's message needs both.
+ *
+ * That is the OPPOSITE of where the ordinary write refusal lives. `assertWritable` is enforced by
+ * the callers (`KintaiSession.punch`) rather than inside the store's write functions, because the
+ * amendment path must be able to write into a closed period and reaches the store directly — the
+ * store's writes therefore cannot enforce locks for everyone. Nothing needs a bypass for closing a
+ * month twice: there is no unlock anywhere in this package, so a second close can never be a
+ * legitimate re-close after a reopen. It is a duplicate call.
+ *
+ * A plain INSERT, where this was `INSERT OR IGNORE`. Keeping the FIRST close is still right and is
+ * still what happens — nothing here overwrites `locked_at`/`locked_by` — but a silent no-op is
+ * indistinguishable from success to whoever called, and until now the only callers were tests. An
+ * administrator pressing a button is somebody who can be misled by it. With the guard above in the
+ * same run, `OR IGNORE` could now only hide a bug.
+ *
+ * If a reopen-then-reclose flow is ever introduced this needs revisiting: it would have to record
+ * the new close explicitly, which it would need to do anyway to record the reopen itself.
+ */
 export function lockPeriod(
   sql: SqlStorage, period: string, lockedBy: EmployeeId, now: number,
 ): void {
-  // OR IGNORE, not OR REPLACE: there is no unlock anywhere in this package, so a second call for
-  // an already-locked period cannot be a legitimate re-close after a reopen — it's a duplicate
-  // call. The first close is the fact worth keeping for audit ("who closed this, and when"), so a
-  // repeat becomes a harmless no-op rather than silently overwriting locked_at/locked_by. If a
-  // reopen-then-reclose flow is ever introduced, this needs revisiting — it would have to record
-  // the new close explicitly, which it would need to do anyway to record the reopen itself.
+  const existing = periodLock(sql, period);
+  if (existing) throw new AlreadyLockedError(period, existing);
   sql.exec(
-    `INSERT OR IGNORE INTO period_locks (period, locked_at, locked_by) VALUES (?, ?, ?)`,
+    `INSERT INTO period_locks (period, locked_at, locked_by) VALUES (?, ?, ?)`,
     period, now, lockedBy,
   );
 }
@@ -65,7 +121,15 @@ export function assertWritable(sql: SqlStorage, workDate: string): void {
 
 export type PeriodLock = { lockedAt: number; lockedBy: EmployeeId };
 
-/** The lock record for `period`, or null if it isn't locked. Test-only introspection. */
+/**
+ * The lock record for `period`, or null if it isn't locked.
+ *
+ * NOT test-only introspection, which is what this said until the admin dashboard landed. Three
+ * production callers read it now: `monthlyTotals` for the report's `locked` flag, `lockPeriod`
+ * just above to refuse a second close, and `AdminKintaiApi.lockPeriod` for the audit entry's
+ * `before`. It is the one read that answers "who closed this month, and when" — which is the first
+ * question asked of a closed month.
+ */
 export function periodLock(sql: SqlStorage, period: string): PeriodLock | null {
   const row = sql
     .exec<{ locked_at: number; locked_by: EmployeeId }>(
