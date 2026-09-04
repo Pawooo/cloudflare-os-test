@@ -408,7 +408,9 @@ describe("pendingOverview", () => {
     expect(stranded).toBeDefined();
     expect(stranded.eligibleActorIds).toEqual([]);
     expect(stranded.eligibleActorNames).toEqual([]);
-    expect(stranded).toMatchObject({ state: "pending", filedByName: "Sato", employeeName: "Suzuki" });
+    expect(stranded).toMatchObject({
+      state: "pending", filedByName: "Sato", employeeName: "Suzuki",
+    });
 
     // Not a defect in the read: the act check refuses every employee in the store for this row.
     for (const employee of await store.listEmployees()) {

@@ -1,5 +1,5 @@
-// The dashboard's plain reads: three views over the same append-only facts every other module in
-// this package already owns.
+// The dashboard's reads: four views over the same append-only facts every other module in this
+// package already owns.
 //
 // Nothing here is a new rule. `anomalousDays`, `monthlyTotals` and `employeeDay` all answer their
 // questions by asking `currentPunches`, `workedMinutes` and `dayAnomalies` -- the SAME functions
@@ -11,10 +11,20 @@
 // says because there is nowhere for a stale number to hide: an approved correction changes the
 // punches, and the very next read of this module walks those punches again and reports the new
 // total. See `daysWithPunches` for the one query this module owns for itself.
+//
+// `pendingOverview` is the fourth, and it is the same principle applied to a rule rather than to a
+// number. It answers a question about AUTHORITY -- who can decide each waiting request -- and it
+// answers it by asking `eligibleActors`, which asks `checkMayAct` once per candidate: the same
+// function `actOnSubmission`, `previewAct` and the approval queue all go through. There is no
+// route walking and no edge reading in this module, deliberately. A stored total that disagreed
+// with the punches would be a wrong number; a second copy of "who may approve" that disagreed with
+// the act check would be a dashboard that hides a stranded request or invents an approver for it,
+// and this project has already shipped that bug once (see `checkMayAct`).
 
 import { assertPeriod } from "../input.js";
 import { currentPunches, dayAnomalies, workedMinutes, type PunchRow } from "./punches.js";
 import { periodLock } from "./periods.js";
+import { eligibleActors, pendingSubmissions, type SubmissionRow } from "./submissions.js";
 import type { EmployeeId } from "../types.js";
 
 /** Every (employee, day) in the month that holds punches -- the only days that can have state. */
@@ -32,10 +42,12 @@ function daysWithPunches(
  * `display_name` and `employee_number` for a set of employees, in one query.
  *
  * `employeeLabel` answers this one id at a time, which is right for describing a single action to
- * an approver and wrong here: both readers below name every employee who has a day in the month,
- * and a label query per row would turn one dashboard open into one round trip per employee. An
- * empty `employeeIds` still has to short-circuit -- `IN ()` is invalid SQL, and an empty month is
- * exactly the case `daysWithPunches` returns nothing for.
+ * an approver and wrong here: the readers below name every employee who has a day in the month --
+ * or, in `pendingOverview`, every employee named anywhere in the pending set, whose own employee,
+ * whose filer and whose every eligible actor all resolve through ONE call -- and a label query per
+ * row would turn one dashboard open into one round trip per employee. An empty `employeeIds` still
+ * has to short-circuit -- `IN ()` is invalid SQL, and an empty month is exactly the case
+ * `daysWithPunches` returns nothing for.
  */
 function labelsFor(
   sql: SqlStorage, employeeIds: number[],
@@ -169,4 +181,94 @@ export function employeeDay(sql: SqlStorage, employeeId: EmployeeId, workDate: s
     anomalies: dayAnomalies(sql, employeeId, workDate),
     workedMinutes: workedMinutes(sql, employeeId, workDate),
   };
+}
+
+/**
+ * One waiting request, as an administrator triaging the whole company's queue needs to read it.
+ *
+ * Every field of the underlying `SubmissionRow` is kept, amendment detail included, so this row is
+ * a superset of what the approver's own queue shows rather than a re-description of it. The added
+ * fields are the three things an administrator has that an approver does not: whose request it is
+ * in words, how long it has waited, and WHO COULD END THE WAIT.
+ */
+export type PendingItem = SubmissionRow & {
+  employeeName: string;
+  employeeNumber: string;
+  /**
+   * Who filed it, in words, or null when the row records no filer.
+   *
+   * Null is not "the employee themself": `created_by` is nullable and a null records that no filer
+   * was captured (an older row, or a `submitOvertime` call that omitted it). Conflating the two
+   * would misreport the one column that makes `FiledBySelfError` — and so most of the stranding
+   * this screen exists to find — legible.
+   */
+  filedByName: string | null;
+  /** epoch ms it has waited, from submitted_at to `now`. */
+  waitingMs: number;
+  /** Who can decide it right now. Empty means STRANDED — surface loudly, never hide. */
+  eligibleActorIds: EmployeeId[];
+  eligibleActorNames: string[];
+};
+
+/**
+ * Every submission waiting on somebody, with how long it has waited and who could act on it.
+ *
+ * THE ONE READ IN THIS SYSTEM THAT CAN SEE A STRANDED REQUEST. Every other surface is scoped to a
+ * person: `listSubmissionsFor` shows an employee their own requests, which they may not decide, and
+ * `pendingApprovalsFor` shows an approver what they can act on. A submission nobody may act on —
+ * filed by its only possible approver, or left behind by an org change that closed the last edge
+ * reaching it — appears on neither, and sat in `pending` unseen by anyone. That is the failure this
+ * function exists to make visible, so an empty `eligibleActorIds` is REPORTED, never filtered:
+ * dropping those rows would leave the screen looking healthiest precisely when the queue is worst.
+ *
+ * `eligibleActors` per row, and it is a probe of `checkMayAct` — not a rule this module owns. See
+ * its comment for why the candidate set is the whole roster and why an empty answer here means
+ * stranded (these rows are all `pending`, the one state in which "nobody may act" cannot be
+ * explained by the submission already being settled).
+ *
+ * The names are ONE query, after the eligible sets are known rather than before: an employee's own
+ * name, their filer's, and every eligible actor's all come out of a single `labelsFor` over the
+ * union of those ids. Resolving them per row would be one round trip per name on the read whose
+ * whole cost is already O(pending × roster) authority probes.
+ *
+ * Rows come back in the approval queue's own order -- `submitted_at`, then id -- which is longest
+ * wait first, and so already the order this screen wants to be read in. It is the queue's order
+ * because it is the queue's query (see `pendingSubmissions`), not because this read chose one.
+ *
+ * `waitingMs` is measured against the caller's `now`, like every other instant in this package, so
+ * one dashboard open judges every row against ONE moment. A null `submitted_at` — no column
+ * records when it started waiting — reports 0 rather than `now - 0`, which would be fifty-six years
+ * and would sort a row with no known age above every real one.
+ */
+export function pendingOverview(sql: SqlStorage, now: number): PendingItem[] {
+  const pending = pendingSubmissions(sql);
+  if (pending.length === 0) return [];
+
+  const eligible = new Map<number, EmployeeId[]>(
+    pending.map((row) => [row.id, eligibleActors(sql, row.id, now)]),
+  );
+
+  const named = new Set<number>();
+  for (const row of pending) {
+    named.add(row.employee_id);
+    if (row.created_by !== null) named.add(row.created_by);
+    for (const actorId of eligible.get(row.id)!) named.add(actorId);
+  }
+  const labels = labelsFor(sql, [...named]);
+
+  return pending.map((row) => {
+    const employee = labels.get(row.employee_id)!;
+    const actorIds = eligible.get(row.id)!;
+    return {
+      ...row,
+      employeeName: employee.display_name,
+      employeeNumber: employee.employee_number,
+      filedByName: row.created_by === null
+        ? null
+        : labels.get(row.created_by)!.display_name,
+      waitingMs: row.submitted_at === null ? 0 : now - row.submitted_at,
+      eligibleActorIds: actorIds,
+      eligibleActorNames: actorIds.map((actorId) => labels.get(actorId)!.display_name),
+    };
+  });
 }

@@ -18,8 +18,8 @@ import {
 } from "./employees.js";
 import { listRoster } from "./roster.js";
 import {
-  anomalousDays, employeeDay, monthlyTotals,
-  type AnomalousDay, type EmployeeDay, type MonthlyReport,
+  anomalousDays, employeeDay, monthlyTotals, pendingOverview,
+  type AnomalousDay, type EmployeeDay, type MonthlyReport, type PendingItem,
 } from "./overview.js";
 import {
   assertApproverReachable, hasAuthorityOver, hasReachableApprover, listReportingLines, managersAt,
@@ -127,6 +127,24 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
   /** One employee's one day: punches, flags and credited minutes. See `employeeDay`. */
   async employeeDay(employeeId: EmployeeId, workDate: string): Promise<EmployeeDay> {
     return employeeDay(this.sql, employeeId, workDate);
+  }
+
+  /**
+   * Every waiting request, with how long it has waited and who may decide it. See
+   * `pendingOverview`.
+   *
+   * Unscoped by design, and the only read here that is: `pendingApprovalsFor` answers the same
+   * question for one approver, and a submission nobody may act on appears in no approver's answer.
+   * A row with an empty `eligibleActorIds` is a stranded request, which is what this exists to
+   * surface.
+   *
+   * `eligibleActors` is deliberately NOT exposed as a method of its own. Nothing needs to ask
+   * about one submission in isolation — an approver deciding one already has `previewAct`, which
+   * runs the same check for the one actor who matters — and an RPC that answered "who may act on
+   * id N" for any caller would hand out the shape of the org graph a submission at a time.
+   */
+  async pendingOverview(now: number): Promise<PendingItem[]> {
+    return pendingOverview(this.sql, now);
   }
 
   /** Whether an employee record exists. Departed employees still exist. */

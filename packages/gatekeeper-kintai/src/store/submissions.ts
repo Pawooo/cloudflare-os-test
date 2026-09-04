@@ -4,7 +4,7 @@ import type {
 import { NoRouteError, resolveRoute, type RouteSnapshot, type RouteStep } from "../routes.js";
 import { assertApproverReachable, hasAuthorityOver, managersAt } from "./org.js";
 import { workDateStart } from "../work-date.js";
-import { designatedApproverOf, employeeLabel, isExempt } from "./employees.js";
+import { designatedApproverOf, employeeLabel, isExempt, listEmployees } from "./employees.js";
 // Read for the amendment detail on `ActPreview` and on the list rows. `periods.ts` imports
 // nothing but the shared types, so this closes no cycle -- and the lock verdict has to be read
 // HERE, in the same call as the authority check, or the approver is shown a period state that had
@@ -1180,4 +1180,77 @@ export function pendingApprovalsFor(
     // After the filter, not before: assembling detail for rows the approver may not see would be
     // work thrown away, and the queue's cost is already the pending set.
     .map(withAmendmentDetail);
+}
+
+/**
+ * Every pending submission in the store, with each amendment's detail — the queue before anybody's
+ * authority narrows it.
+ *
+ * `pendingApprovalsFor` answers "what can THIS approver act on"; this answers "what is waiting",
+ * which is the admin dashboard's question and nobody else's. It runs `PENDING_APPROVALS_QUERY` and
+ * `withAmendmentDetail`, the same SELECT text and the same assembler that queue reads through, so
+ * a request cannot be described one way in the queue an approver acts in and another way on the
+ * screen an administrator triages from. Exported rather than inlined in `overview.ts` for exactly
+ * that: a second SELECT of this shape is a second answer waiting to happen, and neither
+ * `SubmissionListRow` nor `withAmendmentDetail` needs to leave this module for one function to
+ * reuse them.
+ *
+ * `pendingApprovalsFor` deliberately does NOT call this. It filters on the id before assembling
+ * detail, so it never pays for the joins on rows its approver may not see; calling this would
+ * assemble every row first and throw most of them away.
+ */
+export function pendingSubmissions(sql: SqlStorage): SubmissionRow[] {
+  return sql.exec<SubmissionListRow>(PENDING_APPROVALS_QUERY).toArray().map(withAmendmentDetail);
+}
+
+/**
+ * Everyone who may act on this submission right now.
+ *
+ * Implemented as `checkMayAct` per candidate — a probe of the one implementation, NOT a parallel
+ * derivation from routes and edges. O(employees) per submission, which is the honest price of
+ * having exactly one copy of the rule; at the headcounts a single company store holds, that is
+ * tens of probes over indexed reads. If it ever matters, the fix is a faster `checkMayAct`, not a
+ * second one.
+ *
+ * THE CANDIDATE SET IS THE WHOLE ROSTER, and that is not an oversight. `checkMayAct` reads no
+ * status column — `authorize` asks the org graph and the designated-approver record, and neither
+ * consults whether an employee is active, on leave or departed. A status filter here would
+ * therefore be a second, quieter statement of who may approve, and it would fail in the worst
+ * available direction: a submission whose only live approver had been marked departed would be
+ * reported with an EMPTY eligible set — stranded, the loudest thing this function can say — while
+ * `actOnSubmission` went on accepting that person's approval. The honest fix for an approver who
+ * should no longer sign is to close the org edge, which is the thing the act check actually reads,
+ * and until somebody does, showing them here is what makes it visible. Today nothing in this
+ * package can even write a non-active status (`createEmployee` writes `'active'` and no function
+ * changes it), so the roster IS the active set; the reasoning above is what keeps this correct on
+ * the day that stops being true.
+ *
+ * `isQueueRefusal` is REUSED, not restated. It answers exactly the question asked here — "does
+ * this refusal mean 'not this person, not this one, not now', or is it a fault I must not read as
+ * a no?" — and its comment argues every entry on the list, including why
+ * `SubmissionNotFoundError` is absent from it. A copy of that list beside it would be one more
+ * pair of things to keep in step, which is the failure mode this whole function is shaped to
+ * avoid. It is also why `InvalidTransitionError` is caught here although `pendingOverview` can
+ * never provoke it: for a caller who asks about a settled submission, the empty set is the true
+ * answer — nobody may act on it — and it is the same answer `checkMayAct` gives one actor at a
+ * time. An empty result therefore means "nobody, for whatever reason"; it is `pendingOverview`,
+ * whose rows are all `pending`, that can read it as STRANDED.
+ *
+ * Ids come back in `employees.id` order, from `listEmployees`, so the set is stable between reads
+ * and a caller can pair it positionally with names it looks up in the same order.
+ */
+export function eligibleActors(
+  sql: SqlStorage, submissionId: number, now: number,
+): EmployeeId[] {
+  return listEmployees(sql)
+    .filter((employee) => {
+      try {
+        checkMayAct(sql, { submissionId, actorId: employee.id, now });
+        return true;
+      } catch (err) {
+        if (isQueueRefusal(err)) return false;
+        throw err;
+      }
+    })
+    .map((employee) => employee.id);
 }
