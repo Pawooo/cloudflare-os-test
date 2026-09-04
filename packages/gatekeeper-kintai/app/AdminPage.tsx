@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import type {
-  EmployeeId, KintaiIdentity, NewEmployee, RosterEntry, WorkDatePolicy,
+  EmployeeId, KintaiIdentity, LocationSource, NewEmployee, PunchKind, PunchSource, RosterEntry,
+  SubmissionKind, SubmissionState, WorkDatePolicy,
 } from "../src/types";
 import { WORK_DATE_POLICIES, WORK_DATE_POLICY_LABELS } from "../src/work-date";
 import { describeFailure, isAdminRequired } from "./errors";
+import { OverviewTab } from "./OverviewTab";
+import { isReady, RosterRow } from "./RosterRow";
 
 /**
  * The capability this page calls, as the page sees it.
@@ -22,6 +25,120 @@ export type KintaiAdminClient = {
   setDesignatedApprover(employeeId: EmployeeId, approverId: EmployeeId): Promise<void>;
   grantExemption(employeeId: EmployeeId): Promise<void>;
   setWorkDatePolicy(employeeId: EmployeeId, policy: WorkDatePolicy): Promise<void>;
+  /** Every submission waiting on somebody, with who — if anybody — can decide it. */
+  listPendingOverview(): Promise<PendingItem[]>;
+  /** Every (employee, day) in `period` (`YYYY-MM`) carrying an anomaly flag, with the flags. */
+  listAnomalousDays(period: string): Promise<AnomalousDay[]>;
+  /** One employee's one day: the punches, the flags they raise, the minutes they credit. */
+  getEmployeeDay(employeeId: EmployeeId, workDate: string): Promise<EmployeeDay>;
+};
+
+/**
+ * The dashboard's read shapes, restated on this side of the wire.
+ *
+ * NOT a preference. These types are `src/store/overview.ts`'s, and importing even a type from that
+ * module fails `typecheck:app`: its functions take `SqlStorage`, a Workers global that
+ * `tsconfig.app.json` does not declare, so TypeScript pulls the file into the app program and
+ * reports every occurrence of the name (verified: ~40 errors across `src/store` and
+ * `src/routes.ts`). `src/types.ts` and `src/work-date.ts` are clean leaves and ARE imported, which
+ * is why every primitive below — `PunchKind`, `SubmissionState`, `PunchSource` — is the real one
+ * and only the row envelopes are restated.
+ *
+ * What that costs, stated plainly: a field RENAMED in the store would compile here and arrive
+ * `undefined` at runtime. Nothing in the type system catches that, and the mitigation is that
+ * `src/store/overview.ts` is the single place these are defined and the place to change alongside
+ * this one. `KintaiAdminClient` above carries exactly the same risk for exactly the same reason,
+ * and has since this file was written.
+ */
+export type PendingItem = {
+  id: number;
+  employee_id: number;
+  /** `overtime` or `amendment`. An amendment's `minutes` is 0 and means nothing — see below. */
+  kind: SubmissionKind;
+  requested_for: string;
+  state: SubmissionState;
+  submitted_at: number | null;
+  current_step: number;
+  minutes: number;
+  reason: string;
+  calculation_inputs: string | null;
+  route_snapshot: string;
+  created_by: number | null;
+  /**
+   * What a correction asks to change — PRESENT EXACTLY ON AMENDMENTS, absent on every overtime
+   * row, and absence is the discriminator. Read it rather than `kind`, the way `describeApproval`
+   * does: `minutes` is 0 on an amendment, so a row rendered through the overtime shape reports a
+   * request for zero minutes.
+   */
+  amendment?: AmendmentDetail;
+  employeeName: string;
+  employeeNumber: string;
+  /** Who filed it, or null when the row records NO filer. Null is not "the employee themself". */
+  filedByName: string | null;
+  /** How long it has waited, in ms, measured server-side against one instant for the whole read. */
+  waitingMs: number;
+  eligibleActorIds: EmployeeId[];
+  /** Who can decide it right now. EMPTY MEANS STRANDED — surface it loudly, never hide it. */
+  eligibleActorNames: string[];
+};
+
+export type AmendmentDetail = {
+  targetPunchId: number | null;
+  /** What the punch says now, or null when the request is to add one never recorded. */
+  currentOccurredAt: number | null;
+  requestedOccurredAt: number;
+  workDate: string;
+  kind: PunchKind;
+  /** The closed month this would write into, or null when that month is open. */
+  lockedPeriod: string | null;
+};
+
+export type AnomalousDay = {
+  employeeId: number;
+  displayName: string;
+  employeeNumber: string;
+  workDate: string;
+  /** The flag strings `dayAnomalies` produces: `unpaired_in`, `orphan_out`, `long_span`, … */
+  anomalies: string[];
+};
+
+export type PunchRow = {
+  id: number;
+  employee_id: number;
+  work_date: string;
+  kind: PunchKind;
+  occurred_at: number;
+  recorded_at: number;
+  source: PunchSource;
+  latitude: number | null;
+  longitude: number | null;
+  accuracy_m: number | null;
+  location_source: LocationSource | null;
+  matched_site_id: number | null;
+  supersedes_id: number | null;
+  amended_by: number | null;
+  amend_reason: string | null;
+};
+
+export type EmployeeDay = {
+  punches: PunchRow[];
+  anomalies: string[];
+  workedMinutes: number;
+};
+
+/**
+ * The five repairs a roster row can ask for.
+ *
+ * One object rather than five props because TWO tabs pass them now: the Roster tab's list and
+ * 要対応's third section render the same `RosterRow`, so the set has to travel as a unit or the
+ * two call sites drift the next time a sixth repair appears.
+ */
+export type RowFixes = {
+  onLink: (employee: RosterEntry) => void;
+  onSetManager: (employee: RosterEntry) => void;
+  onSetApprover: (employee: RosterEntry) => void;
+  onExempt: (employee: RosterEntry) => void;
+  onSetPolicy: (employee: RosterEntry) => void;
 };
 
 type View =
@@ -75,8 +192,18 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
   const exemptRef = useRef<HTMLSelectElement>(null);
   const policyRef = useRef<HTMLSelectElement>(null);
   const live = useRef(true);
+  // A repair asked for by a row, waiting for the render that shows the form it belongs to. The
+  // nonce is what makes pressing the SAME button twice a second request rather than a no-op.
+  const [toReveal, setToReveal] = useState<{
+    action: string; ref: React.RefObject<HTMLElement | null>; nonce: number;
+  }>();
+  const nonce = useRef(0);
 
   useEffect(() => () => { live.current = false; }, []);
+
+  useEffect(() => {
+    if (toReveal) reveal(toReveal.ref.current, toReveal.action);
+  }, [toReveal]);
 
   const load = useCallback(async () => {
     // Both calls are started together, each with its own handler attached synchronously, so a
@@ -147,6 +274,51 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
     [load],
   );
 
+  /**
+   * Bring the reader to the form that performs a repair, from whichever tab asked for it.
+   *
+   * Switching to the Roster tab is load-bearing, not a courtesy: every form lives in that panel,
+   * which is `hidden` while 要対応 is open, and focusing a field inside a hidden subtree does
+   * nothing at all in a real browser. A row in 要対応's third section that only preselected an
+   * employee would be exactly the silent no-op this page keeps going out of its way not to ship.
+   * Harmless when the reader is already on the Roster tab.
+   *
+   * The reveal itself happens in the effect above rather than here, because at this instant the
+   * panel may still be hidden and the field one state update away from being focusable.
+   */
+  const openForm = useCallback(
+    (action: string, ref: React.RefObject<HTMLElement | null>) => {
+      setTab("roster");
+      nonce.current += 1;
+      setToReveal({ action, ref, nonce: nonce.current });
+    },
+    [],
+  );
+
+  /** The row repairs, wired once and rendered by two tabs. See `RowFixes`. */
+  const fixes: RowFixes = {
+    onLink: (employee) => {
+      setLinkTarget(String(employee.id));
+      openForm("link-account", linkCodeRef);
+    },
+    onSetManager: (employee) => {
+      setReportTarget(String(employee.id));
+      openForm("set-reporting-line", managerRef);
+    },
+    onSetApprover: (employee) => {
+      setApproverTarget(String(employee.id));
+      openForm("set-designated-approver", approverRef);
+    },
+    onExempt: (employee) => {
+      setExemptTarget(String(employee.id));
+      openForm("grant-exemption", exemptRef);
+    },
+    onSetPolicy: (employee) => {
+      setPolicyTarget(String(employee.id));
+      openForm("set-work-date-policy", policyRef);
+    },
+  };
+
   return (
     <main className="mx-auto flex min-h-full w-full max-w-4xl flex-col gap-8 px-5 py-10 sm:px-8 sm:py-12">
       <header>
@@ -185,7 +357,7 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
           <TabBar tab={tab} onSelect={setTab} />
 
           <div hidden={tab !== "overview"} data-testid="panel-overview">
-            <OverviewTab api={api} />
+            <OverviewTab api={api} roster={view.roster} fixes={fixes} />
           </div>
 
           <div hidden={tab !== "monthly"} data-testid="panel-monthly">
@@ -202,26 +374,7 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
               // it would leave a control that looks like the fix, is clickable, and does nothing —
               // the same silent no-op this page went to some trouble to stop producing.
               canSetManager={view.roster.length >= 2}
-              onLink={(employee) => {
-                setLinkTarget(String(employee.id));
-                reveal(linkCodeRef.current, "link-account");
-              }}
-              onSetManager={(employee) => {
-                setReportTarget(String(employee.id));
-                reveal(managerRef.current, "set-reporting-line");
-              }}
-              onSetApprover={(employee) => {
-                setApproverTarget(String(employee.id));
-                reveal(approverRef.current, "set-designated-approver");
-              }}
-              onExempt={(employee) => {
-                setExemptTarget(String(employee.id));
-                reveal(exemptRef.current, "grant-exemption");
-              }}
-              onSetPolicy={(employee) => {
-                setPolicyTarget(String(employee.id));
-                reveal(policyRef.current, "set-work-date-policy");
-              }}
+              fixes={fixes}
             />
 
             <div className="flex flex-col gap-4">
@@ -354,12 +507,6 @@ function TabBar({ tab, onSelect }: { tab: Tab; onSelect: (tab: Tab) => void }) {
   );
 }
 
-/** Placeholder until Task 5 wires the pending-approval queue in. */
-function OverviewTab({ api }: { api: KintaiAdminClient }) {
-  void api;
-  return <p className="text-sm text-kumo-subtle">要対応 is coming soon.</p>;
-}
-
 /** Placeholder until Task 6 wires the monthly report in. */
 function MonthlyTab({ api }: { api: KintaiAdminClient }) {
   void api;
@@ -481,15 +628,11 @@ function AccountCard({ identity, admin }: { identity: KintaiIdentity; admin: boo
  * 管理監督者" for an employee whose punch corrections nobody could have approved.
  */
 function Roster({
-  roster, canSetManager, onLink, onSetManager, onSetApprover, onExempt, onSetPolicy,
+  roster, canSetManager, fixes,
 }: {
   roster: RosterEntry[];
   canSetManager: boolean;
-  onLink: (employee: RosterEntry) => void;
-  onSetManager: (employee: RosterEntry) => void;
-  onSetApprover: (employee: RosterEntry) => void;
-  onExempt: (employee: RosterEntry) => void;
-  onSetPolicy: (employee: RosterEntry) => void;
+  fixes: RowFixes;
 }) {
   const names = new Map(roster.map((row) => [row.id, row.display_name]));
   const incomplete = roster.filter((row) => !isReady(row)).length;
@@ -518,184 +661,17 @@ function Roster({
               employee={employee}
               names={names}
               canSetManager={canSetManager}
-              onLink={() => onLink(employee)}
-              onSetManager={() => onSetManager(employee)}
-              onSetApprover={() => onSetApprover(employee)}
-              onExempt={() => onExempt(employee)}
-              onSetPolicy={() => onSetPolicy(employee)}
+              onLink={() => fixes.onLink(employee)}
+              onSetManager={() => fixes.onSetManager(employee)}
+              onSetApprover={() => fixes.onSetApprover(employee)}
+              onExempt={() => fixes.onExempt(employee)}
+              onSetPolicy={() => fixes.onSetPolicy(employee)}
             />
           ))}
         </ul>
       )}
     </section>
   );
-}
-
-function RosterRow({
-  employee, names, canSetManager, onLink, onSetManager, onSetApprover, onExempt, onSetPolicy,
-}: {
-  employee: RosterEntry;
-  names: Map<number, string>;
-  canSetManager: boolean;
-  onLink: () => void;
-  onSetManager: () => void;
-  onSetApprover: () => void;
-  onExempt: () => void;
-  onSetPolicy: () => void;
-}) {
-  const ready = isReady(employee);
-  return (
-    <li className="flex flex-wrap items-center gap-x-4 gap-y-2 py-3" data-employee={employee.id}>
-      <div className="min-w-48 flex-1">
-        <p className="truncate text-sm font-medium text-kumo-default">{employee.display_name}</p>
-        <p className="truncate text-xs text-kumo-subtle">
-          {[employee.employee_number, employee.department, employee.employment_type]
-            .filter(Boolean).join(" · ")}
-        </p>
-        {/* Shown only when it is NOT the default. A badge on every row would be noise, and the
-            thing HR needs to be able to spot is the handful of people whose punches are filed
-            somewhere other than the day they happened on. */}
-        {employee.work_date_policy === "shift_start" && (
-          <p className="truncate text-xs text-kumo-subtle" data-testid="work-date-policy">
-            夜勤 · punches filed against the shift’s start date
-          </p>
-        )}
-        {/* Here, and only here, for the same reason: a 労働基準法41条 determination is one of the
-            handful of exceptions HR has to be able to spot, and the alternative was pressing the
-            管理監督者 button to see whether it answered "already recorded". Deliberately NOT in
-            the readiness column — it is a fact about the person's overtime, not a verdict about
-            whether anybody can approve for them, and reporting it as the latter is the bug the
-            row beside this one was written to fix. */}
-        {employee.exempt && (
-          <p className="truncate text-xs text-kumo-subtle" data-testid="exempt">
-            管理監督者 · overtime bears no premium
-          </p>
-        )}
-      </div>
-
-      <div className="min-w-56 flex-1">
-        {ready ? (
-          <p className="text-xs text-kumo-subtle" data-testid="status">
-            Ready · {approverReason(employee, names)}
-          </p>
-        ) : (
-          <ul className="flex flex-col gap-1" data-testid="status">
-            {!employee.linked && (
-              <li className="text-xs text-kumo-danger" data-issue="unlinked">
-                No account code linked — they cannot sign in as themselves.
-              </li>
-            )}
-            {!employee.approverReachable && (
-              <li className="text-xs text-kumo-danger" data-issue="no-approver">
-                {/* Not "overtime". A punch correction needs approval too, and naming only
-                    overtime is what made an exempt officer look finished: they file no overtime,
-                    so the warning read as inapplicable to them. */}
-                {employee.exempt
-                  ? "Nobody can approve for them — 管理監督者 exempts their overtime, but a punch" +
-                    " correction still needs a person. Give them a manager or a designated approver."
-                  : "Nobody can approve for them — anything they file will be refused. Give them a" +
-                    " manager, or a designated approver if they report to nobody."}
-              </li>
-            )}
-          </ul>
-        )}
-      </div>
-
-      <div className="flex shrink-0 gap-2">
-        {!employee.linked && (
-          <button
-            type="button"
-            data-action="link-this"
-            className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-xs font-medium text-kumo-default hover:bg-kumo-tint"
-            onClick={onLink}
-          >
-            Link code
-          </button>
-        )}
-        {!employee.approverReachable && canSetManager && (
-          <button
-            type="button"
-            data-action="manager-for-this"
-            className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-xs font-medium text-kumo-default hover:bg-kumo-tint"
-            onClick={onSetManager}
-          >
-            Set manager
-          </button>
-        )}
-        {/* The other honest way to complete this row, and the only one for somebody at the top of
-            the organisation. Gated on the same `canSetManager`: a designated approver is another
-            employee, so with one record on the roster there is nobody to name and the form would
-            have nothing in its dropdown. */}
-        {!employee.approverReachable && canSetManager && (
-          <button
-            type="button"
-            data-action="approver-for-this"
-            className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-xs font-medium text-kumo-default hover:bg-kumo-tint"
-            onClick={onSetApprover}
-          >
-            Set approver
-          </button>
-        )}
-        {/* Offered on every row, and NOT as a repair — which is what it used to look like, sitting
-            beside "Set manager" on exactly the rows that had no approver. 管理監督者 exempts an
-            employee's overtime from a premium; it grants nobody authority to sign, so it never
-            finished a row, and pointing HR at it from a row that needed an approver was pointing
-            them at a button that would not have fixed what they were looking at. It belongs with
-            "Work dates": a determination about one employee that HR makes on its own terms. */}
-        <button
-          type="button"
-          data-action="exempt-this"
-          className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-xs font-medium text-kumo-default hover:bg-kumo-tint"
-          onClick={onExempt}
-        >
-          管理監督者
-        </button>
-        {/* Always offered, unlike the two above: an employee on the wrong work-date policy is not
-            a broken row — the roster cannot tell, because both answers are legitimate — so there
-            is no "issue" for this button to appear in response to. It is the only way HR can see
-            or change the setting, so it is always reachable. */}
-        <button
-          type="button"
-          data-action="policy-for-this"
-          className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-xs font-medium text-kumo-default hover:bg-kumo-tint"
-          onClick={onSetPolicy}
-        >
-          Work dates
-        </button>
-      </div>
-    </li>
-  );
-}
-
-/**
- * Why this employee counts as approvable, in the order `hasReachableApprover` decides it.
- *
- * Display only, and never a second opinion: it is only ever called for a row the server already
- * said is reachable, and it explains that verdict rather than reaching one.
- */
-function approverReason(employee: RosterEntry, names: Map<number, string>): string {
-  if (employee.managerIds.length > 0) {
-    return `reports to ${employee.managerIds.map((id) => label(names, id)).join(", ")}`;
-  }
-  // No 管理監督者 arm, and it is not an omission. This function mirrors `hasReachableApprover`,
-  // which stopped counting an exemption: it exempts overtime from a premium and authorises nobody
-  // to sign anything. Reported here it read as "Ready · 管理監督者" on a row whose punch
-  // corrections nobody could have approved -- observed live on 2026-09-01, on the Admin record.
-  // The exemption is still on the row, as a neutral badge in the identity column beside 夜勤;
-  // what it no longer does is answer this question.
-  if (employee.designated_approver_id !== null) {
-    return `approver ${label(names, employee.designated_approver_id)}`;
-  }
-  return "approvable";
-}
-
-function label(names: Map<number, string>, id: number): string {
-  return names.get(id) ?? `employee ${id}`;
-}
-
-/** Linked AND able to have something approved. Either one alone is an unfinished onboarding. */
-function isReady(employee: RosterEntry): boolean {
-  return employee.linked && employee.approverReachable;
 }
 
 function nameOf(roster: RosterEntry[], id: EmployeeId): string {

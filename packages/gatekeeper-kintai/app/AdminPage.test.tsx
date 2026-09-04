@@ -1134,7 +1134,14 @@ describe("AdminPage", () => {
   // against `pnpm run-local`; these pin it so it cannot come back.
   describe("working inside a sandbox that forbids forms", () => {
     it("runs every action from a plain button, never from form submission", async () => {
-      await render(<AdminPage api={adminApi({}, [TANAKA, STRANDED])} />);
+      // Rendered with something in every section, so 要対応's own controls — the flagged-day
+      // drill-down and the roster repairs it borrows — are in this sweep too.
+      const api = adminApi({
+        listPendingOverview: vi.fn(async () => [waiting()]),
+        listAnomalousDays: vi.fn(async () => [flagged()]),
+      }, [TANAKA, STRANDED]);
+      await render(<AdminPage api={api} />);
+      expect(container!.querySelector('[data-action="expand-day"]')).not.toBeNull();
 
       // EVERY button, not only the ones carrying `data-action`: a button inside a form defaults to
       // `type="submit"`, so a new one added without the attribute would be inert in production and
