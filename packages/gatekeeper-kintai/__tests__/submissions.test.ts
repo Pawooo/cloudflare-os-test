@@ -1308,6 +1308,33 @@ describe("amendment detail in the lists", () => {
     expect(july.every((r) => r.kind !== "overtime" || r.amendment === undefined)).toBe(true);
   });
 
+  it("says the same thing in the queue as the confirmation dialog does", async () => {
+    await singleStepRoute();
+    const punchId = await clockIn();
+    const submissionId = await fileCorrection(punchId);
+    // Superseded out of band, because that is the one case where a queue and a dialog reading the
+    // punch two different ways would disagree — and the case where the disagreement matters most.
+    await store.correctPunch(
+      punchId,
+      { employeeId: worker, workDate: DAY, kind: "in", now: JUL + 600_000, source: "admin" },
+      boss, "corrected from the paper sheet", LATER,
+    );
+    await store.lockPeriod("2026-07", boss, LATER);
+
+    const row = (await store.pendingApprovalsFor(boss, LATER))
+      .find((candidate) => candidate.id === submissionId);
+    const { preview } = await store.previewActOnSubmission({
+      submissionId, actorId: boss, now: LATER,
+    });
+
+    // One type, one assembler, one set of columns. An approver browses the queue and then confirms
+    // from the dialog; if those were two queries they would drift, and the drift would be invisible
+    // — the same class of bug as `checkMayAct` having had three copies.
+    expect(row?.amendment).toEqual(preview.amendment);
+    expect(preview.amendment?.currentOccurredAt).toBe(JUL + 600_000);
+    expect(preview.amendment?.lockedPeriod).toBe("2026-07");
+  });
+
   /**
    * The join must not turn the queue scan quadratic, and "it looked fine" is not a finding.
    *
