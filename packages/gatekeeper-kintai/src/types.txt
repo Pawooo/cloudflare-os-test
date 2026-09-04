@@ -205,9 +205,44 @@ export type SubmissionKind = "overtime" | "amendment";
 export type ApprovalAction = "approve" | "reject" | "return";
 
 /**
- * An overtime request. `route_snapshot` is the approval route frozen as JSON at submission time, so
- * a later reorganisation cannot retroactively change who was required to approve; `current_step`
- * indexes into it.
+ * What one punch correction asks to change, as it appears on an amendment's `SubmissionRow`.
+ *
+ * `currentOccurredAt` is what the punch records NOW, not what it recorded when the request was
+ * filed. Compare it against `requestedOccurredAt` to state the change: "09:00 should be 08:30".
+ *
+ * If `currentOccurredAt` is not the time the request was clearly filed against, somebody has
+ * corrected that punch by another route since, and the request can no longer be applied:
+ * APPROVING it is refused with `KINTAI_AMENDMENT_TARGET_SUPERSEDED`, at every step of the route.
+ * Rejecting it still works, and rejecting it is the correct disposal. Nothing else on the row
+ * changes when this happens, so this field is the only sign of it the row carries.
+ *
+ * `lockedPeriod` is not a property of the request: it is the month the change would land in, named
+ * when that month has been closed for payroll and null when it is open. A closed month means
+ * somebody has already been paid on its totals, and an approved correction is the only thing in
+ * this system that may still change one — so say so prominently to whoever is deciding.
+ */
+export type AmendmentDetail = {
+  /** The punch being corrected, or null when the request is to ADD a punch nobody recorded. */
+  targetPunchId: number | null;
+  /** What that punch records now. Null exactly when `targetPunchId` is null. */
+  currentOccurredAt: number | null;
+  /** The time the punch should carry. Epoch ms. */
+  requestedOccurredAt: number;
+  /** The JST work date the punch belongs to, `YYYY-MM-DD`. */
+  workDate: string;
+  kind: PunchKind;
+  /** The closed month this would write into, e.g. `"2026-07"`, or null when it is open. */
+  lockedPeriod: string | null;
+};
+
+/**
+ * A request, of either kind. `route_snapshot` is the approval route frozen as JSON at submission
+ * time, so a later reorganisation cannot retroactively change who was required to approve;
+ * `current_step` indexes into it.
+ *
+ * READ `kind` BEFORE PRESENTING ANY OF THIS. On an `amendment` row the overtime columns carry
+ * placeholders — `minutes` is 0 and `calculation_inputs` is null, and neither means anything there
+ * (see `SubmissionKind`). What such a row is asking for is in `amendment`.
  */
 export type SubmissionRow = {
   id: number;
@@ -222,6 +257,13 @@ export type SubmissionRow = {
   calculation_inputs: string | null;
   route_snapshot: string;
   created_by: number | null;
+  /**
+   * Present exactly when `kind` is `'amendment'`, and absent on every overtime row — so its
+   * presence, not `kind`, is the safest thing to branch on when deciding how to describe a row.
+   *
+   * Returned by `listMySubmissions()` and `listPendingApprovals()`.
+   */
+  amendment?: AmendmentDetail;
 };
 
 /** Who the capability belongs to. `linked` is false until HR maps the account to an employee. */
@@ -358,7 +400,12 @@ export interface KintaiSession {
   /** Send a returned (`draft`) submission back into the queue. The only way out of `draft`. */
   resubmit(submissionId: number): Promise<void>;
 
-  /** The caller's own submissions, newest first. */
+  /**
+   * The caller's own submissions, newest first — overtime requests and punch corrections together.
+   *
+   * A correction carries its detail in `SubmissionRow.amendment`; describe it from that, never
+   * from `minutes`, which is 0 on those rows.
+   */
   listMySubmissions(): Promise<SubmissionRow[]>;
 
   /**
@@ -366,6 +413,11 @@ export interface KintaiSession {
    *
    * Derived from the org chart at call time: it lists exactly those submissions the caller could
    * actually act on right now, and is empty for an employee who approves nothing.
+   *
+   * The queue mixes overtime requests with punch corrections. Check each row's `kind` before
+   * describing it: a correction's `minutes` is 0 and reporting it as a quantity tells the approver
+   * they are being asked to sign off nothing. `SubmissionRow.amendment` holds what a correction
+   * actually asks for, including whether it writes into a month already closed for payroll.
    *
    * SHARING: this is the only method that returns other people's records, so it is treated as
    * strictly private. The call FAILS outright if this Gadget is currently shared with anyone — the
