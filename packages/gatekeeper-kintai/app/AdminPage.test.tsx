@@ -391,6 +391,24 @@ describe("AdminPage", () => {
         expect(roster.getAttribute("aria-selected")).toBe("false");
       });
 
+    // Everything above this checks the BUTTONS: which one says selected. None of it proves the
+    // panels themselves obey — jsdom's queries and clicks don't enforce `hidden` the way a real
+    // browser does, so a panel wired to the wrong condition (or to none at all) would still pass
+    // every other assertion in this file. This is the one test that reads `hidden` off the panels.
+    it("hides every panel except the one whose tab is active", async () => {
+      await render(<AdminPage api={adminApi({}, [TANAKA])} />);
+
+      for (const active of ["overview", "monthly", "roster"] as const) {
+        await click(`[data-testid="tab-${active}"]`);
+        for (const panel of ["overview", "monthly", "roster"] as const) {
+          expect(
+            field<HTMLElement>(`[data-testid="panel-${panel}"]`).hidden,
+            `panel-${panel}.hidden while tab-${active} is active`,
+          ).toBe(panel !== active);
+        }
+      }
+    });
+
     it("shows the roster once its tab is clicked, and marks that tab selected", async () => {
       await render(<AdminPage api={adminApi({}, [TANAKA])} />);
 

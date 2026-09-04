@@ -184,15 +184,17 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
         <>
           <TabBar tab={tab} onSelect={setTab} />
 
-          <div hidden={tab !== "overview"}>
+          <div hidden={tab !== "overview"} data-testid="panel-overview">
             <OverviewTab api={api} />
           </div>
 
-          <div hidden={tab !== "monthly"}>
+          <div hidden={tab !== "monthly"} data-testid="panel-monthly">
             <MonthlyTab api={api} />
           </div>
 
-          <div hidden={tab !== "roster"} className="flex flex-col gap-8">
+          <div
+            hidden={tab !== "roster"} data-testid="panel-roster" className="flex flex-col gap-8"
+          >
             <Roster
               roster={view.roster}
               // A reporting line needs somebody to report TO, so with one employee on the roster the
