@@ -1463,7 +1463,7 @@ Commit the observations as a short section in the plan file or a note beside the
 
 These are **not** part of this plan and must not be added to it:
 
-- **Screens.** The daily view, the anomaly list, the request form, and amendment cards in the admin UI are the next piece of work and depend on this one.
+- **Screens.** The daily view, the anomaly list, the request form, and amendment cards in the admin UI are the next piece of work and depend on this one. **Direction settled with the owner, 2026-09-04:** the admin dashboard is exceptions-first, split into TABS rather than blended — one tab for what needs a human now (requires-approval, blockers, anomalous days), one for monthly reporting/payroll. Verification and reporting are different jobs at different cadences, and the split lets the tabs ship in dependency order: the approvals/blockers tab needs only what exists after Task 8, while the reporting tab needs a manager-reads-a-report's-day capability that does not exist yet (gate on `hasAuthorityOver`, treat as an observation, add it to the identity-boundary allowlist in `__tests__/amendment-flow.test.ts` — the `requestCorrectionFor` pattern) plus the overtime engine for premium figures. Design session before building; the owner steers this one interactively.
 - **Voiding a punch.** A punch made in error is corrected, not removed.
 - **Batching several corrections into one request.**
 - **Reopening a closed period.**
