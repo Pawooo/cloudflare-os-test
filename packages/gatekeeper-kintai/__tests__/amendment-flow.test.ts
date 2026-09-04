@@ -405,3 +405,51 @@ describe("a correction is the way through a closed period", () => {
     expect(after.anomalies).toEqual([]);
   });
 });
+
+// ------------------------------------------------------------------------------------------------
+// The session's identity boundary, restored to a mechanical check.
+//
+// `KintaiSession`'s contract was once absolute — NO method takes an employee identifier — and its
+// virtue was that a violation was visible in a signature without reasoning about anything. The
+// on-behalf filing pair deliberately broke the letter of that rule: they are gated by
+// `hasAuthorityOver`, an `org_edges` query the caller cannot influence, so the REASONING holds
+// (the rule rejects checks a caller could route around, and the org chart is not one). But the
+// bright line became a judged one, and a judged rule is what gets skipped in review.
+//
+// This test makes it bright again. Any method that names another employee must appear here, and
+// appearing here is a claim: "this parameter is gated by a fact the server owns." A new method
+// taking `employeeId` fails this test until somebody adds it to the list — which is the moment a
+// reviewer asks the question the old rule used to make unnecessary.
+//
+// Read as source text with `?raw`, the same way the terminal-refusal test reads the store modules:
+// runtime reflection cannot see parameter names, and the signature is exactly what a reviewer
+// reads.
+import kintaiSource from "../src/kintai.ts?raw";
+
+describe("the session's identity boundary", () => {
+  it("names every method that may reach another employee's record", () => {
+    const MAY_NAME_AN_EMPLOYEE = new Set([
+      // Both gated by `hasAuthorityOver` and observed via `#assertMayFileFor`; filing for
+      // yourself through them is refused so the two intentions stay distinct.
+      "requestCorrectionFor",
+      "requestMissingPunchFor",
+    ]);
+
+    const sessionBody = kintaiSource.slice(
+      kintaiSource.indexOf("export class KintaiSession"),
+      kintaiSource.indexOf("export class KintaiGatekeeper"),
+    );
+    expect(sessionBody.length).toBeGreaterThan(0);
+
+    // Public methods whose parameter list names an employee. `#`-private helpers are the
+    // implementation of the gate itself, not surface, and `@validateRpc()` exposes only public
+    // methods over RPC.
+    const offenders = [...sessionBody.matchAll(
+      /^  (?:async )?([a-zA-Z][a-zA-Z0-9]*)\s*\(([^)]*)\)/gms,
+    )]
+      .filter(([, , params]) => /employeeId\s*:/.test(params))
+      .map(([, name]) => name);
+
+    expect(offenders.sort()).toEqual([...MAY_NAME_AN_EMPLOYEE].sort());
+  });
+});
