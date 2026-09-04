@@ -1,5 +1,8 @@
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
+import {
+  PENDING_APPROVALS_QUERY, SUBMISSIONS_FOR_EMPLOYEE_QUERY,
+} from "../src/store/submissions.js";
 
 // Rejection assertions are written as `expect(() => store.method(...))`, never as
 // `expect(store.method(...))`: handing `.rejects` an already-created RPC promise leaves that
@@ -1303,6 +1306,52 @@ describe("amendment detail in the lists", () => {
     // whose month is open.
     const july = await store.pendingApprovalsFor(boss, LATER);
     expect(july.every((r) => r.kind !== "overtime" || r.amendment === undefined)).toBe(true);
+  });
+
+  /**
+   * The join must not turn the queue scan quadratic, and "it looked fine" is not a finding.
+   *
+   * `pendingApprovalsFor` already pays one indexed point lookup per pending row for the authority
+   * prologue; the detail is meant to be free on top of that. It is free only if every joined table
+   * is reached by an index — `punches` twice, once by primary key and once by the partial unique
+   * index on `supersedes_id`, and `period_locks` by its primary key. A missed index on either
+   * `punches` join would make the queue's cost the pending set TIMES the whole punch history,
+   * which on this table is the biggest one in the schema.
+   *
+   * Asserted on the plan rather than on a timing, because a timing that passes on an empty test
+   * store proves nothing about a store with a year of punches in it. The query is read from the
+   * module under test, not restated here, so a change to the joins is a change to what is checked.
+   */
+  it("reaches every joined table by an index, so neither list scans punches", async () => {
+    const plans = await runInDurableObject(store, (instance) =>
+      // One bound parameter for the employee list, none for the queue. `EXPLAIN QUERY PLAN` needs
+      // the parameter supplied even though it runs nothing.
+      ([[PENDING_APPROVALS_QUERY, []], [SUBMISSIONS_FOR_EMPLOYEE_QUERY, [1]]] as const).map(
+        ([query, args]) =>
+          instance.sql
+            .exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`, ...args)
+            .toArray()
+            .map((step) => step.detail)));
+
+    for (const plan of plans) {
+      // Exactly one table is walked, and it is the one the WHERE clause narrows: `submissions`.
+      // `pendingApprovalsFor` then pays the authority prologue per surviving row, which is the
+      // cost its own comment measures. Everything the detail adds must be a point lookup on top of
+      // that — a `SCAN punches` here would make the cost the pending set times the punch history,
+      // and `punches` is the largest table in the schema by a wide margin.
+      expect(plan.filter((step) => step.startsWith("SCAN"))).toEqual(["SCAN s"]);
+      // Not merely "no scan": every join step must name the index it took, so that dropping
+      // `punches_supersedes_unique` (or the successor join ever being written in a way SQLite
+      // cannot prove satisfies that partial index) fails here rather than degrading quietly.
+      const searches = plan.filter((step) => step.startsWith("SEARCH"));
+      expect(searches).toHaveLength(4);
+      for (const step of searches) {
+        expect(step).toMatch(/USING (INTEGER PRIMARY KEY|(COVERING )?INDEX )/);
+      }
+      // And each of the four joined aliases is one of them: `a` the request, `t` the target punch,
+      // `c` the punch that superseded it, `pl` the period lock.
+      expect(searches.map((step) => step.split(" ")[1]).sort()).toEqual(["a", "c", "pl", "t"]);
+    }
   });
 
   it("shows the punch's new time when the target was superseded out of band", async () => {

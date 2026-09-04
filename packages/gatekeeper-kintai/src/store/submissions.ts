@@ -992,12 +992,38 @@ type SubmissionListRow = SubmissionColumns & AmendmentDetailColumns & {
   amendment_submission_id: number | null;
 };
 
-/** The submission columns, `${AMENDMENT_DETAIL_JOINS}`'s columns, and the discriminator. */
+/**
+ * The one FROM clause both lists read through: the submissions table, the request row for an
+ * amendment, and everything `AMENDMENT_DETAIL_JOINS` needs to describe it.
+ *
+ * `LEFT JOIN` at every step, without exception. These joins exist to DECORATE rows, and an inner
+ * join anywhere in here would silently drop overtime submissions from both lists — from the
+ * approval queue, where a dropped row is a request stranded in `pending` with nobody able to see
+ * it. That failure is invisible from the outside, which is why it is stated here rather than left
+ * to be read off the SQL.
+ */
+const SUBMISSION_LIST_FROM = `
+  FROM submissions s
+  LEFT JOIN amendment_requests a ON a.submission_id = s.id
+  ${AMENDMENT_DETAIL_JOINS}`;
+
 const SUBMISSION_LIST_COLUMNS =
   `s.*, a.submission_id AS amendment_submission_id, ${AMENDMENT_DETAIL_COLUMNS}`;
 
-const SUBMISSION_LIST_JOINS =
-  `LEFT JOIN amendment_requests a ON a.submission_id = s.id ${AMENDMENT_DETAIL_JOINS}`;
+/**
+ * The two list queries, named and exported so that `__tests__/submissions.test.ts` can check their
+ * plans against the query that actually runs rather than against a copy of it.
+ *
+ * Exported for that and nothing else — no caller outside this module executes them.
+ */
+export const SUBMISSIONS_FOR_EMPLOYEE_QUERY =
+  `SELECT ${SUBMISSION_LIST_COLUMNS} ${SUBMISSION_LIST_FROM}
+   WHERE s.employee_id = ? ORDER BY s.id DESC`;
+
+// submitted_at is caller-supplied and so is not monotonic; id breaks ties in insertion order.
+export const PENDING_APPROVALS_QUERY =
+  `SELECT ${SUBMISSION_LIST_COLUMNS} ${SUBMISSION_LIST_FROM}
+   WHERE s.state = 'pending' ORDER BY s.submitted_at, s.id`;
 
 /**
  * Split one joined row back into a `SubmissionRow`, with `amendment` attached only when there was
@@ -1039,13 +1065,7 @@ export function listSubmissionsFor(
   sql: SqlStorage, employeeId: EmployeeId,
 ): SubmissionRow[] {
   return sql
-    .exec<SubmissionListRow>(
-      `SELECT ${SUBMISSION_LIST_COLUMNS}
-       FROM submissions s
-       ${SUBMISSION_LIST_JOINS}
-       WHERE s.employee_id = ? ORDER BY s.id DESC`,
-      employeeId,
-    )
+    .exec<SubmissionListRow>(SUBMISSIONS_FOR_EMPLOYEE_QUERY, employeeId)
     .toArray()
     .map(withAmendmentDetail);
 }
@@ -1117,15 +1137,7 @@ function isQueueRefusal(err: unknown): boolean {
 export function pendingApprovalsFor(
   sql: SqlStorage, approverId: EmployeeId, now: number,
 ): SubmissionRow[] {
-  const pending = sql
-    .exec<SubmissionListRow>(
-      // submitted_at is caller-supplied and so is not monotonic; id breaks ties in insertion order.
-      `SELECT ${SUBMISSION_LIST_COLUMNS}
-       FROM submissions s
-       ${SUBMISSION_LIST_JOINS}
-       WHERE s.state = 'pending' ORDER BY s.submitted_at, s.id`,
-    )
-    .toArray();
+  const pending = sql.exec<SubmissionListRow>(PENDING_APPROVALS_QUERY).toArray();
 
   return pending
     // The joins supply DISPLAY DATA AND NEVER AUTHORITY. The filter is untouched by them: it is
