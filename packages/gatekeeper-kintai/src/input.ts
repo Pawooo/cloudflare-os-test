@@ -64,6 +64,30 @@ export function assertWorkDate(label: string, value: string): void {
   }
 }
 
+const PERIOD = /^\d{4}-\d{2}$/;
+
+/**
+ * A real JST calendar month in `YYYY-MM` form.
+ *
+ * `assertWorkDate`'s shape, one field shorter, and for the same reason: `"2026-13"` matches the
+ * pattern and `Date.parse` would roll it into next January rather than failing, and `"2026-1"` is
+ * simply not the form every period-keyed table (`period_locks`, and the `WHERE work_date LIKE ?`
+ * scans in `store/overview.ts`) is written against. That LIKE pattern is exactly why this is worth
+ * asserting rather than trusting: `periodOf` and `periodOfSql` never produce anything but a real
+ * `YYYY-MM`, so a malformed period reaching `daysWithPunches` is not a value those functions could
+ * have written -- it can only be a caller's mistake, and a wildcard character in it would change
+ * which rows the LIKE scan matches rather than simply finding none.
+ */
+export function assertPeriod(label: string, value: string): void {
+  if (typeof value !== "string" || !PERIOD.test(value)) {
+    throw new InvalidInputError(`${label} must be a calendar month in YYYY-MM form.`);
+  }
+  const parsed = new Date(`${value}-01T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 7) !== value) {
+    throw new InvalidInputError(`${label} is not a real calendar month: ${value}.`);
+  }
+}
+
 /** One of the four punch kinds; the schema's CHECKs are the backstop, not the message. */
 export function assertPunchKind(label: string, value: string): void {
   if (!(PUNCH_KINDS as readonly string[]).includes(value)) {

@@ -18,6 +18,10 @@ import {
 } from "./employees.js";
 import { listRoster } from "./roster.js";
 import {
+  anomalousDays, employeeDay, monthlyTotals,
+  type AnomalousDay, type EmployeeDay, type MonthlyReport,
+} from "./overview.js";
+import {
   assertApproverReachable, hasAuthorityOver, hasReachableApprover, listReportingLines, managersAt,
   setDelegate, setReportingLine,
   type ReportingLineRow,
@@ -108,6 +112,21 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
   /** The roster with the two computed onboarding columns, as of `at`. See `listRoster`. */
   async listRoster(at: number): Promise<RosterEntry[]> {
     return listRoster(this.sql, at);
+  }
+
+  /** Every (employee, day) in `period` with a non-empty anomaly list. See `anomalousDays`. */
+  async anomalousDays(period: string): Promise<AnomalousDay[]> {
+    return anomalousDays(this.sql, period);
+  }
+
+  /** Days worked, minutes credited and flagged days per employee for `period`. See `monthlyTotals`. */
+  async monthlyTotals(period: string): Promise<MonthlyReport> {
+    return monthlyTotals(this.sql, period);
+  }
+
+  /** One employee's one day: punches, flags and credited minutes. See `employeeDay`. */
+  async employeeDay(employeeId: EmployeeId, workDate: string): Promise<EmployeeDay> {
+    return employeeDay(this.sql, employeeId, workDate);
   }
 
   /** Whether an employee record exists. Departed employees still exist. */
