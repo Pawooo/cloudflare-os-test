@@ -1085,6 +1085,38 @@ describe("closing a month", () => {
     expect(await lockEntries("2025-09")).toEqual([]);
   });
 
+  /**
+   * The month names here are COMPUTED, not written down, because "in the future" is relative to
+   * the wall clock — which is also why this is the one lock test that cannot use a fixed 2025
+   * month. The scenario is HR closing 2026-08 on the last day of the month and typing 2027-08:
+   * the confirmation says closed, and nobody notices until August 2027, when every punch in the
+   * company is refused and there is no unlock.
+   */
+  it("refuses a month that has not happened yet, naming the month given and the current one",
+    async () => {
+      const { hr } = await closer("Mistyping Closer");
+      const current = jstWorkDate(Date.now()).slice(0, 7);
+      const year = Number(current.slice(0, 4));
+      const month = Number(current.slice(5));
+      // Both shapes worth refusing: the month after this one — the nearest thing to a legitimate
+      // request, and the boundary of the rule — and the mistyped year, which is the real accident.
+      const nextMonth = month === 12
+        ? `${year + 1}-01`
+        : `${year}-${String(month + 1).padStart(2, "0")}`;
+      const mistypedYear = `${year + 1}-${current.slice(5)}`;
+
+      for (const period of [nextMonth, mistypedYear]) {
+        const refusal: Error = await hr.lockPeriod(period).catch((error: Error) => error);
+
+        expect(refusal.message, period).toMatch(/KINTAI_FUTURE_PERIOD/);
+        expect(refusal.message, period).toContain(period);
+        expect(refusal.message, period).toContain(current);
+        // Nothing written, either half: no lock row, and no audit entry claiming a close.
+        expect(await store.periodLock(period), period).toBeNull();
+        expect(await lockEntries(period), period).toEqual([]);
+      }
+    });
+
   it("writes nothing for a malformed period", async () => {
     const { hr } = await closer("Typing Closer");
 

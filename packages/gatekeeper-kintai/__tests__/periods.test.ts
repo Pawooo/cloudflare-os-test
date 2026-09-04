@@ -59,6 +59,48 @@ describe("period locks", () => {
   });
 
   /**
+   * A MONTH THAT HAS NOT STARTED CANNOT BE CLOSED, and this is where that is refused.
+   *
+   * The hole this closes: `assertPeriod` accepts any well-formed `YYYY-MM`, `period_locks` has no
+   * unlock, and every write into a closed month is refused — so one mistyped year ("2027-08" for
+   * "2026-08") wrote a permanent row that would stop the whole company clocking in when that month
+   * arrived, a year later, with nothing but hand-editing the Durable Object to undo it.
+   *
+   * Judged against the CALLER's `now`, which is why this is testable at fixed instants rather than
+   * against the wall clock: the same `now` that will be written as `locked_at` is the one the
+   * period is compared with, so the refusal and the row can never disagree about what time it is.
+   * "Current or earlier", not "ended": closing the live month on its last day is the ordinary case.
+   */
+  it("refuses to close a month that has not started, against the caller's own clock", async () => {
+    // JUL is the 31st of July in JST, so August has not begun.
+    const refusal: Error = await store
+      .lockPeriod("2026-08", hr, JUL)
+      .catch((error: Error) => error);
+
+    expect(refusal.message).toMatch(/KINTAI_FUTURE_PERIOD/);
+    // Both months, so a reader who typed the wrong year can see it at once.
+    expect(refusal.message).toContain("2026-08");
+    expect(refusal.message).toContain("2026-07");
+    expect(await store.periodLock("2026-08")).toBeNull();
+
+    // One day later August has started, and the identical call is accepted — the boundary is the
+    // month edge itself, not "the month is over".
+    await store.lockPeriod("2026-08", hr, JUL + 86_400_000);
+    expect(await store.periodLock("2026-08")).toMatchObject({ lockedBy: hr });
+  });
+
+  // The shape is asserted here as well as at the admin boundary — the same imported
+  // `assertPeriod`, as `anomalousDays` and `monthlyTotals` already call it in this layer. It is
+  // the future check's precondition: without it, `"banana" > "2026-07"` would be true and a
+  // malformed period would be reported as a month that has not happened yet.
+  it("refuses a malformed period rather than writing a lock nothing could ever match", async () => {
+    await expect(() => store.lockPeriod("banana", hr, JUL))
+      .rejects.toThrow(/KINTAI_INVALID_INPUT/);
+
+    expect(await store.periodLock("banana")).toBeNull();
+  });
+
+  /**
    * A second close is REFUSED, and the first one survives it.
    *
    * This used to be an `INSERT OR IGNORE` that silently kept the first lock, on the reasoning that
