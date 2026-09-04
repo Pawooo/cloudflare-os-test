@@ -660,11 +660,20 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
    * employee record — `period_locks.locked_by` is NOT NULL — so that case is refused instead; see
    * `UnlinkedAdminError` for why the column is right and the refusal is not a workaround.
    *
-   * ALREADY-CLOSED IS NOT CHECKED HERE. It is refused by `lockPeriod` in `store/periods.ts`, in
-   * the same synchronous run as the INSERT, and that placement is the point: a check in this body
-   * would read over one RPC and write over another, so two admins pressing the button together
-   * would both be told they closed the month. See that function's comment. What this body does is
-   * make sure the refusal can happen at all — the read below is the audit entry's, not the rule's.
+   * TWO REFUSALS ARE NOT CHECKED HERE, and their absence is deliberate. A month ALREADY CLOSED,
+   * and a month THAT HAS NOT STARTED, are both refused by `lockPeriod` in `store/periods.ts`, in
+   * the same synchronous run as the INSERT. For already-closed that placement is the only correct
+   * one — a check in this body would read over one RPC and write over another, so two admins
+   * pressing the button together would both be told they closed the month. For the future bound it
+   * is a choice: a row in `period_locks` is permanent and refuses every write into its month, so
+   * one mistyped year would stop the whole company clocking in when that month arrived, and a
+   * guard on a write that cannot be undone belongs against the write rather than in front of the
+   * one caller that exists today. See that function's comment for both. What this body does is
+   * make sure the refusals can happen at all — the read below is the audit entry's, not a rule's.
+   *
+   * `assertPeriod` IS still called here, and it is not the store's copy repeated: this is the
+   * boundary that accepts a typed-in month, and refusing a form typo before a round trip is what
+   * it is for. The store asserts it again because its own two later checks depend on the shape.
    *
    * Read before the write, as `linkAccount`, `setDesignatedApprover` and `setWorkDatePolicy` all
    * do. `before` records the state this call changed FROM, read rather than assumed: an audit

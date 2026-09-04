@@ -12,6 +12,7 @@
  */
 
 import { PUNCH_KINDS } from "./types.js";
+import { jstWorkDate } from "./work-date.js";
 
 /**
  * Rejects malformed input at the untrusted boundary.
@@ -127,6 +128,67 @@ export function assertNotFuture(label: string, value: number, now: number): void
   }
   if (value > now) {
     throw new FutureOccurrenceError(label);
+  }
+}
+
+/**
+ * A month that has not started yet, offered as a month to close.
+ *
+ * `FutureOccurrenceError`'s sibling, and separate from `InvalidInputError` for the same reason:
+ * the value is well formed and the caller named the wrong one. Its own code, because the remedy is
+ * specific and an app should be able to say it — check the year.
+ *
+ * The message names BOTH months. The accident this exists for is a mistyped year ("2027-08" for
+ * "2026-08") on a control whose confirmation then reads "closed", so the one thing the reader
+ * needs is to see the month they asked for next to the month it actually is. The irreversibility
+ * is stated too, because it is what makes the mistake expensive rather than annoying.
+ */
+export class FuturePeriodError extends Error {
+  readonly code = "KINTAI_FUTURE_PERIOD";
+  constructor(label: string, value: string, current: string) {
+    super(
+      `KINTAI_FUTURE_PERIOD: ${label} ${value} has not started yet — the current month is ` +
+      `${current}. Check the year. A month can only be closed once it has begun, and closing ` +
+      `one cannot be undone.`,
+    );
+  }
+}
+
+/**
+ * A period that is the current JST month or an earlier one.
+ *
+ * WHY THIS BOUND EXISTS, and it is not hygiene: `period_locks` has no unlock anywhere in this
+ * package, and a closed month refuses every ordinary write into it. A period accepted here is
+ * therefore permanent, so a well-formed month a year away is not a harmless row — when it arrives,
+ * every `punch()` and every `setAllocations` in it is refused company-wide, and the only way back
+ * is editing the Durable Object by hand. `assertPeriod` cannot catch it: "2027-08" is a perfectly
+ * real calendar month.
+ *
+ * CURRENT OR EARLIER, deliberately, and not "the month must have ended". Closing the live month on
+ * its last day is the ordinary payroll case, and the admin dashboard's end-to-end does exactly
+ * that; a rule that waited for the month to be over would refuse the one close HR actually makes.
+ *
+ * `now` is a parameter rather than a `Date.now()` read inside, exactly as `assertNotFuture` takes
+ * one: the caller that will write `locked_at` passes the same instant it compares with, so the
+ * refusal and the row can never disagree about what time it is. It is checked for finiteness for
+ * `assertNotFuture`'s reason — every comparison with `NaN` is false, so one bad argument would
+ * silently switch the bound off rather than report it.
+ *
+ * The comparison is a STRING comparison, which is correct only because both sides are fixed-width
+ * zero-padded `YYYY-MM`: `assertPeriod` guarantees that of `value`, and `jstWorkDate` of `current`.
+ * Call `assertPeriod` first — the store's `lockPeriod` does — or "banana" reads as the future.
+ *
+ * The +9h offset is not restated here: the current month is `jstWorkDate` sliced, so there is one
+ * copy of that arithmetic (see `work-date.ts`) and this cannot drift from what a punch's work date
+ * would be at the same instant.
+ */
+export function assertNotFuturePeriod(label: string, value: string, now: number): void {
+  if (typeof now !== "number" || !Number.isFinite(now)) {
+    throw new InvalidInputError(`now must be a finite timestamp in milliseconds.`);
+  }
+  const current = jstWorkDate(now).slice(0, 7);
+  if (value > current) {
+    throw new FuturePeriodError(label, value, current);
   }
 }
 

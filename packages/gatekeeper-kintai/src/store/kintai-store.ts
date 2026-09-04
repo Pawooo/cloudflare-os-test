@@ -460,12 +460,16 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * Close `period`. Refuses one that is already closed, with `KINTAI_ALREADY_LOCKED`.
+   * Close `period`, and refuse the three periods that must never get a row: malformed
+   * (`KINTAI_INVALID_INPUT`), not started yet (`KINTAI_FUTURE_PERIOD`), already closed
+   * (`KINTAI_ALREADY_LOCKED`). See `lockPeriod`.
    *
-   * `period` is taken on trust here, as `employeeDay`'s work date is: the boundary that accepts a
-   * typed-in month asserts its shape (`AdminKintaiApi.lockPeriod`, via `assertPeriod`). Nothing
-   * else in the package reaches this — a malformed period would insert a lock row no `periodOf`
-   * could ever match.
+   * Unlike `employeeDay`'s work date, nothing here is taken on trust, and the reason is that a row
+   * in `period_locks` is permanent: this delegate is public to every worker-side caller, and a
+   * month closed by mistake refuses the whole company's punches with no unlock to undo it.
+   *
+   * `now` is the caller's, like every instant in this package, and it is what the future bound is
+   * measured against as well as what lands in `locked_at`.
    */
   async lockPeriod(period: string, lockedBy: EmployeeId, now: number): Promise<void> {
     lockPeriod(this.sql, period, lockedBy, now);

@@ -1,3 +1,4 @@
+import { assertNotFuturePeriod, assertPeriod } from "../input.js";
 import { jstClockTime, jstWorkDate } from "../work-date.js";
 import type { EmployeeId } from "../types.js";
 
@@ -77,18 +78,33 @@ export function isLocked(sql: SqlStorage, workDate: string): boolean {
 }
 
 /**
- * Close `period`, recording who closed it and when. Refuses a period that is already closed.
+ * Close `period`, recording who closed it and when.
  *
- * THE REFUSAL LIVES HERE, in the same synchronous run as the INSERT, and deliberately not at the
- * admin boundary that calls it. Two reasons, and the first is a race no boundary can close: a
- * check in `AdminKintaiApi.lockPeriod` would read `period_locks` over one RPC and write over
- * another, so two administrators pressing the button at the same moment would both read "open" and
- * both be told they closed the month — falsely for one of them, because there is only ever one
- * row. Here the read and the write are one turn of the store's input gate and nothing can arrive
- * between them. The second reason is ownership: whether a period is closed, and who closed it, is
- * this module's fact, and the refusal's message needs both.
+ * THREE REFUSALS, and all three are here rather than at the boundary that calls this: a malformed
+ * period, a month that has not started, and a month already closed. The reasoning is the same for
+ * all three and it starts from one property — a row in this table is PERMANENT. There is no unlock
+ * anywhere in this package, and a closed month refuses every ordinary write into it, so a bad row
+ * here is not a bad row: it is a company that cannot clock in, undoable only by editing the
+ * Durable Object by hand. A guard on an irreversible write belongs against the write.
  *
- * That is the OPPOSITE of where the ordinary write refusal lives. `assertWritable` is enforced by
+ * ALREADY-CLOSED could not be checked anywhere else, and that is the strongest of the three
+ * arguments: it is a race no boundary can close. A check in `AdminKintaiApi.lockPeriod` would read
+ * `period_locks` over one RPC and write over another, so two administrators pressing the button at
+ * the same moment would both read "open" and both be told they closed the month — falsely for one
+ * of them, because there is only ever one row. Here the read and the write are one turn of the
+ * store's input gate and nothing can arrive between them. Ownership says the same: whether a
+ * period is closed, and who closed it, is this module's fact, and the refusal's message needs both.
+ *
+ * THE FUTURE BOUND is not race-sensitive in that way — `now` is an argument, so there is nothing
+ * to re-read and a boundary check would compare the same instant it passes down. It is here for
+ * the other two reasons. Reach: this delegate is public on `KintaiStore`, so every worker-side
+ * caller present and future hits the wall, not only the one admin method that exists today.
+ * Precondition: the comparison is only sound after `assertPeriod`, and keeping the pair together
+ * is what stops a caller satisfying one and not the other. The RULE itself lives in `input.ts` as
+ * `assertNotFuturePeriod`, beside `assertNotFuture`, so this is a call to the one copy of it and
+ * not a fourth statement of what "in the future" means.
+ *
+ * ALL THREE SIT OPPOSITE where the ordinary write refusal lives. `assertWritable` is enforced by
  * the callers (`KintaiSession.punch`) rather than inside the store's write functions, because the
  * amendment path must be able to write into a closed period and reaches the store directly — the
  * store's writes therefore cannot enforce locks for everyone. Nothing needs a bypass for closing a
@@ -107,6 +123,14 @@ export function isLocked(sql: SqlStorage, workDate: string): boolean {
 export function lockPeriod(
   sql: SqlStorage, period: string, lockedBy: EmployeeId, now: number,
 ): void {
+  // Shape first, because the two checks after it both read `period` as a `YYYY-MM`: the future
+  // bound compares it as a string, and a lock row for "banana" is one no `periodOf` could ever
+  // match. The SAME imported `assertPeriod` the admin boundary calls, as `anomalousDays` and
+  // `monthlyTotals` already call it in this layer -- one rule, two layers, not two rules.
+  assertPeriod("period", period);
+  // Against the `now` that is about to be written as `locked_at`, so the refusal and the row can
+  // never disagree about what time it is.
+  assertNotFuturePeriod("period", period, now);
   const existing = periodLock(sql, period);
   if (existing) throw new AlreadyLockedError(period, existing);
   sql.exec(
