@@ -372,6 +372,53 @@ describe("AdminPage", () => {
     });
   });
 
+  // Overview and Monthly are placeholders until Tasks 5–6 wire them up; this describe pins the
+  // tab mechanism itself — which tab is default, what the buttons are labelled, and that flipping
+  // between tabs does not remount the Roster panel and lose whatever HR was mid-typing.
+  describe("the tab bar", () => {
+    it("defaults to 要対応, labels the other two, and marks only the active one selected",
+      async () => {
+        await render(<AdminPage api={adminApi({}, [TANAKA])} />);
+
+        const overview = field<HTMLButtonElement>('[data-testid="tab-overview"]');
+        const monthly = field<HTMLButtonElement>('[data-testid="tab-monthly"]');
+        const roster = field<HTMLButtonElement>('[data-testid="tab-roster"]');
+        expect(overview.textContent).toBe("要対応");
+        expect(monthly.textContent).toBe("月次");
+        expect(roster.textContent).toBe("Roster");
+        expect(overview.getAttribute("aria-selected")).toBe("true");
+        expect(monthly.getAttribute("aria-selected")).toBe("false");
+        expect(roster.getAttribute("aria-selected")).toBe("false");
+      });
+
+    it("shows the roster once its tab is clicked, and marks that tab selected", async () => {
+      await render(<AdminPage api={adminApi({}, [TANAKA])} />);
+
+      await click('[data-testid="tab-roster"]');
+
+      expect(field<HTMLButtonElement>('[data-testid="tab-roster"]').getAttribute("aria-selected"))
+        .toBe("true");
+      expect(field<HTMLButtonElement>('[data-testid="tab-overview"]').getAttribute("aria-selected"))
+        .toBe("false");
+      expect(text('[data-testid="roster-summary"]')).toBe("1 employee · all ready");
+    });
+
+    // The whole reason `hidden` was chosen over remounting: a form flipped away from and back to
+    // must not have forgotten what HR was typing into it.
+    it("keeps what was typed into a roster form when the tab is flipped away and back",
+      async () => {
+        await render(<AdminPage api={adminApi({}, [TANAKA, STRANDED])} />);
+        await click('[data-testid="tab-roster"]');
+
+        await type('[name="accountId"]', "acct-survives");
+
+        await click('[data-testid="tab-overview"]');
+        await click('[data-testid="tab-roster"]');
+
+        expect(field<HTMLInputElement>('[name="accountId"]').value).toBe("acct-survives");
+      });
+  });
+
   describe("the forms", () => {
     it("creates an employee with what was typed, trimmed", async () => {
       const api = adminApi();
