@@ -1,8 +1,10 @@
 import React, { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RosterEntry } from "../src/types";
-import AdminPage, { type KintaiAdminClient } from "./AdminPage";
+import AdminPage, {
+  type AnomalousDay, type KintaiAdminClient, type PendingItem, type PunchRow,
+} from "./AdminPage";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -63,6 +65,13 @@ function adminApi(overrides: Partial<KintaiAdminClient> = {}, roster: RosterEntr
     setDesignatedApprover: vi.fn<KintaiAdminClient["setDesignatedApprover"]>(async () => {}),
     grantExemption: vi.fn<KintaiAdminClient["grantExemption"]>(async () => {}),
     setWorkDatePolicy: vi.fn<KintaiAdminClient["setWorkDatePolicy"]>(async () => {}),
+    // The dashboard's three reads answer empty by default, so every roster test above renders a
+    // 要対応 tab in its "nothing waiting" state rather than having to say so.
+    listPendingOverview: vi.fn<KintaiAdminClient["listPendingOverview"]>(async () => []),
+    listAnomalousDays: vi.fn<KintaiAdminClient["listAnomalousDays"]>(async () => []),
+    getEmployeeDay: vi.fn<KintaiAdminClient["getEmployeeDay"]>(async () => ({
+      punches: [], anomalies: [], workedMinutes: 0,
+    })),
     ...overrides,
   };
 }
@@ -94,8 +103,84 @@ function viewerApi(overrides: Partial<KintaiAdminClient> = {}) {
     setWorkDatePolicy: vi.fn<KintaiAdminClient["setWorkDatePolicy"]>(async () => {
       throw REFUSED("setWorkDatePolicy");
     }),
+    listPendingOverview: vi.fn<KintaiAdminClient["listPendingOverview"]>(async () => {
+      throw REFUSED("listPendingOverview");
+    }),
+    listAnomalousDays: vi.fn<KintaiAdminClient["listAnomalousDays"]>(async () => {
+      throw REFUSED("listAnomalousDays");
+    }),
+    getEmployeeDay: vi.fn<KintaiAdminClient["getEmployeeDay"]>(async () => {
+      throw REFUSED("getEmployeeDay");
+    }),
     ...overrides,
   });
+}
+
+/**
+ * The one moment every 要調査 assertion is judged against.
+ *
+ * `Date.now` is stubbed rather than the timers faked: the only thing this screen reads a clock
+ * for is which month to ask `listAnomalousDays` about, and faking timers would also take away the
+ * microtask flushing every `act` here depends on. `waitingMs` comes off the wire already
+ * measured, so nothing about an age assertion depends on this.
+ */
+const NOW = Date.parse("2026-09-04T12:00:00+09:00");
+const HOUR = 60 * 60 * 1000;
+const DAY = 24 * HOUR;
+
+/** A waiting overtime request: three days old, with exactly one person able to decide it. */
+function waiting(overrides: Partial<PendingItem> = {}): PendingItem {
+  return {
+    id: 71,
+    employee_id: TANAKA.id,
+    kind: "overtime",
+    requested_for: "2026-09-01",
+    state: "pending",
+    submitted_at: NOW - 3 * DAY,
+    current_step: 0,
+    minutes: 150,
+    reason: "月末の締め作業",
+    calculation_inputs: null,
+    route_snapshot: "[]",
+    created_by: TANAKA.id,
+    employeeName: "Tanaka",
+    employeeNumber: "E-1001",
+    filedByName: "Tanaka",
+    waitingMs: 3 * DAY,
+    eligibleActorIds: [SUZUKI.id],
+    eligibleActorNames: ["Suzuki"],
+    ...overrides,
+  };
+}
+
+/** A waiting punch correction: 09:00 should have been 08:30. `minutes` is 0 and means nothing. */
+function correction(overrides: Partial<PendingItem> = {}): PendingItem {
+  return waiting({
+    id: 72,
+    kind: "amendment",
+    minutes: 0,
+    requested_for: "2026-09-02",
+    amendment: {
+      targetPunchId: 500,
+      currentOccurredAt: Date.parse("2026-09-02T09:00:00+09:00"),
+      requestedOccurredAt: Date.parse("2026-09-02T08:30:00+09:00"),
+      workDate: "2026-09-02",
+      kind: "in",
+      lockedPeriod: null,
+    },
+    ...overrides,
+  });
+}
+
+function flagged(overrides: Partial<AnomalousDay> = {}): AnomalousDay {
+  return {
+    employeeId: TANAKA.id,
+    displayName: "Tanaka",
+    employeeNumber: "E-1001",
+    workDate: "2026-09-02",
+    anomalies: ["unpaired_in"],
+    ...overrides,
+  };
 }
 
 describe("AdminPage", () => {
@@ -435,6 +520,359 @@ describe("AdminPage", () => {
 
         expect(field<HTMLInputElement>('[name="accountId"]').value).toBe("acct-survives");
       });
+  });
+
+  /**
+   * 要対応: what needs a human, and who that human is.
+   *
+   * Every assertion here is scoped to `[data-testid="panel-overview"]` rather than to the
+   * container. All three panels are mounted at once, so an unscoped query would happily find the
+   * Roster tab's copy of a row and pass while this panel rendered nothing at all — and section 3
+   * deliberately renders the SAME row component the roster does, which makes that failure mode
+   * more than theoretical.
+   */
+  describe("要対応, the queue an administrator opens this page for", () => {
+    beforeEach(() => {
+      vi.spyOn(Date, "now").mockReturnValue(NOW);
+    });
+
+    describe("approvals waiting", () => {
+      // Whose it is, who filed it, what it asks for, and how long it has sat there — the four
+      // things a triage read has to answer before an administrator can do anything about it.
+      it("names whose request it is, who filed it, and what it asks", async () => {
+        const api = adminApi({
+          listPendingOverview: vi.fn(async () => [waiting({ filedByName: "Suzuki" })]),
+        }, [TANAKA, SUZUKI]);
+        await render(<AdminPage api={api} />);
+
+        const request = pendingRow(71);
+        expect(request.textContent).toContain("Tanaka");
+        expect(request.textContent).toContain("E-1001");
+        expect(within(request, '[data-testid="filed-by"]')).toContain("Suzuki");
+        expect(within(request, '[data-testid="asks"]')).toContain("2h 30m");
+        expect(within(request, '[data-testid="asks"]')).toContain("2026-09-01");
+      });
+
+      // `created_by` is nullable and a null records that NO filer was captured. Reporting it as
+      // "filed by themself" would erase the one column that makes a filed-by-self stranding
+      // legible, so the row says the truth: nobody knows.
+      it("says the filer was not recorded rather than guessing it was the employee", async () => {
+        const api = adminApi({
+          listPendingOverview: vi.fn(async () => [waiting({ created_by: null, filedByName: null })]),
+        }, [TANAKA, SUZUKI]);
+        await render(<AdminPage api={api} />);
+
+        expect(within(pendingRow(71), '[data-testid="filed-by"]')).toContain("not recorded");
+      });
+
+      // The same comparison `describeCorrectionApproval` puts in front of the approver, in the
+      // same words: this punch says X, the employee says it should say Y. An amendment's
+      // `minutes` is 0 by design, so a row that rendered the overtime shape would report a
+      // request for zero minutes.
+      it("renders a correction as the comparison it is, not as zero minutes", async () => {
+        const api = adminApi({
+          listPendingOverview: vi.fn(async () => [correction()]),
+        }, [TANAKA, SUZUKI]);
+        await render(<AdminPage api={api} />);
+
+        const asks = within(pendingRow(72), '[data-testid="asks"]');
+        expect(asks).toContain("in 09:00 → 08:30");
+        expect(asks).toContain("2026-09-02");
+        expect(asks).not.toContain("0h");
+        expect(asks).not.toContain("minutes");
+        // And no closed-month marker: that month is open, and a marker on every row is noise.
+        expect(overviewMaybe('[data-submission="72"] [data-testid="closed-period"]')).toBeNull();
+      });
+
+      // An addition has no left-hand side. `describeCorrectionApproval` says "(none recorded)"
+      // rather than fabricating a 00:00 that would read as a punch that exists.
+      it("renders an added punch as an addition, with nothing on the left", async () => {
+        const api = adminApi({
+          listPendingOverview: vi.fn(async () => [correction({
+            amendment: {
+              targetPunchId: null,
+              currentOccurredAt: null,
+              requestedOccurredAt: Date.parse("2026-09-02T18:00:00+09:00"),
+              workDate: "2026-09-02",
+              kind: "out",
+              lockedPeriod: null,
+            },
+          })]),
+        }, [TANAKA, SUZUKI]);
+        await render(<AdminPage api={api} />);
+
+        expect(within(pendingRow(72), '[data-testid="asks"]'))
+          .toContain("out added at 18:00 (none recorded)");
+      });
+
+      // Applying an approved correction is the only write allowed into a closed month, and a
+      // month is closed precisely when somebody has already been paid on its totals.
+      it("marks a correction that would write into a closed month", async () => {
+        const api = adminApi({
+          listPendingOverview: vi.fn(async () => [correction({
+            amendment: {
+              targetPunchId: 500,
+              currentOccurredAt: Date.parse("2026-08-31T09:00:00+09:00"),
+              requestedOccurredAt: Date.parse("2026-08-31T08:30:00+09:00"),
+              workDate: "2026-08-31",
+              kind: "in",
+              lockedPeriod: "2026-08",
+            },
+          })]),
+        }, [TANAKA, SUZUKI]);
+        await render(<AdminPage api={api} />);
+
+        const closed = within(pendingRow(72), '[data-testid="closed-period"]');
+        expect(closed).toContain("2026-08");
+        expect(closed).toContain("closed");
+      });
+
+      it("names who can decide each request", async () => {
+        const api = adminApi({
+          listPendingOverview: vi.fn(async () => [waiting({
+            eligibleActorIds: [SUZUKI.id, 4], eligibleActorNames: ["Suzuki", "Kato"],
+          })]),
+        }, [TANAKA, SUZUKI]);
+        await render(<AdminPage api={api} />);
+
+        const deciders = within(pendingRow(71), '[data-testid="deciders"]');
+        expect(deciders).toContain("Suzuki");
+        expect(deciders).toContain("Kato");
+        expect(overviewMaybe('[data-submission="71"] [data-testid="stranded"]')).toBeNull();
+      });
+
+      /**
+       * THE ROW THIS SECTION EXISTS FOR.
+       *
+       * `pendingOverview` is the one read in the system that can see a submission nobody may act
+       * on: every other surface is scoped to a person, so a stranded request appears on none of
+       * them and sat in `pending` unseen. Rendering an empty decider list as an empty cell would
+       * reproduce that invisibility on the one screen that can see it.
+       */
+      it("warns loudly, and names the fix, when nobody can decide a request", async () => {
+        const api = adminApi({
+          listPendingOverview: vi.fn(async () => [waiting({
+            eligibleActorIds: [], eligibleActorNames: [],
+          })]),
+        }, [TANAKA, SUZUKI]);
+        await render(<AdminPage api={api} />);
+
+        const stranded = overview('[data-submission="71"] [data-testid="stranded"]');
+        expect(stranded.textContent).toContain("Nobody can decide this");
+        // The fix, in words HR can act on, and naming the employee rather than an id.
+        expect(stranded.textContent).toContain("Tanaka");
+        expect(stranded.textContent).toContain("designated approver");
+        expect(stranded.textContent).not.toMatch(/employee \d/);
+        // Loud: an alert, not a quiet subtitle, and never an empty decider cell instead.
+        expect(stranded.getAttribute("role")).toBe("alert");
+        expect(overviewMaybe('[data-submission="71"] [data-testid="deciders"]')).toBeNull();
+      });
+
+      // Coarse buckets, deliberately: an age that ticks would rerender the whole queue every
+      // second to tell an administrator something they cannot act on that precisely.
+      it("ages a request in coarse buckets rather than to the second", async () => {
+        const api = adminApi({
+          listPendingOverview: vi.fn(async () => [
+            waiting({ id: 71, waitingMs: 3 * DAY + 4 * HOUR }),
+            waiting({ id: 72, waitingMs: 5 * HOUR + 40 * 60 * 1000 }),
+            waiting({ id: 73, waitingMs: 12 * 60 * 1000 }),
+          ]),
+        }, [TANAKA, SUZUKI]);
+        await render(<AdminPage api={api} />);
+
+        expect(within(pendingRow(71), '[data-testid="waiting"]')).toBe("3日");
+        expect(within(pendingRow(72), '[data-testid="waiting"]')).toBe("5時間");
+        expect(within(pendingRow(73), '[data-testid="waiting"]')).toBe("1時間未満");
+      });
+
+      // A blank dashboard must read as good news rather than as a screen that failed to load.
+      it("says plainly that nothing is waiting", async () => {
+        await render(<AdminPage api={adminApi({}, [TANAKA, SUZUKI])} />);
+
+        expect(within(overview('[data-testid="pending-section"]'), '[data-testid="pending-empty"]'))
+          .toContain("承認待ちはありません");
+      });
+
+      // One section failing must not take out the other two: an administrator who cannot read
+      // the queue can still see the flagged days and the broken roster rows.
+      it("reports a failed read beside the section that failed, and keeps the rest", async () => {
+        const api = adminApi({
+          listPendingOverview: vi.fn(async () => { throw new Error("connection lost"); }),
+          listAnomalousDays: vi.fn(async () => [flagged()]),
+        }, [TANAKA, SUZUKI]);
+        await render(<AdminPage api={api} />);
+
+        expect(overview('[data-testid="pending-error"]').textContent).toContain("承認待ち");
+        expect(overviewMaybe('[data-day="1:2026-09-02"]')).not.toBeNull();
+        expect(container!.querySelector('[data-testid="error"]')).toBeNull();
+      });
+    });
+
+    describe("days that need a look", () => {
+      it("asks for the current month, grouped by employee, with the flags themselves", async () => {
+        const api = adminApi({
+          listAnomalousDays: vi.fn(async () => [
+            flagged({ workDate: "2026-09-01", anomalies: ["unpaired_in"] }),
+            flagged({ workDate: "2026-09-02", anomalies: ["orphan_out", "long_span"] }),
+            flagged({
+              employeeId: SUZUKI.id, displayName: "Suzuki", employeeNumber: "E-1002",
+              workDate: "2026-09-03", anomalies: ["duplicate_in"],
+            }),
+          ]),
+        }, [TANAKA, SUZUKI]);
+        await render(<AdminPage api={api} />);
+
+        expect(api.listAnomalousDays).toHaveBeenCalledWith("2026-09");
+        // Two groups, one per employee, each naming the person once rather than on every row.
+        expect(overviewAll('[data-anomaly-employee]')).toHaveLength(2);
+        expect(overview('[data-anomaly-employee="1"]').textContent).toContain("Tanaka");
+        expect(overviewAll('[data-anomaly-employee="1"] [data-day]')).toHaveLength(2);
+        // The flags, as sentences rather than as column names.
+        expect(within(overview('[data-day="1:2026-09-01"]'), '[data-testid="flags"]'))
+          .toContain("退勤打刻なし");
+        const both = within(overview('[data-day="1:2026-09-02"]'), '[data-testid="flags"]');
+        expect(both).toContain("出勤打刻のない退勤");
+        expect(both).toContain("14時間以上の勤務");
+      });
+
+      // Lazily: one `getEmployeeDay` per row expanded, and none for a queue nobody opened. The
+      // read is punch-level, so a dashboard that prefetched every flagged day would pull the
+      // whole company's clock times to render a list of dates.
+      it("reads the punches only when a day is expanded", async () => {
+        const api = adminApi({
+          listAnomalousDays: vi.fn(async () => [flagged()]),
+          getEmployeeDay: vi.fn(async () => ({
+            punches: [
+              punch({ id: 1, kind: "in", occurred_at: Date.parse("2026-09-02T09:00:00+09:00") }),
+              punch({
+                id: 2, kind: "out", occurred_at: Date.parse("2026-09-02T18:30:00+09:00"),
+                source: "admin",
+              }),
+            ],
+            anomalies: ["unpaired_in"],
+            workedMinutes: 510,
+          })),
+        }, [TANAKA, SUZUKI]);
+        await render(<AdminPage api={api} />);
+
+        expect(api.getEmployeeDay).not.toHaveBeenCalled();
+        expect(overviewMaybe('[data-day="1:2026-09-02"] [data-testid="day-detail"]')).toBeNull();
+
+        await click('[data-testid="panel-overview"] [data-day="1:2026-09-02"] [data-action="expand-day"]');
+
+        expect(api.getEmployeeDay).toHaveBeenCalledWith(1, "2026-09-02");
+        const detail = overview('[data-day="1:2026-09-02"] [data-testid="day-detail"]');
+        expect(detail.textContent).toContain("in");
+        expect(detail.textContent).toContain("09:00");
+        expect(detail.textContent).toContain("18:30");
+        expect(detail.textContent).toContain("admin");
+        expect(detail.textContent).toContain("8h 30m");
+      });
+
+      it("does not read the same day twice, and closes again on a second press", async () => {
+        const api = adminApi({ listAnomalousDays: vi.fn(async () => [flagged()]) }, [TANAKA]);
+        await render(<AdminPage api={api} />);
+        const button = '[data-testid="panel-overview"] [data-day="1:2026-09-02"] [data-action="expand-day"]';
+
+        await click(button);
+        await click(button);
+        await click(button);
+
+        expect(api.getEmployeeDay).toHaveBeenCalledTimes(1);
+        expect(overviewMaybe('[data-day="1:2026-09-02"] [data-testid="day-detail"]')).not.toBeNull();
+      });
+
+      // Reading a day is not deciding anything. The only writes this screen offers are the
+      // roster repairs in section 3, and a "fix this" control here would be a promise the
+      // amendment flow — which belongs to the employee and their approver — does not keep.
+      it("offers no decide or repair control on a flagged day", async () => {
+        const api = adminApi({
+          listAnomalousDays: vi.fn(async () => [flagged()]),
+        }, [TANAKA, SUZUKI]);
+        await render(<AdminPage api={api} />);
+
+        const actions = [...overview('[data-day="1:2026-09-02"]')
+          .querySelectorAll<HTMLButtonElement>("button")].map((b) => b.dataset.action);
+        expect(actions).toEqual(["expand-day"]);
+      });
+
+      it("says plainly that no day is flagged", async () => {
+        await render(<AdminPage api={adminApi({}, [TANAKA, SUZUKI])} />);
+
+        expect(within(overview('[data-testid="anomalies-section"]'), '[data-testid="anomalies-empty"]'))
+          .toContain("フラグの立った勤務日はありません");
+      });
+    });
+
+    describe("the roster rows that block people from using Kintai", () => {
+      // The SAME component the Roster tab renders, not a second description of readiness. Pinned
+      // by asserting on the row's own `data-issue` markers and its repair buttons: a copy would
+      // drift the first time one of them changed.
+      it("renders the not-ready rows, with the repair buttons the roster offers", async () => {
+        await render(<AdminPage api={adminApi({}, [TANAKA, SUZUKI, STRANDED])} />);
+
+        const blocked = overview(`[data-employee="${STRANDED.id}"]`);
+        expect(blocked.querySelector('[data-issue="no-approver"]')).not.toBeNull();
+        expect(blocked.querySelector('[data-action="manager-for-this"]')).not.toBeNull();
+        expect(blocked.querySelector('[data-action="approver-for-this"]')).not.toBeNull();
+        // Word for word what the roster's own row says, because it IS the roster's own row.
+        expect(blocked.querySelector('[data-issue="no-approver"]')!.textContent)
+          .toBe(row(STRANDED.id).querySelector('[data-issue="no-approver"]')!.textContent);
+        // Only the rows that are actually blocked: a ready employee is not a thing to do.
+        expect(overviewAll("[data-employee]")).toHaveLength(1);
+      });
+
+      // The repair form lives in the Roster panel, which is `hidden` while 要対応 is open —
+      // focusing a field inside a hidden subtree does nothing in a real browser. So the fix has
+      // to bring the reader to the form, not just quietly preselect somebody.
+      it("takes the reader to the form, on the right employee, when a fix is pressed", async () => {
+        const api = adminApi({}, [TANAKA, SUZUKI, STRANDED]);
+        await render(<AdminPage api={api} />);
+
+        await click(`[data-testid="panel-overview"] [data-employee="${STRANDED.id}"] [data-action="approver-for-this"]`);
+
+        expect(field<HTMLElement>('[data-testid="panel-roster"]').hidden).toBe(false);
+        expect(field<HTMLButtonElement>('[data-testid="tab-roster"]').getAttribute("aria-selected"))
+          .toBe("true");
+        await choose('[data-form="set-designated-approver"] [name="approverId"]', "1");
+        await submit("set-designated-approver");
+        expect(api.setDesignatedApprover).toHaveBeenCalledWith(STRANDED.id, 1);
+      });
+
+      it("says plainly that nobody is blocked", async () => {
+        await render(<AdminPage api={adminApi({}, [TANAKA, SUZUKI])} />);
+
+        expect(within(overview('[data-testid="blockers-section"]'), '[data-testid="blockers-empty"]'))
+          .toContain("全員 Kintai を使える状態です");
+      });
+
+      it("says there is nobody yet rather than claiming everyone is ready", async () => {
+        await render(<AdminPage api={adminApi({}, [])} />);
+
+        expect(within(overview('[data-testid="blockers-section"]'), '[data-testid="blockers-empty"]'))
+          .toContain("従業員がまだ登録されていません");
+      });
+    });
+
+    // All three panels are mounted from the first render, so this tab's reads must not wait for
+    // it to be looked at — and must not fire again every time it is. A visibility hack that
+    // fetched on focus would do both wrongly.
+    it("reads once on mount, hidden or not, and never again on a tab flip", async () => {
+      const api = adminApi({
+        listPendingOverview: vi.fn(async () => [waiting()]),
+        listAnomalousDays: vi.fn(async () => [flagged()]),
+      }, [TANAKA, SUZUKI]);
+      await render(<AdminPage api={api} />);
+
+      await click('[data-testid="tab-roster"]');
+      await click('[data-testid="tab-monthly"]');
+      await click('[data-testid="tab-overview"]');
+
+      expect(api.listPendingOverview).toHaveBeenCalledTimes(1);
+      expect(api.listAnomalousDays).toHaveBeenCalledTimes(1);
+      // And the rows survived being flipped away from, like the roster forms do.
+      expect(overviewMaybe('[data-submission="71"]')).not.toBeNull();
+    });
   });
 
   describe("the forms", () => {
@@ -885,8 +1323,62 @@ describe("AdminPage", () => {
     return field(selector).textContent ?? "";
   }
 
+  /**
+   * A roster row, scoped to the Roster panel.
+   *
+   * Scoped deliberately: 要対応's third section renders the same `RosterRow` component for every
+   * employee who is not ready, and that panel comes FIRST in the document. An unscoped
+   * `[data-employee]` query would have silently started resolving to the overview's copy the
+   * moment that section landed, and a roster assertion would then have been passing about the
+   * wrong tab.
+   */
   function row(employeeId: number): HTMLElement {
-    return field<HTMLElement>(`[data-employee="${employeeId}"]`);
+    return field<HTMLElement>(`[data-testid="panel-roster"] [data-employee="${employeeId}"]`);
+  }
+
+  /** Anything inside the 要対応 panel. See that describe's comment for why nothing is unscoped. */
+  function overview(selector: string): HTMLElement {
+    return field<HTMLElement>(`[data-testid="panel-overview"] ${selector}`);
+  }
+
+  function overviewMaybe(selector: string): HTMLElement | null {
+    return container!.querySelector<HTMLElement>(`[data-testid="panel-overview"] ${selector}`);
+  }
+
+  function overviewAll(selector: string): HTMLElement[] {
+    return [...container!.querySelectorAll<HTMLElement>(
+      `[data-testid="panel-overview"] ${selector}`,
+    )];
+  }
+
+  function pendingRow(submissionId: number): HTMLElement {
+    return overview(`[data-submission="${submissionId}"]`);
+  }
+
+  /** The text of one part of a row, or of the row itself when `selector` is empty. */
+  function within(node: HTMLElement, selector: string): string {
+    const target = selector === "" ? node : node.querySelector(selector);
+    if (!target) throw new Error(`Missing ${selector} inside ${node.dataset.submission ?? "node"}`);
+    return target.textContent ?? "";
+  }
+
+  /** One current punch as `getEmployeeDay` returns it. */
+  function punch(overrides: Partial<PunchRow> & Pick<PunchRow, "id" | "kind" | "occurred_at">) {
+    return {
+      employee_id: TANAKA.id,
+      work_date: "2026-09-02",
+      recorded_at: overrides.occurred_at,
+      source: "gadget" as const,
+      latitude: null,
+      longitude: null,
+      accuracy_m: null,
+      location_source: null,
+      matched_site_id: null,
+      supersedes_id: null,
+      amended_by: null,
+      amend_reason: null,
+      ...overrides,
+    };
   }
 
   async function click(selector: string): Promise<void> {
