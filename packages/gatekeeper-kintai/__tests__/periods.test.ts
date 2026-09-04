@@ -58,14 +58,33 @@ describe("period locks", () => {
     expect(await store.isLocked("2026-08-01")).toBe(false);
   });
 
-  it("preserves the original lock when the same period is locked twice", async () => {
+  /**
+   * A second close is REFUSED, and the first one survives it.
+   *
+   * This used to be an `INSERT OR IGNORE` that silently kept the first lock, on the reasoning that
+   * a duplicate call is harmless. Keeping the first close is still right and this still keeps it —
+   * but a silent no-op is indistinguishable from success to whoever called, and now that an
+   * administrator can press "close this month" there is somebody to mislead. The refusal is here,
+   * in the same synchronous run as the INSERT, rather than at the admin boundary: a check over one
+   * RPC and a write over another would let two admins pressing the button at once both be told
+   * they closed the month, when only one row exists.
+   */
+  it("refuses a second close of the same period, and keeps the first", async () => {
     const other = await store.createEmployee({
       employeeNumber: "HR2", displayName: "Other HR", joinedOn: "2026-04-01",
     });
-
     await store.lockPeriod("2026-07", hr, JUL);
-    await store.lockPeriod("2026-07", other, JUL + 1000 * 60 * 60 * 24);
 
+    const refusal: Error = await store
+      .lockPeriod("2026-07", other, JUL + 86_400_000)
+      .catch((error: Error) => error);
+
+    // Who closed it and when, in JST, because that is what tells the reader whether this was them
+    // a moment ago or somebody else last week.
+    expect(refusal.message).toMatch(/KINTAI_ALREADY_LOCKED/);
+    expect(refusal.message).toContain("2026-07");
+    expect(refusal.message).toContain(`employee ${hr}`);
+    expect(refusal.message).toContain("2026-07-31");
     expect(await store.periodLock("2026-07")).toEqual({ lockedAt: JUL, lockedBy: hr });
   });
 });

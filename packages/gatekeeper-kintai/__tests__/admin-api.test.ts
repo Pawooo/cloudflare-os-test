@@ -1,6 +1,7 @@
 import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { AdminKintaiApi, ViewerKintaiApi } from "../src/admin-api.js";
+import { jstWorkDate } from "../src/work-date.js";
 
 // The HR admin surface, reached the way the Workshop reaches it: `KintaiAccount.startAppUi({
 // isAdmin })` hands back a capability, and the iframe can only ever call what that capability
@@ -48,6 +49,62 @@ async function employee(tag: string) {
   });
 }
 
+/** A caller's view of the session a Gadget holds, so a test can attempt an ordinary punch. */
+function sessionFor(accountId: string) {
+  return new Proxy({} as Record<string, (...args: unknown[]) => Promise<any>>, {
+    get(_target, method) {
+      if (typeof method !== "string" || method === "then") return undefined;
+      return (...args: unknown[]) =>
+        host.callSession(accountId, `session-${accountId}-${seq}`, method, args);
+    },
+  }) as any;
+}
+
+/**
+ * One employee with a manager, a worked day, a flagged day, a pending overtime request and a
+ * pending correction — the smallest store state in which all four attendance reads return
+ * something.
+ *
+ * `period` is a parameter, and every test that calls this passes its OWN month. This file shares
+ * one store (`getByName("")`, matching production, because that is the instance the account
+ * resolves) and there is no unlock anywhere in this package, so a test that closes a month closes
+ * it for every test that runs after it. Months are therefore rationed here rather than reused.
+ */
+async function attendance(tag: string, period: string) {
+  const worker = await employee(`${tag}-worker`);
+  const boss = await employee(`${tag}-boss`);
+  await store.setReportingLine(worker, boss, 0);
+
+  // 09:00 JST on the second of the month, out eight hours later: one complete, unflagged day.
+  const day = `${period}-02`;
+  const nine = Date.parse(`${day}T00:00:00Z`);
+  await store.recordPunch({
+    employeeId: worker, workDate: day, kind: "in", now: nine, source: "gadget",
+  });
+  const outId = await store.recordPunch({
+    employeeId: worker, workDate: day, kind: "out", now: nine + 8 * 3_600_000, source: "gadget",
+  });
+  // The next day, a clock-in and nothing else: `unpaired_in`, which is what the flagged-day read
+  // exists to surface.
+  const flaggedDay = `${period}-03`;
+  await store.recordPunch({
+    employeeId: worker, workDate: flaggedDay, kind: "in", now: nine + 86_400_000,
+    source: "gadget",
+  });
+
+  const overtimeId = await store.submitOvertime({
+    employeeId: worker, requestedFor: day, minutes: 120, reason: "site overrun",
+    now: nine + 9 * 3_600_000, department: null, employmentType: null,
+  });
+  const correctionId = await store.fileAmendment({
+    employeeId: worker, targetPunchId: outId, occurredAt: nine + 9 * 3_600_000,
+    reason: "left at six; the terminal was tapped when clocking out at five",
+    now: nine + 10 * 3_600_000, department: null, employmentType: null, createdBy: worker,
+  });
+
+  return { worker, boss, day, flaggedDay, nine, outId, overtimeId, correctionId };
+}
+
 // Valid arguments for every member of `KintaiAdminApi`, so a refusal can only come from the
 // authorization shape and never from argument validation running first.
 const CALL_ARGS: Record<string, unknown[]> = {
@@ -60,6 +117,14 @@ const CALL_ARGS: Record<string, unknown[]> = {
   setDesignatedApprover: [1, 2],
   grantExemption: [1],
   setWorkDatePolicy: [1, "shift_start"],
+  listPendingOverview: [],
+  listAnomalousDays: ["2026-07"],
+  monthlyReport: ["2026-07"],
+  getEmployeeDay: [1, "2026-07-03"],
+  // A month nothing else in this file closes. A non-admin's call never reaches the write, but a
+  // period named here must still be one no later test wants open, because a refusal that stopped
+  // working would silently close it.
+  lockPeriod: ["2026-11"],
 };
 
 /**
@@ -70,7 +135,8 @@ const CALL_ARGS: Record<string, unknown[]> = {
  * interface means adding it here and deciding what it does to a non-admin.
  */
 const INTERFACE_MEMBERS = [
-  "createEmployee", "grantExemption", "linkAccount", "listEmployees", "listReportingLines",
+  "createEmployee", "getEmployeeDay", "grantExemption", "linkAccount", "listAnomalousDays",
+  "listEmployees", "listPendingOverview", "listReportingLines", "lockPeriod", "monthlyReport",
   "setDesignatedApprover", "setReportingLine", "setWorkDatePolicy", "whoAmI",
 ];
 
@@ -96,6 +162,41 @@ const RETURN_SHAPES: Record<string, string[]> = {
     "status", "work_date_policy",
   ],
   listReportingLines: ["employee_id", "id", "manager_id", "valid_from", "valid_to"],
+  listAnomalousDays: ["anomalies", "displayName", "employeeId", "employeeNumber", "workDate"],
+  monthlyReport: ["locked", "period", "rows"],
+  getEmployeeDay: ["anomalies", "punches", "workedMinutes"],
+  // Every column of `submissions` plus the six the dashboard adds. An amendment row carries one
+  // more key, `amendment`, and ABSENCE of it is the discriminator — see the assertion below.
+  listPendingOverview: [
+    "calculation_inputs", "created_by", "current_step", "eligibleActorIds", "eligibleActorNames",
+    "employeeName", "employeeNumber", "employee_id", "filedByName", "id", "kind", "minutes",
+    "reason", "requested_for", "route_snapshot", "state", "submitted_at", "waitingMs",
+  ],
+};
+
+/**
+ * The shapes NESTED inside the four attendance reads, pinned for the same reason as the top-level
+ * ones.
+ *
+ * These are where the widening actually lands. `monthlyReport` and `getEmployeeDay` hand back
+ * objects whose interesting fields are one level down — a punch row is fifteen columns of one
+ * named person's day, including where they were standing — so a pin on the three or four keys at
+ * the top would say almost nothing about what leaves the worker. A field added to `PunchRow`, or
+ * to the amendment detail, must be a decision made in this file.
+ */
+const NESTED_RETURN_SHAPES: Record<string, string[]> = {
+  monthlyRow: [
+    "anomalousDays", "daysWorked", "displayName", "employeeId", "employeeNumber", "workedMinutes",
+  ],
+  punchRow: [
+    "accuracy_m", "amend_reason", "amended_by", "employee_id", "id", "kind", "latitude",
+    "location_source", "longitude", "matched_site_id", "occurred_at", "recorded_at", "source",
+    "supersedes_id", "work_date",
+  ],
+  amendmentDetail: [
+    "currentOccurredAt", "kind", "lockedPeriod", "requestedOccurredAt", "targetPunchId",
+    "workDate",
+  ],
 };
 
 /** The names a caller can actually invoke on `cls` over RPC. */
@@ -199,6 +300,62 @@ describe("the capability a non-admin receives", () => {
         employeeNumber: `E-shape-${seq}`, displayName: "Shaped", joinedOn: "2026-04-01",
       })).toBe("number");
     });
+
+  /**
+   * The same pin for the four attendance reads, which needed a store with attendance in it.
+   *
+   * Separate from the test above rather than folded into it: these four return nothing at all
+   * until somebody has punched, been flagged and filed something, so the seeding is most of the
+   * test. The point is unchanged — every field these hand the browser is written down here, in the
+   * file a reviewer opens to see what this surface exposes, and this is the surface that reads the
+   * whole company's worked hours.
+   */
+  it("returns exactly the fields written down for each attendance read", async () => {
+    // Linked, because `lockPeriod` records who closed the month and refuses an admin who has no
+    // employee record to be that person. See "closing a month" below.
+    const adminAccount = `acct-shape-attendance-${seq}`;
+    await store.linkAccount(adminAccount, await employee("Shape Admin"), Date.now());
+    const hr = appUi(adminAccount, true);
+    const { worker, day, correctionId } = await attendance("shape", "2026-06");
+
+    for (const [method, args] of [
+      ["listAnomalousDays", ["2026-06"]], ["listPendingOverview", []],
+    ] as [string, unknown[]][]) {
+      const rows = await hr[method](...args);
+      expect(rows.length, `${method} returned nothing to inspect`).toBeGreaterThan(0);
+      for (const row of rows) {
+        // An amendment row carries the request's own detail and an overtime row does not, so the
+        // discriminator is part of the pin rather than something the comparison tolerates.
+        const expected = row.kind === "amendment"
+          ? [...RETURN_SHAPES[method], "amendment"].toSorted()
+          : RETURN_SHAPES[method];
+        expect(Object.keys(row).toSorted(), method).toEqual(expected);
+      }
+    }
+
+    const report = await hr.monthlyReport("2026-06");
+    expect(Object.keys(report).toSorted()).toEqual(RETURN_SHAPES.monthlyReport);
+    expect(report.rows.length, "monthlyReport returned no rows").toBeGreaterThan(0);
+    for (const row of report.rows) {
+      expect(Object.keys(row).toSorted()).toEqual(NESTED_RETURN_SHAPES.monthlyRow);
+    }
+
+    const employeeDay = await hr.getEmployeeDay(worker, day);
+    expect(Object.keys(employeeDay).toSorted()).toEqual(RETURN_SHAPES.getEmployeeDay);
+    expect(employeeDay.punches.length, "getEmployeeDay returned no punches").toBeGreaterThan(0);
+    for (const punch of employeeDay.punches) {
+      expect(Object.keys(punch).toSorted()).toEqual(NESTED_RETURN_SHAPES.punchRow);
+    }
+
+    const correction = (await hr.listPendingOverview())
+      .find((item: { id: number }) => item.id === correctionId)!;
+    expect(Object.keys(correction.amendment).toSorted())
+      .toEqual(NESTED_RETURN_SHAPES.amendmentDetail);
+
+    // The one new write answers with nothing, like every other write here. Its own month, because
+    // closing one is permanent for the rest of this file.
+    expect(await hr.lockPeriod("2026-12")).toBeUndefined();
+  });
 
   it("still answers whoAmI, which is how an employee reads their code for HR", async () => {
     const accountId = `acct-unlinked-${seq}`;
@@ -725,6 +882,221 @@ describe("recording an employee's work-date policy", () => {
   });
 });
 
+describe("the attendance an admin can now read", () => {
+  // The four reads are unit-tested at store level in `overview.test.ts`; what is asserted here is
+  // that the ADMIN CAPABILITY reaches them and hands back what was actually seeded — the boundary,
+  // not the composition. Each test asks about its own month, for the reason `attendance` explains.
+  it("lists the flagged days of a month, with the flags themselves", async () => {
+    const hr = appUi(`acct-admin-flags-${seq}`, true);
+    const { worker, flaggedDay } = await attendance("flags", "2026-03");
+
+    const days = await hr.listAnomalousDays("2026-03");
+
+    expect(days.filter((row: { employeeId: number }) => row.employeeId === worker)).toEqual([
+      expect.objectContaining({
+        employeeId: worker, workDate: flaggedDay, anomalies: ["unpaired_in"],
+        displayName: "flags-worker",
+      }),
+    ]);
+  });
+
+  it("reports the month per employee, and whether it is closed", async () => {
+    const hr = appUi(`acct-admin-month-${seq}`, true);
+    const { worker } = await attendance("month", "2026-04");
+
+    const report = await hr.monthlyReport("2026-04");
+
+    expect(report).toMatchObject({ period: "2026-04", locked: false });
+    expect(report.rows.find((row: { employeeId: number }) => row.employeeId === worker))
+      .toMatchObject({
+        employeeNumber: `month-worker-a${seq}`, daysWorked: 2, workedMinutes: 480,
+        anomalousDays: 1,
+      });
+  });
+
+  // The punch-level read, and the whole reason the interface header now carries a paragraph about
+  // what this capability sees: one named person's clock times on one named day.
+  it("shows one employee's day: the punches, the flags and the credited minutes", async () => {
+    const hr = appUi(`acct-admin-day-${seq}`, true);
+    const { worker, day, flaggedDay, nine } = await attendance("day", "2026-05");
+
+    const worked = await hr.getEmployeeDay(worker, day);
+    expect(worked.punches.map((punch: { kind: string }) => punch.kind)).toEqual(["in", "out"]);
+    expect(worked.punches[0].occurred_at).toBe(nine);
+    expect(worked.anomalies).toEqual([]);
+    expect(worked.workedMinutes).toBe(480);
+
+    const flagged = await hr.getEmployeeDay(worker, flaggedDay);
+    expect(flagged.anomalies).toEqual(["unpaired_in"]);
+    expect(flagged.workedMinutes).toBe(0);
+  });
+
+  // The one read no other surface can answer: `pendingApprovalsFor` shows an approver what they
+  // may act on, and a request nobody may act on appears in nobody's queue.
+  it("lists every waiting request, naming who could decide it", async () => {
+    const hr = appUi(`acct-admin-pending-${seq}`, true);
+    const { boss, overtimeId, correctionId } = await attendance("pending", "2026-07");
+
+    const items = await hr.listPendingOverview();
+
+    const overtime = items.find((item: { id: number }) => item.id === overtimeId);
+    expect(overtime).toMatchObject({
+      kind: "overtime", state: "pending", minutes: 120, employeeName: "pending-worker",
+      filedByName: null, eligibleActorIds: [boss], eligibleActorNames: ["pending-boss"],
+    });
+    expect(items.find((item: { id: number }) => item.id === correctionId)).toMatchObject({
+      kind: "amendment", filedByName: "pending-worker", eligibleActorIds: [boss],
+    });
+  });
+
+  // `assertPeriod` at the boundary, on all three members that take one. `anomalousDays` and
+  // `monthlyTotals` assert it again inside the store (the same imported function, not a second
+  // copy); `lockPeriod` does not, so for that one this boundary is the only thing standing between
+  // a typo and a lock row nothing could ever match.
+  it.each(["2026-13", "2026-1", "banana", "", "2026-00", "2026-07-03"])(
+    "refuses %o as a period", async (period) => {
+      const hr = appUi(`acct-admin-badperiod-${seq}`, true);
+
+      await expect(() => hr.listAnomalousDays(period)).rejects.toThrow(/KINTAI_INVALID_INPUT/);
+      await expect(() => hr.monthlyReport(period)).rejects.toThrow(/KINTAI_INVALID_INPUT/);
+      await expect(() => hr.lockPeriod(period)).rejects.toThrow(/KINTAI_INVALID_INPUT/);
+    },
+  );
+
+  // The store's `employeeDay` takes its work date on trust, exactly as its neighbours do, because
+  // every worker-side caller has already derived it. This is the surface untrusted input reaches,
+  // so it is where the date is checked — `assertWorkDate`, the same one the session facet applies
+  // to every other date in this package. "2026-02-31" is the case a regex alone accepts and
+  // `Date.parse` rolls silently into March.
+  it.each(["2026-02-31", "2026-13-01", "01/04/2026", "2026-4-1", "2026-07", ""])(
+    "refuses %o as a work date", async (workDate) => {
+      const hr = appUi(`acct-admin-badday-${seq}`, true);
+
+      await expect(() => hr.getEmployeeDay(1, workDate)).rejects.toThrow(/KINTAI_INVALID_INPUT/);
+    },
+  );
+
+  it.each([0, -1, 1.5])("refuses %o as an employee id", async (employeeId) => {
+    const hr = appUi(`acct-admin-badid-${seq}`, true);
+
+    await expect(() => hr.getEmployeeDay(employeeId, "2026-07-03"))
+      .rejects.toThrow(/KINTAI_INVALID_INPUT/);
+  });
+});
+
+describe("closing a month", () => {
+  /** An admin whose own account is linked, which closing a month requires. */
+  async function closer(tag: string) {
+    const adminEmployee = await employee(tag);
+    const adminAccount = `acct-${tag}-${seq}`;
+    await store.linkAccount(adminAccount, adminEmployee, Date.now());
+    return { adminEmployee, hr: appUi(adminAccount, true) };
+  }
+
+  async function lockEntries(period: string) {
+    return (await store.auditEntries()).filter((row) =>
+      row.action === "lock_period" && (row.after ?? "").includes(`"${period}"`));
+  }
+
+  // `lockPeriod` was the fourth confirmed instance of implemented-but-unreachable: the store has
+  // had it since the beginning and nothing outside the worker could call it, so no month could
+  // ever be closed and `setAllocations` — the one write with no approval behind it — could rewrite
+  // a paid month indefinitely.
+  it("writes the lock, with the acting admin as the one who closed it", async () => {
+    const { adminEmployee, hr } = await closer("Closer");
+    const before = Date.now();
+
+    expect(await hr.lockPeriod("2026-01")).toBeUndefined();
+
+    const lock = await store.periodLock("2026-01");
+    expect(lock).toMatchObject({ lockedBy: adminEmployee });
+    expect(lock!.lockedAt).toBeGreaterThanOrEqual(before);
+    // And the report says so, from the same table rather than from a second opinion.
+    expect(await hr.monthlyReport("2026-01")).toMatchObject({ locked: true });
+  });
+
+  // Who closed a month is the first question asked of a closed month, and it is taken from the
+  // admin's own capability — there is no argument that could credit somebody else.
+  it("audits the close, recording that the period was open before", async () => {
+    const { adminEmployee, hr } = await closer("Auditing Closer");
+    const before = Date.now();
+
+    await hr.lockPeriod("2026-02");
+
+    const [entry] = await lockEntries("2026-02");
+    expect(entry).toMatchObject({ entity: "period_locks", actor_employee_id: adminEmployee });
+    // `period_locks` is keyed on the period, which is TEXT; `audit_log.entity_id` is an INTEGER,
+    // so the period travels in before/after and this column stays null rather than carrying a
+    // number that would join back to the wrong table.
+    expect(entry.entity_id).toBeNull();
+    expect(JSON.parse(entry.before!)).toEqual({ period: "2026-02", locked: false });
+    expect(JSON.parse(entry.after!)).toMatchObject({
+      period: "2026-02", lockedBy: adminEmployee,
+    });
+    expect(JSON.parse(entry.after!).lockedAt).toBeGreaterThanOrEqual(before);
+  });
+
+  // An admin double-clicks the button, or works from a screen a colleague has already acted on.
+  // They are told it is already done — NOT `PeriodLockedError`'s "file an amendment", which is an
+  // instruction to correct a record they never meant to touch.
+  it("refuses a second close, and keeps the first one intact", async () => {
+    const { adminEmployee, hr } = await closer("Double Closer");
+    await hr.lockPeriod("2026-08");
+    const first = await store.periodLock("2026-08");
+    const { hr: other } = await closer("Late Closer");
+
+    const refusal: Error = await other.lockPeriod("2026-08").catch((error: Error) => error);
+
+    // The period, who closed it and when: enough for the admin to see whether it was them a
+    // moment ago or a colleague last week.
+    expect(refusal.message).toMatch(/KINTAI_ALREADY_LOCKED/);
+    expect(refusal.message).toContain("2026-08");
+    expect(refusal.message).toContain(`employee ${adminEmployee}`);
+    expect(refusal.message).toContain(jstWorkDate(first!.lockedAt));
+    // And NOT `PeriodLockedError`'s instruction, which is written for whoever tried to write into
+    // a closed month: telling this caller to file an amendment would send them to correct a record
+    // they never meant to touch.
+    expect(refusal.message).not.toContain("amendment");
+
+    // Nothing written: the row still names the first admin and the first instant, and the refused
+    // calls left no audit entry claiming a second close happened.
+    expect(await store.periodLock("2026-08")).toEqual(first);
+    expect(await lockEntries("2026-08")).toHaveLength(1);
+  });
+
+  // `period_locks.locked_by` is NOT NULL, so there is no honest row to write for an admin who has
+  // no employee record of their own — a real state, and the first administrator's normal one. The
+  // refusal names the fix, which is theirs to make: they are HR.
+  it("refuses an admin with no employee record, naming the fix", async () => {
+    const hr = appUi(`acct-admin-nolink-${seq}`, true);
+
+    await expect(() => hr.lockPeriod("2026-09"))
+      .rejects.toThrow(/KINTAI_ADMIN_NOT_LINKED/);
+    await expect(() => hr.lockPeriod("2026-09")).rejects.toThrow(/whoAmI/);
+    // Refused before anything was written, audit entry included.
+    expect(await store.periodLock("2026-09")).toBeNull();
+    expect(await lockEntries("2026-09")).toEqual([]);
+  });
+
+  it("writes nothing for a malformed period", async () => {
+    const { hr } = await closer("Typing Closer");
+
+    await expect(() => hr.lockPeriod("2026-13")).rejects.toThrow(/KINTAI_INVALID_INPUT/);
+
+    expect(await store.periodLock("2026-13")).toBeNull();
+    expect(await lockEntries("2026-13")).toEqual([]);
+  });
+
+  // Closing a month is the write that makes every punch in it final. Reachable by an employee, it
+  // would be a way to freeze a month before a colleague's correction could be filed against it.
+  it("is refused to a non-administrator", async () => {
+    await expect(() => appUi(`acct-nonadmin-lock-${seq}`, false).lockPeriod("2026-10"))
+      .rejects.toThrow(/KINTAI_ADMIN_REQUIRED/);
+
+    expect(await store.periodLock("2026-10")).toBeNull();
+  });
+});
+
 describe("the audit trail", () => {
   // src/store/audit.ts promises to record "account linking, org edges, exemptions, route
   // configuration and period locks". Before part 1 nothing in the runtime called `appendAudit` at
@@ -855,4 +1227,70 @@ describe("the frame the Workshop hosts", () => {
     expect(frame.iframeHtml).not.toContain('src="./main.tsx"');
     expect(await frame.ui.whoAmI()).toEqual({ accountId, linked: false, employeeId: null });
   });
+});
+
+// MUST BE LAST IN THIS FILE. `punch()` derives its work date from the wall clock, so the only
+// month an ordinary punch can land in is the live one — and there is no unlock anywhere in this
+// package, so closing it closes it for every test that runs afterwards. Same constraint, same
+// placement, and the same comment as "period locks close the live period, irreversibly" in
+// `facet.test.ts`, which is the store-level version of this.
+//
+// This is the end-to-end that yesterday's live verification could not drive, because nothing could
+// close a month: the admin API closes one, and then the four things that must follow are checked
+// through the real facet and the real store rather than asserted about the lock row.
+describe("closing the live month, end to end", () => {
+  it("refuses the next punch, still admits an approved correction, and says so on both reads",
+    async () => {
+      const adminAccount = `acct-e2e-hr-${seq}`;
+      await store.linkAccount(adminAccount, await employee("E2E HR"), Date.now());
+      const hr = appUi(adminAccount, true);
+
+      const worker = await employee("E2E Worker");
+      const boss = await employee("E2E Boss");
+      const workerAccount = `acct-e2e-worker-${seq}`;
+      await store.linkAccount(workerAccount, worker, Date.now());
+      await store.setReportingLine(worker, boss, 0);
+
+      // The live month, because that is the one an ordinary punch attributes itself to.
+      const workDate = jstWorkDate(Date.now());
+      const period = workDate.slice(0, 7);
+      const nine = Date.parse(`${workDate}T00:00:00Z`);
+      await store.recordPunch({
+        employeeId: worker, workDate, kind: "in", now: nine, source: "gadget",
+      });
+      const outId = await store.recordPunch({
+        employeeId: worker, workDate, kind: "out", now: nine + 8 * 3_600_000, source: "gadget",
+      });
+      expect(await hr.monthlyReport(period)).toMatchObject({ locked: false });
+
+      await hr.lockPeriod(period);
+
+      // (a) An ordinary punch, through the session a Gadget actually holds, is refused.
+      await expect(() => sessionFor(workerAccount).punch("in"))
+        .rejects.toThrow(/KINTAI_PERIOD_LOCKED/);
+
+      // (d) A correction filed against the closed month names the month it would write into —
+      // the one thing an approver most needs told and is least able to infer.
+      const correctionId = await store.fileAmendment({
+        employeeId: worker, targetPunchId: outId, occurredAt: nine + 9 * 3_600_000,
+        reason: "left at six; the terminal was tapped when clocking out at five",
+        now: nine + 10 * 3_600_000, department: null, employmentType: null, createdBy: worker,
+      });
+      const waiting = (await hr.listPendingOverview())
+        .find((item: { id: number }) => item.id === correctionId)!;
+      expect(waiting.amendment).toMatchObject({ lockedPeriod: period, targetPunchId: outId });
+      expect(waiting.eligibleActorIds).toEqual([boss]);
+
+      // (b) Approved, it applies anyway: the one write a closed period admits.
+      expect(await store.actOnSubmission({
+        submissionId: correctionId, actorId: boss, action: "approve", now: nine + 11 * 3_600_000,
+      })).toBe("approved");
+
+      // (c) The month still reads closed, and its total moved regardless. Closed is not frozen,
+      // and there is no stored aggregate for a stale number to hide in.
+      const after = await hr.monthlyReport(period);
+      expect(after.locked).toBe(true);
+      expect(after.rows.find((row: { employeeId: number }) => row.employeeId === worker))
+        .toMatchObject({ workedMinutes: 540 });
+    });
 });
