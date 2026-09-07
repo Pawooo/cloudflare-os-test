@@ -54,8 +54,11 @@ implemented-with-throws on `ViewerKintaiApi`, covered by the surface test's `INT
 audited.
 
 - `listPendingOverview()`, `listAnomalousDays(period)`, `monthlyReport(period)`,
-  `getEmployeeDay(employeeId, workDate)` — the four reads. `monthlyReport` rows carry `locked`;
-  there is no separate `isPeriodLocked` member, because no tab renders one.
+  `getEmployeeDay(employeeId, workDate)` — the four reads. `monthlyReport` carries `locked` on the
+  REPORT, one period per report — not per row (amended 2026-09-07 to match the code, which reads
+  it once from `periodLock`: a report names one period, so a per-row copy could only ever be the
+  same value repeated or a disagreement with itself). There is no separate `isPeriodLocked`
+  member, because no tab renders one.
 - **`lockPeriod(period)`** — the write. Audited with before/after (`before` records that the
   period was open; `after` the lock row). Refuses a period already locked with a NEW
   `KINTAI_ALREADY_LOCKED` — `PeriodLockedError`'s message tells users to file an amendment, which
@@ -110,8 +113,13 @@ freezes behaviour, not pixels.
   yesterday's verification could not drive — lock a month through the ADMIN API, then confirm an
   ordinary punch refuses and an approved correction still applies.
 - App tests per tab; the blanket every-button-is-type-button test covers new controls.
-- Update `docs/kintai-architecture-limits.md`: the routes and lock entries move from "unreachable"
-  to resolved, with the date.
+- Update `docs/kintai-architecture-limits.md`: the lock entry moves from "unreachable" to
+  resolved, with the date. The routes entry SPLITS: blocking half resolved, configuration half
+  open (amended 2026-09-07 — the seeded catch-all fallback means no store can be left unable to
+  create a submission, but `createRoute` is still on no API and behind no form, so department
+  rules, minute thresholds and multi-step escalation stay unreachable). Recording it as "moves to
+  resolved" would have closed an entry that is half open, and the two halves have different
+  owners.
 
 ## Out of scope
 
