@@ -1,21 +1,14 @@
 import type {
-  EmployeeId, LocationSource, PunchKind, PunchRow, PunchSource,
+  EmployeeId, PunchKind, PunchLocation, PunchRow, PunchSource,
 } from "../types.js";
 import { LONG_SPAN_MS, MAX_SHIFT_MS, jstWorkDate } from "../work-date.js";
 import { workDatePolicyOf } from "./employees.js";
 import { matchSite } from "./sites.js";
 
-// Re-exported so every worker-side caller still reads the row type from the module that
-// queries it. The declaration lives in `src/types.ts` because `app/` renders these rows and
-// cannot compile this file -- see that module's "wire shapes" section.
-export type { PunchRow };
-
-export type PunchLocation = {
-  source: LocationSource;
-  latitude?: number;
-  longitude?: number;
-  accuracyM?: number;
-};
+// Re-exported so every worker-side caller still reads the shape from the module that queries it.
+// The declarations live in `src/types.ts` because `app/` renders these and cannot compile this
+// file -- see that module's "wire shapes" sections.
+export type { PunchRow, PunchLocation };
 
 export type NewPunch = {
   employeeId: EmployeeId;

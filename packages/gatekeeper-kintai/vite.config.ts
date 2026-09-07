@@ -34,12 +34,20 @@ export default defineConfig({
         input: [
           { auto: true },
           { pattern: "!**/dist-app/**", base: "workspace" },
+          // The employee bundle's own `dist` dir, kept out of the fingerprint for the same reason
+          // and separate from `dist-app` so the two watchers never race (see vite.app.config.ts).
+          { pattern: "!**/dist-app-employee/**", base: "workspace" },
           { pattern: "!**/src/generated/**", base: "workspace" },
           // Wrangler's scratch bundles are randomly named, so without this a `pnpm dev-server` run
           // guarantees a miss on the next one.
           { pattern: "!**/.wrangler/**", base: "workspace" },
         ],
-        output: ["dist-app/**", "src/generated/app.txt"],
+        output: [
+          "dist-app/**",
+          "dist-app-employee/**",
+          "src/generated/app.txt",
+          "src/generated/employee-app.txt",
+        ],
         // Read via `loadEnv` in vite.app.config.ts and baked into the bundle, so it belongs in the
         // fingerprint.
         env: ["VITE_FRONTEND_ERROR_REPORTING"],
@@ -58,10 +66,11 @@ export default defineConfig({
         input: [
           { auto: true },
           { pattern: "!**/dist-app/**", base: "workspace" },
+          { pattern: "!**/dist-app-employee/**", base: "workspace" },
           { pattern: "!**/src/generated/**", base: "workspace" },
           { pattern: "!**/.wrangler/**", base: "workspace" },
         ],
-        output: ["src/generated/app.txt"],
+        output: ["src/generated/app.txt", "src/generated/employee-app.txt"],
         env: ["VITE_FRONTEND_ERROR_REPORTING"],
       },
     },

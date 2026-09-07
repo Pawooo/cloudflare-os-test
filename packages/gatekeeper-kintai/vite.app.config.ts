@@ -17,23 +17,58 @@ const watch = process.argv.includes("--watch");
 // this so the pre-flight produces exactly what the watcher will, letting the write be skipped.
 const unminified = watch || process.env.GATEKEEPER_APP_UNMINIFIED === "true";
 
+/**
+ * Which of the two bundles this invocation builds. `viteSingleFile` inlines exactly one entry per
+ * build and `emitAppText` writes exactly one `.txt`, so the two bundles are two Vite runs, not one
+ * multi-entry build -- `build-app.mjs` runs this config once per entry, passing the name here.
+ *
+ * Each entry owns a SEPARATE `outDir`: the admin build is byte-for-byte what it was before this
+ * file grew a second entry (same input, same `dist-app`, same `emitAppText` output), which is what
+ * keeps `app.txt` from shifting. Separate dirs also let `--watch` run both watchers at once without
+ * two `emptyOutDir` builds racing on one `dist` tree; the two write to different `src/generated`
+ * files, so those never collide.
+ */
+type EntryName = "admin" | "employee";
+const ENTRIES = {
+  admin: {
+    input: "app/index.html",
+    outDir: "dist-app",
+    builtHtml: "index.html",
+    output: "app.txt",
+    jsFile: "gatekeeper-kintai.js",
+    sourceUrl: "app:///gatekeeper/kintai/gatekeeper-kintai.js",
+  },
+  employee: {
+    input: "app/employee-index.html",
+    outDir: "dist-app-employee",
+    builtHtml: "employee-index.html",
+    output: "employee-app.txt",
+    jsFile: "gatekeeper-kintai-employee.js",
+    sourceUrl: "app:///gatekeeper/kintai/gatekeeper-kintai-employee.js",
+  },
+} as const satisfies Record<EntryName, unknown>;
+
+const entryName: EntryName =
+  process.env.GATEKEEPER_APP_ENTRY === "employee" ? "employee" : "admin";
+const entry = ENTRIES[entryName];
+
 function emitAppText(errorReporting: boolean): Plugin {
   return {
     name: "emit-app-text",
     closeBundle() {
-      const builtHtml = resolve(packageDirectory, "dist-app", "app", "index.html");
+      const builtHtml = resolve(packageDirectory, entry.outDir, "app", entry.builtHtml);
       const html = readFileSync(builtHtml, "utf8").replace(
         /(<script type="module"[^>]*>)([\s\S]*?)(<\/script>)/,
-        "$1$2\n//# sourceURL=app:///gatekeeper/kintai/gatekeeper-kintai.js\n$3",
+        `$1$2\n//# sourceURL=${entry.sourceUrl}\n$3`,
       );
       const script = html.match(/<script type="module"[^>]*>([\s\S]*?)<\/script>/)?.[1];
       if (script && errorReporting) {
         writeFileSync(
-          resolve(packageDirectory, "dist-app", "gatekeeper-kintai.js"),
-          `${script}\n//# sourceMappingURL=gatekeeper-kintai.js.map\n`,
+          resolve(packageDirectory, entry.outDir, entry.jsFile),
+          `${script}\n//# sourceMappingURL=${entry.jsFile}.map\n`,
         );
       }
-      const output = resolve(packageDirectory, "src", "generated", "app.txt");
+      const output = resolve(packageDirectory, "src", "generated", entry.output);
       const contents =
         "<!-- Generated from packages/gatekeeper-kintai/app. Do not edit. -->\n" + html;
       if (existsSync(output) && readFileSync(output, "utf8") === contents) return;
@@ -54,7 +89,7 @@ export default defineConfig(({ mode }) => {
       emitAppText(errorReporting),
     ],
     build: {
-      outDir: "dist-app",
+      outDir: entry.outDir,
       emptyOutDir: true,
       minify: unminified ? false : "terser",
       terserOptions: { compress: { passes: 2 }, format: { comments: false } },
@@ -62,12 +97,18 @@ export default defineConfig(({ mode }) => {
       cssCodeSplit: false,
       sourcemap: errorReporting ? "hidden" : false,
       rollupOptions: {
-        input: "app/index.html",
-        output: { entryFileNames: "gatekeeper-kintai.js" },
+        input: entry.input,
+        output: { entryFileNames: entry.jsFile },
       },
       watch: watch
         ? {
-            exclude: ["**/node_modules/**", "**/dist-app/**", "**/.wrangler/**", "**/generated/**"],
+            exclude: [
+              "**/node_modules/**",
+              "**/dist-app/**",
+              "**/dist-app-employee/**",
+              "**/.wrangler/**",
+              "**/generated/**",
+            ],
           }
         : undefined,
     },

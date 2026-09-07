@@ -403,3 +403,75 @@ export type PendingItem = SubmissionRow & {
   eligibleActorIds: EmployeeId[];
   eligibleActorNames: string[];
 };
+
+// ---- the wire shapes the EMPLOYEE gadget renders -----------------------------------------------
+//
+// The same rule as the admin section above, for the employee half of the surface: these cross the
+// RPC boundary into `app/`, so they live in this zero-import leaf rather than in the store modules
+// that query them (`store/allocations.ts`, `store/punches.ts`) or in `kintai.ts` (which imports
+// `cloudflare:workers`). Those modules re-export them under the same names, so worker-side callers
+// still read each shape from where it is produced and nothing there moved. `KintaiEmployeeClient`
+// below is the app-facing mirror of `EmployeeKintaiApi`, and it can only be written here because
+// every type it names is reachable here.
+
+/** Where a punch was taken, as the gadget offers it to `punch`. See `store/punches.ts`. */
+export type PunchLocation = {
+  source: LocationSource;
+  latitude?: number;
+  longitude?: number;
+  accuracyM?: number;
+};
+
+/** One project allocation on one of the caller's own days. See `store/allocations.ts`. */
+export type AllocationRow = {
+  id: number;
+  employee_id: number;
+  work_date: string;
+  project_code: string;
+  minutes: number;
+  note: string | null;
+  version: number;
+  superseded_by: number | null;
+};
+
+/** Allocated vs worked minutes for one day, with the (never-rejecting) discrepancy between them. */
+export type Reconciliation = {
+  allocatedMinutes: number;
+  workedMinutes: number;
+  /** allocated - worked. Negative means under-allocated. Never a rejection. */
+  discrepancyMinutes: number;
+};
+
+/** A punch write's receipt: the row created, whose it is, and the day it was filed against. */
+export type PunchReceipt = { punchId: number; employeeId: EmployeeId; workDate: string };
+
+/**
+ * The capability the employee gadget calls, as the page sees it — the plain-type mirror of
+ * `EmployeeKintaiApi`, exactly as `KintaiAdminClient` mirrors the admin surface.
+ *
+ * Declared here, not imported from `kintai.ts`: `EmployeeKintaiApi` extends `RpcTarget` and its
+ * module pulls in `cloudflare:workers` and the whole store, none of which `tsconfig.app.json` can
+ * compile. This leaf imports nothing, so the app reaches the shape without dragging the worker into
+ * its type graph. Every method here is the app-visible half of the class's own; the class is the
+ * authority and `employee-api.test.ts` pins its callable surface, so a method added there without
+ * a line here is simply unreachable from the page until this mirror catches up.
+ */
+export type KintaiEmployeeClient = {
+  whoAmI(): Promise<KintaiIdentity>;
+  getDay(workDate: string): Promise<{
+    punches: PunchRow[];
+    allocations: AllocationRow[];
+    reconciliation: Reconciliation;
+    anomalies: string[];
+    locked: boolean;
+  }>;
+  myMonth(period: string): Promise<EmployeeMonth>;
+  punch(kind: PunchKind, location?: PunchLocation): Promise<PunchReceipt>;
+  requestMissingPunch(
+    workDate: string, kind: PunchKind, occurredAt: number, reason: string,
+  ): Promise<number>;
+  requestPunchCorrection(punchId: number, occurredAt: number, reason: string): Promise<number>;
+  listMySubmissions(): Promise<SubmissionRow[]>;
+  withdrawSubmission(submissionId: number): Promise<void>;
+  resubmit(submissionId: number): Promise<void>;
+};

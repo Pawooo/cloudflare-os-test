@@ -1,25 +1,13 @@
-import type { EmployeeId } from "../types.js";
+import type { AllocationRow, EmployeeId, Reconciliation } from "../types.js";
 import { workedMinutes } from "./punches.js";
 
+// Re-exported so every worker-side caller still reads these from the module that queries them.
+// The declarations live in `src/types.ts` because `app/` renders them and cannot compile this
+// file -- see that module's "wire shapes" sections. `AllocationEntry` is a write-path argument
+// the app never sees, so it stays declared here.
+export type { AllocationRow, Reconciliation };
+
 export type AllocationEntry = { projectCode: string; minutes: number; note?: string };
-
-export type AllocationRow = {
-  id: number;
-  employee_id: number;
-  work_date: string;
-  project_code: string;
-  minutes: number;
-  note: string | null;
-  version: number;
-  superseded_by: number | null;
-};
-
-export type Reconciliation = {
-  allocatedMinutes: number;
-  workedMinutes: number;
-  /** allocated - worked. Negative means under-allocated. Never a rejection. */
-  discrepancyMinutes: number;
-};
 
 export function currentAllocations(
   sql: SqlStorage, employeeId: EmployeeId, workDate: string,

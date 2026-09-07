@@ -31,3 +31,7 @@ async function removeReportingArtifacts(dir: string): Promise<void> {
 
 await removeReportingArtifacts(join(packageDir, "src", "generated"));
 await removeReportingArtifacts(join(packageDir, "dist-app"));
+// The employee gadget's bundle builds into its own `dist-app-employee` (see gatekeeper-kintai's
+// vite.app.config.ts), so its sourcemap artifacts are cleaned alongside the admin bundle's. Absent
+// for every other package and when reporting is off, which `removeReportingArtifacts` no-ops on.
+await removeReportingArtifacts(join(packageDir, "dist-app-employee"));

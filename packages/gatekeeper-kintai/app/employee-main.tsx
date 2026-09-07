@@ -1,0 +1,63 @@
+import { createRoot } from "react-dom/client";
+import { RpcTarget, newMessagePortRpcSession, type RpcStub } from "capnweb";
+import type {
+  GatekeeperAppTheme,
+  GatekeeperAppThemeReceiver,
+} from "@gadgets/workshop-shared/theme";
+import type { KintaiEmployeeClient } from "../src/types";
+import EmployeePage from "./EmployeePage";
+import ErrorBoundary from "./ErrorBoundary";
+import { installErrorReporting, reportIssue } from "./error-reporting";
+import { applyAppTheme } from "./theme";
+import "./styles.css";
+
+installErrorReporting();
+
+class AppIframe extends RpcTarget implements GatekeeperAppThemeReceiver {
+  setTheme(theme: GatekeeperAppTheme): void {
+    applyAppTheme(theme);
+  }
+}
+
+/**
+ * What the Workshop exposes to this iframe. `ui` is the capability `startAppUi` handed this viewer;
+ * on this entry it is always the employee one (`EmployeeKintaiApi`), because the Workshop only ever
+ * serves this bundle to a non-admin. The page still cannot tell which class is behind the stub, by
+ * design — the same property `main.tsx` documents — it just has no admin methods to reach for.
+ *
+ * The host also offers workspace navigation to gatekeeper apps that want it. None is declared here
+ * because this page opens nothing.
+ */
+interface HostCapability extends RpcTarget {
+  readonly ui: RpcStub<KintaiEmployeeClient>;
+  subscribeTheme(receiver: GatekeeperAppThemeReceiver): Promise<GatekeeperAppTheme>;
+}
+
+function main() {
+  const element = document.getElementById("root");
+  if (!element) throw new Error("Missing Kintai app root.");
+
+  const { port1, port2 } = new MessageChannel();
+  window.parent.postMessage({ type: "handshake" }, "*", [port2]);
+  const iframe = new AppIframe();
+  const host = newMessagePortRpcSession<HostCapability>(port1, iframe);
+  host
+    .subscribeTheme(iframe)
+    .then(applyAppTheme)
+    .catch(() => {});
+
+  createRoot(element, {
+    onUncaughtError: (error) =>
+      reportIssue("kintai.react-root", error, {
+        handled: false,
+        severity: "fatal",
+        captureMechanism: "react",
+      }),
+  }).render(
+    <ErrorBoundary>
+      <EmployeePage api={host.ui} />
+    </ErrorBoundary>,
+  );
+}
+
+main();
