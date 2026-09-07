@@ -1,0 +1,479 @@
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
+import type { MonthlyReport, MonthlyTotalRow } from "../src/types";
+import { jstWorkDate } from "../src/work-date";
+import type { KintaiAdminClient } from "./AdminPage";
+import { describeFailure } from "./errors";
+
+/**
+ * 月次: one month's hours per employee, and the one write that closes it.
+ *
+ * Two jobs, and the second is the reason this tab exists at all. Reading a month is useful; being
+ * able to CLOSE one is what makes this package's append-only storage mean anything. Until
+ * `lockPeriod` became reachable, no month could ever be closed, and `setAllocations` — the one
+ * write in this system with no approval behind it — could rewrite a month somebody had already
+ * been paid on, indefinitely. See `AdminKintaiApi.lockPeriod`.
+ *
+ * NOTHING HERE RECOMPUTES ANYTHING. Every number on the screen arrives from `monthlyReport`, which
+ * walks the punches through the same `workedMinutes` and `dayAnomalies` the employee's own day view
+ * uses. This module formats and it links; it owns no arithmetic over attendance, and there is no
+ * stored total anywhere for it to disagree with.
+ */
+export function MonthlyTab({
+  api, onShowOverview,
+}: {
+  api: KintaiAdminClient;
+  /**
+   * Switch the page to 要対応, which is where a flagged day is actually looked at.
+   *
+   * A callback rather than a second rendering of the flagged days here: that panel already lists
+   * every one of them with its punches one press away, and two screens over one query are two
+   * screens to keep in agreement. `AdminPage` owns which tab is showing, so it owns this.
+   */
+  onShowOverview: () => void;
+}) {
+  /*
+   * The month the administrator is in, in JST, read ONCE for the life of the panel.
+   *
+   * `jstWorkDate` rather than `toISOString().slice(0, 7)`: the latter is UTC and reports the
+   * previous month for the first nine hours of every Japanese day — the same nine hours
+   * `workDateStart` exists because of. Held rather than recomputed so the future bound below
+   * cannot shift under a page left open across midnight on the 1st, which would silently turn the
+   * next button on for a month that has still not started as far as this render is concerned.
+   */
+  const [currentMonth] = useState(() => jstWorkDate(Date.now()).slice(0, 7));
+  const [period, setPeriod] = useState(currentMonth);
+  const [report, setReport] = useState<{ data?: MonthlyReport; error?: string }>({});
+  const [armed, setArmed] = useState(false);
+  const [closing, setClosing] = useState(false);
+  const [closeError, setCloseError] = useState<string>();
+
+  const live = useRef(true);
+  useEffect(() => () => { live.current = false; }, []);
+  // Which read is the current one. A reader pressing prev twice quickly has two reads in flight,
+  // and the first to come back is not necessarily the month they are now looking at.
+  const readId = useRef(0);
+
+  const readMonth = useCallback(async (target: string) => {
+    const id = ++readId.current;
+    setReport({});
+    try {
+      const data = await api.monthlyReport(target);
+      if (live.current && id === readId.current) setReport({ data });
+    } catch (caught) {
+      if (live.current && id === readId.current) {
+        setReport({ error: describeFailure(caught, "Couldn’t read that month.") });
+      }
+    }
+  }, [api]);
+
+  /*
+   * Read on mount, and again whenever the month changes — never on a tab flip.
+   *
+   * All three panels are mounted from the first admin render (see the `hidden` panels in
+   * `AdminPage`), so there is no "became visible" event to hang a fetch on and nothing to wait
+   * for. `readMonth` closes over `api`, which never changes for the life of the page, so this
+   * fires once per month looked at rather than once per ancestor rerender — and `AdminPage`
+   * rerenders on every keystroke in a roster form.
+   */
+  useEffect(() => {
+    void readMonth(period);
+  }, [readMonth, period]);
+
+  /*
+   * An armed confirmation names ONE month, so moving the picker takes it back.
+   *
+   * Leaving it armed would put a confirmation about September in front of a reader now looking at
+   * August, one press away from closing the wrong month — and closing one cannot be undone. The
+   * close failure goes with it for the same reason: it is a sentence about the month that was on
+   * screen when it was pressed.
+   */
+  useEffect(() => {
+    setArmed(false);
+    setCloseError(undefined);
+  }, [period]);
+
+  const locked = report.data?.locked ?? false;
+  /*
+   * The close control exists only for an open month that has actually started.
+   *
+   * The second half is belt to the picker's braces: `next-month` never walks past `currentMonth`,
+   * so `period` cannot be in the future — but `lockPeriod` refuses a future month
+   * (`KINTAI_FUTURE_PERIOD`) and a button that could only ever fail should not be rendered. While
+   * the month is unread, `locked` is false and this stays hidden anyway, because `report.data` is
+   * undefined and the panel is showing a spinner.
+   */
+  const closable = report.data !== undefined && !locked && period <= currentMonth;
+
+  const close = async () => {
+    setClosing(true);
+    setCloseError(undefined);
+    try {
+      await api.lockPeriod(period);
+    } catch (caught) {
+      if (live.current) {
+        setCloseError(describeFailure(caught, "Couldn’t close that month."));
+      }
+    } finally {
+      if (live.current) {
+        setArmed(false);
+        setClosing(false);
+      }
+    }
+    /*
+     * Re-read either way, and the failure case is the one that needs it.
+     *
+     * On success the badge has to come from the store rather than from this component assuming its
+     * own write landed. On failure the LIKELIEST refusal is `KINTAI_ALREADY_LOCKED` — somebody
+     * else closed the month between this page's read and this press, which is a race the store
+     * settles inside the same run as the INSERT and no caller can pre-empt. That means the
+     * `locked` on screen is already wrong, so the honest response to the refusal is to go and
+     * find out what the month actually says.
+     */
+    if (live.current) await readMonth(period);
+  };
+
+  const headingId = useId();
+  return (
+    <section className="flex flex-col gap-6" aria-labelledby={headingId}>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            data-action="prev-month"
+            aria-label="Previous month"
+            className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-sm font-medium text-kumo-default hover:bg-kumo-tint"
+            onClick={() => setPeriod(shiftMonth(period, -1))}
+          >
+            ←
+          </button>
+          {/* A label, not a field: the only two months a reader can ask for are the one before
+              and the one after, so there is no free text to validate and no typo to refuse.
+              `YYYY-MM` is exactly what `monthlyReport` and `lockPeriod` take. */}
+          <h2
+            id={headingId}
+            data-testid="month-label"
+            className="min-w-20 text-center font-mono text-base font-semibold text-kumo-default"
+          >
+            {period}
+          </h2>
+          <button
+            type="button"
+            data-action="next-month"
+            aria-label="Next month"
+            /* Disabled AT the current month, not after it. `lockPeriod` refuses a month that has
+               not started, and a next button that reached October would offer a reader an empty
+               month and a close control that could only fail. Going backwards has no bound. */
+            disabled={period >= currentMonth}
+            className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-sm font-medium text-kumo-default hover:bg-kumo-tint disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-kumo-control"
+            onClick={() => setPeriod(shiftMonth(period, 1))}
+          >
+            →
+          </button>
+        </div>
+
+        {locked && (
+          <p
+            data-testid="monthly-locked"
+            className="rounded-lg bg-kumo-tint px-3 py-1.5 text-xs font-medium text-kumo-default"
+          >
+            {/* Closed, and NOT frozen — the same distinction the confirmation spells out. An
+                approved correction is still applied into this month, so these numbers can still
+                move; what has stopped is everything else. */}
+            締め済み · {period} is closed. Ordinary edits are refused; an approved correction is
+            still applied, so these totals can still change.
+          </p>
+        )}
+
+        {closable && !armed && (
+          <button
+            type="button"
+            data-action="close-month"
+            className="press rounded-lg border border-kumo-line bg-kumo-control px-3 py-1.5 text-sm font-medium text-kumo-default hover:bg-kumo-tint"
+            onClick={() => setArmed(true)}
+          >
+            この月を締める
+          </button>
+        )}
+      </div>
+
+      {armed && (
+        <CloseConfirmation
+          period={period}
+          busy={closing}
+          onClose={close}
+          onCancel={() => setArmed(false)}
+        />
+      )}
+
+      {/* Beside the control that failed, like every notice on this page. A close that was refused
+          is not a reason to blank the month's numbers — and after a refused close those numbers
+          have just been re-read, which is the most useful thing on the screen. */}
+      {closeError !== undefined && (
+        <p className="text-sm text-kumo-danger" data-testid="close-error" role="alert">
+          {closeError}
+        </p>
+      )}
+
+      <MonthTable
+        report={report}
+        /* Only for the month 要対応 is actually reading. That panel reads `listAnomalousDays` once,
+           for the month the page opened in, and never again — so a jump from an August row would
+           switch tabs to September's flagged days and look like it had done nothing. */
+        linkAnomalies={period === currentMonth}
+        onShowOverview={onShowOverview}
+        onRetry={() => void readMonth(period)}
+      />
+    </section>
+  );
+}
+
+/**
+ * The two-step close, inline — never `window.confirm`.
+ *
+ * The host's iframe carries `allow-modals`, so a native confirm would in fact open; it is still
+ * the wrong control. Every other confirmation and notice on this page is rendered markup, a modal
+ * cannot say four sentences legibly, and a browser dialog is untestable in jsdom — which for the
+ * one irreversible write in this package is the argument that settles it.
+ *
+ * WHAT IT HAS TO SAY, and why all four sentences are load-bearing: "closed" in this system does
+ * not mean frozen. `assertWritable` refuses ordinary writes into a closed month, but applying an
+ * APPROVED amendment is the one write still allowed in (see `actOnAmendment`), and the next
+ * `monthlyTotals` walks the punches that write left behind. An administrator who read "closed" as
+ * "these numbers are final" would hand payroll a total that can still move. And there is no
+ * unlock anywhere in this package, so the press is one-way.
+ */
+function CloseConfirmation({
+  period, busy, onClose, onCancel,
+}: {
+  period: string;
+  busy: boolean;
+  onClose: () => Promise<void>;
+  onCancel: () => void;
+}) {
+  return (
+    <div
+      data-testid="close-confirm"
+      role="group"
+      aria-label={`Close ${period}`}
+      className="flex flex-col gap-3 rounded-lg border border-kumo-line bg-kumo-tint px-4 py-3"
+    >
+      <p className="text-sm font-medium text-kumo-default">
+        {period} を締めますか？
+      </p>
+      <ul className="flex flex-col gap-1 text-xs text-kumo-subtle">
+        <li>通常の打刻や修正は拒否されます — ordinary edits into this month stop here.</li>
+        <li>
+          承認された修正申請は引き続き反映されます — approval is the one way in that stays open.
+        </li>
+        <li>だから合計はまだ動きます — closing a month does not freeze these numbers.</li>
+      </ul>
+      <p className="text-xs font-medium text-kumo-danger">
+        締めを解除する方法はありません — this cannot be undone.
+      </p>
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          data-action="confirm-close-month"
+          disabled={busy}
+          className="press rounded-lg bg-kumo-brand px-3 py-1.5 text-sm font-medium text-white hover:bg-kumo-brand-hover disabled:cursor-not-allowed disabled:opacity-60"
+          onClick={() => void onClose()}
+        >
+          {busy ? "締めています…" : `${period} を締める`}
+        </button>
+        <button
+          type="button"
+          data-action="cancel-close-month"
+          disabled={busy}
+          className="press rounded-lg border border-kumo-line bg-kumo-control px-3 py-1.5 text-sm font-medium text-kumo-default hover:bg-kumo-tint disabled:cursor-not-allowed disabled:opacity-60"
+          onClick={onCancel}
+        >
+          やめる
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** One row per employee with punches in the month. */
+function MonthTable({
+  report, linkAnomalies, onShowOverview, onRetry,
+}: {
+  report: { data?: MonthlyReport; error?: string };
+  linkAnomalies: boolean;
+  onShowOverview: () => void;
+  onRetry: () => void;
+}) {
+  if (report.error !== undefined) {
+    /*
+     * Not a dead end, which is the whole reason the button is here.
+     *
+     * The picker is the only other control on this panel, so a month whose read failed would stay
+     * unreadable for the life of the page unless the reader happened to walk away from it and
+     * back. Same finding as the flagged-day drill-down's, one tab over.
+     */
+    return (
+      <div className="flex flex-col items-start gap-3">
+        <p className="text-sm text-kumo-danger" data-testid="monthly-error" role="alert">
+          {report.error}
+        </p>
+        <button
+          type="button"
+          data-action="retry-month"
+          className="text-sm font-medium text-kumo-link hover:text-kumo-brand-hover"
+          onClick={onRetry}
+        >
+          Try again
+        </button>
+      </div>
+    );
+  }
+
+  if (report.data === undefined) {
+    return <p className="text-sm text-kumo-subtle">Reading the month…</p>;
+  }
+
+  const { period, rows } = report.data;
+  if (rows.length === 0) {
+    /*
+     * What "nothing here" means, never a blank space — the same rule 要対応's three sections
+     * follow. `monthlyTotals` returns a row per employee WITH PUNCHES, so an empty report is a
+     * month nobody clocked into, which for a past month is a finding and not a healthy silence.
+     */
+    return (
+      <p
+        className="rounded-lg border border-dashed border-kumo-line px-4 py-6 text-center text-sm text-kumo-subtle"
+        data-testid="monthly-empty"
+      >
+        {period} には打刻がありません — nobody clocked in this month, so there is nothing to total.
+      </p>
+    );
+  }
+
+  const days = rows.reduce((sum, row) => sum + row.daysWorked, 0);
+  const minutes = rows.reduce((sum, row) => sum + row.workedMinutes, 0);
+  const flagged = rows.reduce((sum, row) => sum + row.anomalousDays, 0);
+
+  return (
+    <div className="flex flex-col gap-3">
+      <p className="text-xs text-kumo-subtle" data-testid="monthly-summary">
+        {rows.length} {rows.length === 1 ? "employee" : "employees"} · {days}{" "}
+        {days === 1 ? "day" : "days"} · {formatWorkedHours(minutes)}
+        {flagged > 0 ? ` · ${flagged} ${flagged === 1 ? "day" : "days"} flagged` : ""}
+      </p>
+      {/* A real table: four of these five columns are numbers a reader compares down the column,
+          which is the one thing a list of cards cannot do. It scrolls inside its own box rather
+          than pushing the page sideways. */}
+      <div className="overflow-x-auto">
+        <table className="w-full border-collapse text-sm">
+          <thead>
+            <tr className="border-b border-kumo-line text-left text-xs text-kumo-subtle">
+              <th scope="col" className="py-2 pr-4 font-medium">従業員</th>
+              <th scope="col" className="py-2 pr-4 text-right font-medium">出勤日数</th>
+              <th scope="col" className="py-2 pr-4 text-right font-medium">労働時間</th>
+              <th scope="col" className="py-2 text-right font-medium">要確認</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-kumo-line">
+            {rows.map((row) => (
+              <MonthRow
+                key={row.employeeId}
+                row={row}
+                linkAnomalies={linkAnomalies}
+                onShowOverview={onShowOverview}
+              />
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function MonthRow({
+  row, linkAnomalies, onShowOverview,
+}: {
+  row: MonthlyTotalRow;
+  linkAnomalies: boolean;
+  onShowOverview: () => void;
+}) {
+  return (
+    <tr data-monthly-employee={row.employeeId}>
+      <td className="py-2 pr-4">
+        <span className="font-medium text-kumo-default">{row.displayName}</span>
+        <span className="ml-2 text-xs text-kumo-subtle">{row.employeeNumber}</span>
+      </td>
+      <td className="py-2 pr-4 text-right font-mono text-kumo-default" data-testid="days">
+        {row.daysWorked}
+      </td>
+      <td className="py-2 pr-4 text-right font-mono text-kumo-default" data-testid="hours">
+        {formatWorkedHours(row.workedMinutes)}
+      </td>
+      <td className="py-2 text-right font-mono" data-testid="anomalies">
+        <AnomalyCount row={row} linkAnomalies={linkAnomalies} onShowOverview={onShowOverview} />
+      </td>
+    </tr>
+  );
+}
+
+/**
+ * How many of the month's days need a look, and — sometimes — a way to go and look at them.
+ *
+ * A BUTTON ONLY WHEN IT WOULD DO SOMETHING. 要対応 reads its flagged days once, for the month the
+ * page opened in, so a jump from a row in any other month would switch tabs and show the reader
+ * September's days under an August question — the clickable-but-inert control this page has gone
+ * to some trouble never to ship (see the roster's `canSetManager`). The count still reads either
+ * way, because the number is the finding; the link is only the convenience.
+ */
+function AnomalyCount({
+  row, linkAnomalies, onShowOverview,
+}: {
+  row: MonthlyTotalRow;
+  linkAnomalies: boolean;
+  onShowOverview: () => void;
+}): ReactNode {
+  if (row.anomalousDays === 0) return <span className="text-kumo-inactive">0</span>;
+  if (!linkAnomalies) return <span className="text-kumo-danger">{row.anomalousDays}</span>;
+  return (
+    <button
+      type="button"
+      data-action="show-anomalies"
+      aria-label={
+        `${row.anomalousDays} days need a look for ${row.displayName} — open 要対応`
+      }
+      className="press font-medium text-kumo-link underline hover:text-kumo-brand-hover"
+      onClick={onShowOverview}
+    >
+      {row.anomalousDays}
+    </button>
+  );
+}
+
+/**
+ * `162h 30m`, and always both units.
+ *
+ * Deliberately NOT `formatDuration` in `OverviewTab.tsx`, which drops the empty half — `3h`, `45m`
+ * — because that one labels a single request in a sentence and this one fills a column a reader
+ * runs their eye down. `162h` beside `162h 30m` makes the column ragged at exactly the place
+ * somebody is comparing two people's months.
+ *
+ * It is arithmetic on a number that arrived already computed. Nothing here decides what counts as
+ * worked time; `workedMinutes` in `store/punches.ts` is the only place that is decided.
+ */
+function formatWorkedHours(minutes: number): string {
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+/**
+ * `period` moved by `delta` months, carrying across a year boundary.
+ *
+ * Months counted from year zero rather than a `Date`, on purpose: a `Date` would drag a timezone
+ * into an operation on a `YYYY-MM` string that has no instant in it, and `setMonth` on the 31st of
+ * a month is the classic way this arithmetic goes wrong. One expression, no special case for
+ * January or December in either direction.
+ */
+function shiftMonth(period: string, delta: number): string {
+  const months = Number(period.slice(0, 4)) * 12 + (Number(period.slice(5, 7)) - 1) + delta;
+  const year = Math.floor(months / 12);
+  const month = months - year * 12 + 1;
+  return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}`;
+}

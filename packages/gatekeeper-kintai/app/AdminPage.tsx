@@ -19,6 +19,7 @@ import type {
 } from "../src/types";
 import { WORK_DATE_POLICIES, WORK_DATE_POLICY_LABELS } from "../src/work-date";
 import { describeFailure, isAdminRequired } from "./errors";
+import { MonthlyTab } from "./MonthlyTab";
 import { OverviewTab } from "./OverviewTab";
 import { isReady, RosterRow } from "./RosterRow";
 
@@ -293,7 +294,11 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
           </div>
 
           <div hidden={tab !== "monthly"} data-testid="panel-monthly">
-            <MonthlyTab api={api} />
+            {/* 月次's flagged-day counts are a way INTO 要対応, not a second rendering of it — so
+                the tab switch is this component's to perform, exactly as the roster repairs'
+                `openForm` is. Passing the setter down would let that panel decide which tab is
+                showing, which is the one piece of state this component exists to own. */}
+            <MonthlyTab api={api} onShowOverview={() => setTab("overview")} />
           </div>
 
           <div
@@ -437,12 +442,6 @@ function TabBar({ tab, onSelect }: { tab: Tab; onSelect: (tab: Tab) => void }) {
       })}
     </div>
   );
-}
-
-/** Placeholder until Task 6 wires the monthly report in. */
-function MonthlyTab({ api }: { api: KintaiAdminClient }) {
-  void api;
-  return <p className="text-sm text-kumo-subtle">月次 is coming soon.</p>;
 }
 
 /**
