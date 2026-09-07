@@ -52,6 +52,24 @@ export function MonthlyTab({
   // Which read is the current one. A reader pressing prev twice quickly has two reads in flight,
   // and the first to come back is not necessarily the month they are now looking at.
   const readId = useRef(0);
+  /*
+   * Which month the picker is on, readable from inside an async continuation.
+   *
+   * `close()` captures `period` in its closure and cannot see a later one, and the picker is
+   * deliberately NOT disabled while a close is in flight — the new test below moves it mid-close
+   * on purpose, because that is what a reader on a slow link does. So the continuation needs to
+   * ask where the picker is NOW, and `period` in scope is where it was THEN.
+   *
+   * Written by `goToMonth`, synchronously, which is the only thing in this component that moves
+   * the month. That is what makes it safe to read after an await: the assignment happens in the
+   * click handler, long before any pending promise resumes, so there is no window in which the
+   * ref and the rendered picker disagree.
+   */
+  const periodRef = useRef(period);
+  const goToMonth = (next: string) => {
+    periodRef.current = next;
+    setPeriod(next);
+  };
 
   const readMonth = useCallback(async (target: string) => {
     const id = ++readId.current;
@@ -92,23 +110,27 @@ export function MonthlyTab({
     setCloseError(undefined);
   }, [period]);
 
-  const locked = report.data?.locked ?? false;
+  const data = report.data;
+  const locked = data?.locked ?? false;
   /*
    * The close control exists only for an open month that has actually started.
    *
    * The second half is belt to the picker's braces: `next-month` never walks past `currentMonth`,
    * so `period` cannot be in the future — but `lockPeriod` refuses a future month
    * (`KINTAI_FUTURE_PERIOD`) and a button that could only ever fail should not be rendered. While
-   * the month is unread, `locked` is false and this stays hidden anyway, because `report.data` is
+   * the month is unread, `locked` is false and this stays hidden anyway, because `data` is
    * undefined and the panel is showing a spinner.
    */
-  const closable = report.data !== undefined && !locked && period <= currentMonth;
+  const closable = data !== undefined && !locked && period <= currentMonth;
 
   const close = async () => {
+    // The month this close is ABOUT, named once. Everything below is judged against it rather
+    // than against `period`, which is a closure variable from the render that armed the button.
+    const target = period;
     setClosing(true);
     setCloseError(undefined);
     try {
-      await api.lockPeriod(period);
+      await api.lockPeriod(target);
     } catch (caught) {
       if (live.current) {
         setCloseError(describeFailure(caught, "Couldn’t close that month."));
@@ -119,6 +141,7 @@ export function MonthlyTab({
         setClosing(false);
       }
     }
+    if (!live.current) return;
     /*
      * Re-read either way, and the failure case is the one that needs it.
      *
@@ -128,8 +151,17 @@ export function MonthlyTab({
      * settles inside the same run as the INSERT and no caller can pre-empt. That means the
      * `locked` on screen is already wrong, so the honest response to the refusal is to go and
      * find out what the month actually says.
+     *
+     * UNLESS THE PICKER HAS MOVED, and this guard is the whole fix for a real bug. Nothing
+     * disables the picker while a close is in flight, so a reader on a slow link can press ← in
+     * between — and the `[period]` effect has then ALREADY read the new month. Re-reading `target`
+     * here would win the `readId` race with that effect and leave the panel holding September's
+     * report while the picker says August: an open month rendering 締め済み, with its close control
+     * gone, on the one irreversible write in this package. The new month's read is already correct
+     * and already in flight or landed; there is nothing for this call to add.
      */
-    if (live.current) await readMonth(period);
+    if (periodRef.current !== target) return;
+    await readMonth(target);
   };
 
   const headingId = useId();
@@ -142,7 +174,7 @@ export function MonthlyTab({
             data-action="prev-month"
             aria-label="Previous month"
             className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-sm font-medium text-kumo-default hover:bg-kumo-tint"
-            onClick={() => setPeriod(shiftMonth(period, -1))}
+            onClick={() => goToMonth(shiftMonth(period, -1))}
           >
             ←
           </button>
@@ -165,22 +197,28 @@ export function MonthlyTab({
                month and a close control that could only fail. Going backwards has no bound. */
             disabled={period >= currentMonth}
             className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-sm font-medium text-kumo-default hover:bg-kumo-tint disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-kumo-control"
-            onClick={() => setPeriod(shiftMonth(period, 1))}
+            onClick={() => goToMonth(shiftMonth(period, 1))}
           >
             →
           </button>
         </div>
 
-        {locked && (
+        {data !== undefined && data.locked && (
           <p
             data-testid="monthly-locked"
             className="rounded-lg bg-kumo-tint px-3 py-1.5 text-xs font-medium text-kumo-default"
           >
             {/* Closed, and NOT frozen — the same distinction the confirmation spells out. An
                 approved correction is still applied into this month, so these numbers can still
-                move; what has stopped is everything else. */}
-            締め済み · {period} is closed. Ordinary edits are refused; an approved correction is
-            still applied, so these totals can still change.
+                move; what has stopped is everything else.
+
+                The month named is `data.period`, THE ONE THIS REPORT IS FOR, never the one the
+                picker is showing. They agree in every ordinary render, and the point of not
+                relying on that is the case where they briefly would not: a badge that took its
+                month from the picker once claimed 締め済み over an open month's report. A lock is
+                the one claim on this screen that must come from the same read as the verdict. */}
+            締め済み · {data.period} is closed. Ordinary edits are refused; an approved correction
+            is still applied, so these totals can still change.
           </p>
         )}
 
@@ -349,18 +387,18 @@ function MonthTable({
     );
   }
 
-  const days = rows.reduce((sum, row) => sum + row.daysWorked, 0);
-  const minutes = rows.reduce((sum, row) => sum + row.workedMinutes, 0);
-  const flagged = rows.reduce((sum, row) => sum + row.anomalousDays, 0);
-
+  /*
+   * No summary line above this table, on purpose.
+   *
+   * The obvious one — employees, days, hours — has a number in it that cannot be labelled
+   * honestly in a word: days summed across people is person-days, and beside a column headed
+   * 出勤日数 it reads as a count of calendar days in the month. Payroll totals are not the place
+   * for a figure whose unit a reader has to infer. The per-employee rows are the report; a total
+   * row is a separate decision, needs a unit on it, and belongs to whoever asks for one.
+   */
   return (
     <div className="flex flex-col gap-3">
-      <p className="text-xs text-kumo-subtle" data-testid="monthly-summary">
-        {rows.length} {rows.length === 1 ? "employee" : "employees"} · {days}{" "}
-        {days === 1 ? "day" : "days"} · {formatWorkedHours(minutes)}
-        {flagged > 0 ? ` · ${flagged} ${flagged === 1 ? "day" : "days"} flagged` : ""}
-      </p>
-      {/* A real table: four of these five columns are numbers a reader compares down the column,
+      {/* A real table: three of these four columns are numbers a reader compares down the column,
           which is the one thing a list of cards cannot do. It scrolls inside its own box rather
           than pushing the page sideways. */}
       <div className="overflow-x-auto">

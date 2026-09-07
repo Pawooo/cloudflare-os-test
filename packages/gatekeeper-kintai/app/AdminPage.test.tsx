@@ -970,6 +970,29 @@ describe("AdminPage", () => {
         expect(api.monthlyReport).toHaveBeenCalledWith("2026-09");
       });
 
+      /**
+       * The case that makes the assertion above mean something.
+       *
+       * At the instant below `toISOString().slice(0, 7)` returns `2026-08` — the picker would open
+       * on the month that ended half an hour ago, and `lockPeriod` would then be one press away
+       * from closing a month while the company is still clocking into it. Every other test on this
+       * tab runs at midday JST, where UTC and JST agree on the month and either implementation
+       * passes.
+       */
+      it("reads the JST month in the first nine hours of a Japanese day, not the UTC one",
+        async () => {
+          // 2026-09-01T00:30+09:00 is 2026-08-31T15:30Z.
+          vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-09-01T00:30:00+09:00"));
+          const api = adminApi({}, [TANAKA]);
+          await render(<AdminPage api={api} />);
+
+          expect(monthlyText('[data-testid="month-label"]')).toBe("2026-09");
+          expect(api.monthlyReport).toHaveBeenCalledWith("2026-09");
+          expect(api.monthlyReport).not.toHaveBeenCalledWith("2026-08");
+          // And the month that just began is the ceiling, not the one that just ended.
+          expect(monthlyField<HTMLButtonElement>('[data-action="next-month"]').disabled).toBe(true);
+        });
+
       it("walks backwards a month at a time, across a year boundary", async () => {
         const api = adminApi({}, [TANAKA]);
         await render(<AdminPage api={api} />);
@@ -1189,6 +1212,10 @@ describe("AdminPage", () => {
           await click('[data-testid="panel-monthly"] [data-action="confirm-close-month"]');
 
           expect(api.lockPeriod).toHaveBeenCalledWith("2026-09");
+          // Once. The confirm button is `disabled` while the call is in flight, and without that
+          // guard a double press would be two closes — the second of which is the refusal the
+          // store raises for an already-closed month, shown to somebody who did nothing wrong.
+          expect(api.lockPeriod).toHaveBeenCalledTimes(1);
           expect(monthlyText('[data-testid="monthly-locked"]')).toContain("締め済み");
           expect(monthlyMaybe('[data-action="close-month"]')).toBeNull();
           expect(monthlyMaybe('[data-testid="close-confirm"]')).toBeNull();
@@ -1222,6 +1249,56 @@ describe("AdminPage", () => {
           .toContain("2026-09 is already closed — employee 3 closed it");
         expect(monthlyText('[data-testid="close-error"]')).not.toContain("KINTAI_");
       });
+
+      /**
+       * A lock claimed over a month that is not closed — the one lie this screen must never tell.
+       *
+       * Nothing disables the picker while a close is in flight, deliberately: a reader on a slow
+       * link who has changed their mind should be able to go and look at another month. What that
+       * allows is two reads racing. The `[period]` effect reads August the moment ← is pressed;
+       * the close's own post-await re-read then asked for September and, being later, won — so the
+       * panel held September's report while the picker said August, and August rendered
+       * 締め済み with its close control gone. It persisted until the picker moved again.
+       *
+       * On the one irreversible write in this package, that is a screen asserting a lock that does
+       * not exist, over a month somebody may still be clocking into. Two things stop it: the close
+       * skips its re-read when the picker has moved (the new month's read is already correct), and
+       * the badge names `report.data.period` rather than the picker's month, so the two sources
+       * cannot disagree visibly even if they ever disagree at all.
+       */
+      it("never reports a lock on a month the picker moved to while the close was in flight",
+        async () => {
+          let settle!: () => void;
+          const inFlight = new Promise<void>((resolve) => { settle = resolve; });
+          const closed = new Set<string>();
+          const api = adminApi({
+            monthlyReport: vi.fn<KintaiAdminClient["monthlyReport"]>(async (period) =>
+              report({ period, locked: closed.has(period) })),
+            lockPeriod: vi.fn<KintaiAdminClient["lockPeriod"]>(async (period) => {
+              await inFlight;
+              closed.add(period);
+            }),
+          }, [TANAKA]);
+          await render(<AdminPage api={api} />);
+
+          await click('[data-testid="panel-monthly"] [data-action="close-month"]');
+          await click('[data-testid="panel-monthly"] [data-action="confirm-close-month"]');
+          // September's close is in flight and has NOT settled. The reader goes back a month.
+          await click('[data-testid="panel-monthly"] [data-action="prev-month"]');
+          // Now it lands.
+          await act(async () => { settle(); });
+
+          // September really was closed — this is not a test about the write failing.
+          expect(api.lockPeriod).toHaveBeenCalledWith("2026-09");
+          // But August is what is on screen, and August is open.
+          expect(monthlyText('[data-testid="month-label"]')).toBe("2026-08");
+          expect(monthlyMaybe('[data-testid="monthly-locked"]')).toBeNull();
+          expect(monthlyMaybe('[data-action="close-month"]')).not.toBeNull();
+          expect(field<HTMLElement>('[data-testid="panel-monthly"]').textContent)
+            .not.toContain("締め済み");
+          // And September's report was not re-read over the top of August's.
+          expect(api.monthlyReport).toHaveBeenLastCalledWith("2026-08");
+        });
 
       // An armed confirmation names one month. Walking the picker while it is armed would leave a
       // confirmation about September in front of a reader now looking at August.

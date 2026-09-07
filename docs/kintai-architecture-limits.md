@@ -148,13 +148,16 @@ not:
 
 ## The pattern worth noticing
 
-Five of the six limits above are the same shape: **a capability implemented on the store, tested,
-and reachable from nowhere.** `createRoute` was one. `designated_approver_id`'s escape hatch was
-another. `correctPunch` is a third — it is what the amendment work exists to reach.
-`recordPunch`'s historical-write ability is a fourth, and that one should stay unreachable.
-`lockPeriod` is the fifth, and it is the one that shows what the shape actually costs: the lock it
-writes was enforced everywhere, so the gap did not read as a missing feature — it read as a system
+Four of the six limits above are the same shape: **a capability implemented on the store, tested,
+and reachable from nowhere.** `createRoute` was one, `designated_approver_id`'s escape hatch
+another, `recordPunch`'s historical-write ability a third — and that one should stay unreachable.
+`lockPeriod` is the fourth, and it is the one that shows what the shape actually costs: the lock it
+writes was enforced everywhere, so the gap did not read as a missing feature. It read as a system
 whose central compliance guarantee was watertight and permanently inert.
+
+`correctPunch` is a fifth instance with no heading of its own, because it never became a limit
+anybody hit: it is what the amendment work exists to reach, and it was reached before this document
+had to record it as unreachable.
 
 A store method with no caller is not a feature. It is either a gap that will surface as
 "the system cannot do X and nothing can fix it", or a hole waiting for someone in a hurry.

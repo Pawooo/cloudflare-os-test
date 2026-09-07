@@ -30,15 +30,19 @@ import type {
 } from "../types.js";
 
 /*
- * The four read shapes, re-exported so worker-side callers -- `admin-api.ts`, `KintaiStore` and
- * the tests -- still read each one from the module that produces it.
+ * The five read shapes this module produces, re-exported so worker-side callers -- `admin-api.ts`,
+ * `KintaiStore` and the tests -- still read each one from the module that produces it.
  *
  * The declarations moved to `src/types.ts` on 2026-09-04. Until then `app/AdminPage.tsx` carried a
- * SECOND, hand-written copy of all four, because `import type` from this module pulls it into the
- * app's type program and every `SqlStorage` in this file becomes an error there. Two copies compile
- * clean in both projects when a field is renamed here, and the dashboard then renders `undefined`
- * -- see that module's "wire shapes" section. Nothing about how these rows are ASSEMBLED moved;
- * that is still entirely below.
+ * SECOND, hand-written copy of THREE of them -- `PendingItem`, `AnomalousDay` and `EmployeeDay`,
+ * the three the dashboard rendered at the time -- because `import type` from this module pulls it
+ * into the app's type program and every `SqlStorage` in this file becomes an error there. Two
+ * copies compile clean in both projects when a field is renamed here, and the dashboard then
+ * renders `undefined` -- see that module's "wire shapes" section. `MonthlyReport` and
+ * `MonthlyTotalRow` were never restated: the 月次 tab landed after the move, and moving them with
+ * the other three is why it never had to be.
+ *
+ * Nothing about how any of these rows is ASSEMBLED moved; that is still entirely below.
  */
 export type { AnomalousDay, EmployeeDay, MonthlyReport, MonthlyTotalRow, PendingItem };
 
