@@ -34,6 +34,14 @@ file the missing punch on the employee's behalf (`requestCorrectionFor`/`request
 built and tested) — is not offered from the row. Cheap fix; belongs with this cycle or as a
 standalone steering fix, spec's call.
 
+Second finding, same session: the approvals rows name WHO can decide but never tell the viewing
+admin "this one is yours" versus "chase that person" — the owner, logged in as an admin who was
+not the eligible approver, spent real minutes working out why a decidable-looking row was not
+theirs to decide. The page already holds the admin's linked employee id (`whoAmI`) and the row
+already carries `eligibleActorIds`, so a "yours to decide" badge is a client-side comparison, no
+new reads. Company-wide visibility with route-held authority is the DESIGN (triage, not override,
+per the 2026-09-04 ruling) — the badge makes the design legible instead of puzzling.
+
 ## Constraints the spec inherits
 
 - This surface is a GADGET-side session UI: identity from the capability, no employee id
