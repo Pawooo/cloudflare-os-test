@@ -73,6 +73,28 @@ describe("PunchSource", () => {
     expect(container!.textContent!.split(/[^a-z]+/i)).not.toContain("amendment");
   });
 
+  // Task 4's review ruling: the amendment label carries the APPROVER's employee id, and a screen
+  // that has a way to turn that id into a name should show the name. The prop is how it passes one.
+  it("renders the approver's NAME when a resolver is given, not the bare #id", async () => {
+    await render(<PunchSource
+      punch={punch({ source: "amendment", amended_by: 7, amend_reason: "forgot to clock out" })}
+      resolveApprover={(id) => (id === 7 ? "山田 花子" : `#${id}`)}
+    />);
+
+    expect(container!.textContent).toContain("山田 花子");
+    expect(container!.textContent).not.toContain("#7");
+  });
+
+  // No resolver — the admin drill-down passes none, and this is the honest fallback: the id, never
+  // a blank. The whole point of keeping the prop optional.
+  it("falls back to #id for an amendment when no resolver is given", async () => {
+    await render(<PunchSource punch={punch({
+      source: "amendment", amended_by: 7, amend_reason: "forgot to clock out",
+    })} />);
+
+    expect(container!.textContent).toContain("#7");
+  });
+
   it("renders a neutral label for an admin-entered punch", async () => {
     await render(<PunchSource punch={punch({ source: "admin" })} />);
 

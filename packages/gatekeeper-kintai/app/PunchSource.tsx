@@ -10,9 +10,12 @@ import type { PunchRow } from "../src/types";
  * matters to the reader is WHO approved it and WHY, not the bare fact that it differs from what was
  * first recorded. `punch.amended_by` is the approver's employee id (see the comment beside its
  * write in `store/amendments.ts`, "the APPROVER, not the filer") — there is no employee-name table
- * reachable from a bare `PunchRow`, so the id is what is shown; a reader who needs the name behind
- * it already has the roster this screen is drawn beside. What must never happen is the id or reason
- * going missing and leaving the sentence to read as the internal word "amendment" alone.
+ * reachable from a bare `PunchRow`, so the id is the fallback; a reader who needs the name behind it
+ * already has the roster this screen is drawn beside. `resolveApprover` is how a screen that CAN
+ * turn that id into a name hands one in: given it, the name is shown; absent it, the `#id` fallback
+ * stands. It is deliberately optional — the admin day drill-down (`OverviewTab`) passes none and is
+ * unaffected. What must never happen is the id or reason going missing and leaving the sentence to
+ * read as the internal word "amendment" alone.
  *
  * `admin` and `import` get a neutral label rather than `gadget`'s treatment, because neither word is
  * platform jargon the way `gadget` is — an HR reader already knows what "an administrator entered
@@ -24,12 +27,18 @@ import type { PunchRow } from "../src/types";
  */
 export function describePunchSource(
   punch: Pick<PunchRow, "source" | "amended_by" | "amend_reason">,
+  resolveApprover?: (id: number) => string,
 ): string {
   switch (punch.source) {
     case "gadget":
       return "本人打刻";
     case "amendment": {
-      const approver = punch.amended_by === null ? "不明" : `#${punch.amended_by}`;
+      const approver =
+        punch.amended_by === null
+          ? "不明"
+          : resolveApprover
+            ? resolveApprover(punch.amended_by)
+            : `#${punch.amended_by}`;
       const reason = punch.amend_reason ?? "理由未記載";
       return `修正 (承認: ${approver}, 理由: ${reason})`;
     }
@@ -47,7 +56,13 @@ export function describePunchSource(
  * no capability, no control, nothing for the sandbox rules to say anything about.
  */
 export function PunchSource(
-  { punch }: { punch: Pick<PunchRow, "source" | "amended_by" | "amend_reason"> },
+  { punch, resolveApprover }: {
+    punch: Pick<PunchRow, "source" | "amended_by" | "amend_reason">;
+    /** Turn an approver's employee id into a name; omitted where no roster is at hand (`#id` shows). */
+    resolveApprover?: (id: number) => string;
+  },
 ) {
-  return <span className="ml-2 text-kumo-inactive">{describePunchSource(punch)}</span>;
+  return (
+    <span className="ml-2 text-kumo-inactive">{describePunchSource(punch, resolveApprover)}</span>
+  );
 }
