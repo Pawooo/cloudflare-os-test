@@ -1252,6 +1252,37 @@ describe("the frame the Workshop hosts", () => {
     expect(frame.iframeHtml).not.toContain('src="./main.tsx"');
     expect(await frame.ui.whoAmI()).toEqual({ accountId, linked: false, employeeId: null });
   });
+
+  // The role decides the BUNDLE, server-side, in the same expression it decides the capability —
+  // see `startAppUi`. A non-admin is served the employee gadget and an administrator the HR
+  // dashboard, and neither can ask for the other: `isAdmin` is consumed here and never sent to the
+  // browser. This is the security-relevant half of Task 3 — the split is only worth anything if it
+  // is the server that chooses.
+  it("serves the employee bundle to a non-admin and the admin bundle to an admin", async () => {
+    const employeeFrame = await host.openAppUi(`acct-bundle-emp-${seq}`, false);
+    const adminFrame = await host.openAppUi(`acct-bundle-hr-${seq}`, true);
+
+    // The tab-bar LABELS are the markers, each a literal present in one bundle and absent from the
+    // other: the employee gadget's 今日 / 今月, the admin dashboard's 要対応. (The `tab-*` testids
+    // are built at runtime — `data-testid={`tab-${id}`}` — so they are no literal to grep for; the
+    // labels are.) Present-in-one AND absent-from-the-other on both sides is what proves the role
+    // picked the bundle, rather than one bundle that happens to carry both surfaces.
+    expect(employeeFrame.iframeHtml).toContain("今日");
+    expect(employeeFrame.iframeHtml).toContain("今月");
+    expect(employeeFrame.iframeHtml).not.toContain("要対応");
+
+    expect(adminFrame.iframeHtml).toContain("要対応");
+    expect(adminFrame.iframeHtml).not.toContain("今日");
+
+    // The capability handed alongside agrees with the bundle: the employee stub answers `whoAmI`
+    // but has no admin `listEmployees` to call, and the admin stub does. `appUi` re-opens the frame
+    // per call, so this is the same role decision reached independently of the html above.
+    const emp = appUi(`acct-bundle-emp2-${seq}`, false);
+    const hr = appUi(`acct-bundle-hr2-${seq}`, true);
+    expect(await emp.whoAmI()).toMatchObject({ linked: false });
+    await expect(() => emp.listEmployees()).rejects.toThrow(/does not implement the method/);
+    expect(Array.isArray(await hr.listEmployees())).toBe(true);
+  });
 });
 
 // MUST BE LAST IN THIS FILE. `punch()` derives its work date from the wall clock, so the only

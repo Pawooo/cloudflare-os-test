@@ -26,7 +26,7 @@ import type {
   VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type {
-  ApprovalAction, EmployeeId, EmployeeMonth, KintaiIdentity, PunchKind,
+  ApprovalAction, EmployeeId, EmployeeMonth, KintaiIdentity, PunchKind, PunchReceipt,
 } from "./types.js";
 import type { AllocationEntry, AllocationRow, Reconciliation } from "./store/allocations.js";
 import type { PunchLocation, PunchRow } from "./store/punches.js";
@@ -51,6 +51,7 @@ import {
 import { jstClockTime } from "./work-date.js";
 import TYPES_CODE from "./types.txt";
 import APP_HTML from "./generated/app.txt";
+import EMPLOYEE_APP_HTML from "./generated/employee-app.txt";
 
 const KINTAI_ICON = {
   url:
@@ -659,9 +660,12 @@ export class KintaiAccount
    * The alternative — one capability plus a boolean the app is trusted to honour — would put
    * `linkAccount` one forged message away from anyone, and `linkAccount` grants identity.
    *
-   * The bundle is the same `APP_HTML` for both today; splitting the employee view out of it is
-   * Task 3. What differs now is the capability behind the iframe, which is the half that decides
-   * what a browser can actually do.
+   * The bundle now follows the capability: an administrator gets `APP_HTML` (the HR dashboard) and
+   * everyone else gets `EMPLOYEE_APP_HTML` (the attendance gadget). BOTH halves of the frame are
+   * chosen from `context.isAdmin` in this one expression — the same server-side decision, made
+   * once, that `isAdmin` never leaves. The browser is handed a bundle AND a capability that agree,
+   * and cannot ask for the other pairing: the admin bundle's methods have no employee stub behind
+   * them, and the employee bundle carries no admin surface to call.
    */
   async startAppUi(context: AppUiContext): Promise<GatekeeperUiFrame> {
     const ui = new NativeRpcStub(
@@ -669,7 +673,7 @@ export class KintaiAccount
         ? new AdminKintaiApi(this.#store(), this.ctx.props.accountId)
         : new EmployeeKintaiApi(this.#store(), this.ctx.props.accountId),
     );
-    return { iframeHtml: APP_HTML, ui };
+    return { iframeHtml: context.isAdmin ? APP_HTML : EMPLOYEE_APP_HTML, ui };
   }
 
   /** Returns no URL-addressed resources: attendance is ambient, not a thing with a URL. */
@@ -751,8 +755,10 @@ export class KintaiVerifier
   verify(): void {}
 }
 
-/** A punch write's receipt: the row created, whose it is, and the day it was filed against. */
-export type PunchReceipt = { punchId: number; employeeId: EmployeeId; workDate: string };
+// Re-exported so existing importers keep reading it from here; the declaration moved to
+// `src/types.ts` when `KintaiEmployeeClient` — the app-facing mirror of `EmployeeKintaiApi`, whose
+// `punch` returns this — needed it in the zero-import leaf `app/` can compile.
+export type { PunchReceipt };
 
 /**
  * THE punch implementation. Both facets that let a person clock in and out — `KintaiSession.punch`
