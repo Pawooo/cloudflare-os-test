@@ -16,29 +16,38 @@ import {
 /**
  * The HR admin surface, served to the management app at `/gatekeepers/kintai`.
  *
- * Two classes implement this interface, and which one a browser gets is decided once, server-side,
- * in `KintaiAccount.startAppUi()` from the `isAdmin` the Workshop supplies. `AdminKintaiApi` does
- * the work; `ViewerKintaiApi` refuses everything but `whoAmI`. The flag itself never reaches the
- * iframe, so there is nothing for a browser to lie about — a non-admin's capability simply has no
- * admin behaviour behind it.
+ * Which capability a browser gets is decided once, server-side, in `KintaiAccount.startAppUi()`
+ * from the `isAdmin` the Workshop supplies: an administrator gets `AdminKintaiApi`, which
+ * implements every member here; everyone else gets `EmployeeKintaiApi` (in `kintai.ts`), a
+ * DIFFERENT capability that carries none of these methods — one employee's own attendance, and
+ * nothing administrative. The flag itself never reaches the iframe, so there is nothing for a
+ * browser to lie about: a non-admin's capability has no admin method to call under any argument,
+ * because it is not this class and does not implement this interface.
  *
- * Both classes `implements KintaiAdminApi`, which is the load-bearing part: adding a REQUIRED
- * member to this interface makes both classes fail to compile until someone writes down whether a
- * non-admin may call it. This mirrors `UseOverseerInterface` in `workshop-backend`, for the same
- * reason (see docs/sharing.md).
+ * That is the whole authorization property, and it is structural rather than a check. There is no
+ * refuse-everything twin holding the line any more — a non-admin simply holds a capability on
+ * which `linkAccount` and its siblings do not exist. (This replaced `ViewerKintaiApi`, which used
+ * to `implements KintaiAdminApi` and throw on all but `whoAmI` so that a non-admin's capability
+ * still answered every admin call, with a refusal; the employee gadget gave non-admins a real
+ * capability of their own, and a refuse-all stub with the admin methods still spelled out on it was
+ * then both dead and a wider surface than "the methods are absent".)
  *
- * Know the two things that guard does NOT cover, because both compile clean:
+ * `AdminKintaiApi implements KintaiAdminApi` is still load-bearing: a REQUIRED member added here
+ * makes `AdminKintaiApi` fail to compile until it is written, so the surface cannot grow a method
+ * nobody implemented. Know the two things that guard does NOT cover, because both compile clean:
  *
- *  - a public method added to `ViewerKintaiApi` itself that is absent from this interface. It is
+ *  - a public method added to `AdminKintaiApi` itself that is absent from this interface. It is
  *    callable over RPC, and `implements` says nothing about it. (Narrowing the decorator to
  *    `@validateRpc<KintaiAdminApi>()` does generate a narrowed `methods` map, but
  *    capnweb-validate 0.3.0's runtime wrapper dispatches the extra method regardless.)
- *  - an OPTIONAL member (`foo?(): Promise<void>`) added here, which both classes satisfy without
+ *  - an OPTIONAL member (`foo?(): Promise<void>`) added here, which the class satisfies without
  *    implementing.
  *
- * Neither is caught by the compiler, so both are caught by the test instead: see "exposes exactly
- * the interface" in `__tests__/admin-api.test.ts`, which pins the callable surface of both classes
- * against a written-out list of these members. Add a member here and that list must change too.
+ * Neither is caught by the compiler, so both are caught by the test instead: see "keeps the admin
+ * capability to exactly the interface" in `__tests__/admin-api.test.ts`, which pins the callable
+ * surface of `AdminKintaiApi` against a written-out list of these members. Add a member here and
+ * that list must change too. The parallel pin for the non-admin capability — that
+ * `EmployeeKintaiApi` exposes none of these — lives in `__tests__/employee-api.test.ts`.
  *
  * WHAT THIS CAPABILITY READS, as of 2026-09-04: all attendance, for everybody, down to individual
  * punches. `listPendingOverview`, `listAnomalousDays`, `monthlyReport` and `getEmployeeDay` widen
@@ -56,15 +65,13 @@ import {
  * capability; nothing on this interface is that, and a manager holding a Workshop admin account is
  * getting the HR capability, not a manager's one.
  *
- * `ViewerKintaiApi` is what holds that line, and it is the reason these members are on the
- * interface rather than only on the admin class. It implements every member here and throws on all
- * but `whoAmI`, so a non-admin's capability carries ZERO attendance reads — not a filtered view,
- * not an empty list, nothing to call. A read added to `AdminKintaiApi` alone compiles perfectly
- * well and leaves no written decision anywhere about whether a non-admin may have it; this
- * interface is what forces that decision to be made, and the surface test is what pins the answer
- * for both classes. The gap that stays uncaught by the compiler is still the one named above — a
- * public method on `ViewerKintaiApi` that is absent from here — so a new read belongs on the
- * interface first, never on a class first.
+ * A non-admin carries ZERO of these attendance reads — not a filtered view, not an empty list,
+ * nothing to call — because they hold `EmployeeKintaiApi`, on which none of them exists. A read
+ * added here reaches only an administrator's capability; whether a non-admin may see the same thing
+ * is a separate decision, made by adding the corresponding method to `EmployeeKintaiApi` (scoped to
+ * the caller's own record) or deliberately not. The gap that stays uncaught by the compiler is the
+ * one named above — a public method on `AdminKintaiApi` absent from here — so a new read belongs on
+ * this interface first, never on the class first.
  */
 export interface KintaiAdminApi {
   /**
@@ -220,23 +227,6 @@ export interface KintaiAdminApi {
 export type { KintaiIdentity };
 
 /**
- * Thrown when a non-admin capability is asked for something only HR may do.
- *
- * The code is repeated in the message, as every other error in this package does, because `code`
- * is a plain own property and does not survive the RPC boundary — the browser receives the message
- * and nothing else.
- */
-export class AdminRequiredError extends Error {
-  readonly code = "KINTAI_ADMIN_REQUIRED";
-  constructor(method: string) {
-    super(
-      `KINTAI_ADMIN_REQUIRED: ${method} is available to Workshop administrators only. ` +
-      "Ask an administrator to make this change.",
-    );
-  }
-}
-
-/**
  * Thrown when an administrator with no employee record of their own tries to close a month.
  *
  * `period_locks.locked_by` is NOT NULL, and that is the right shape rather than an oversight: a
@@ -268,14 +258,16 @@ export class UnlinkedAdminError extends Error {
 }
 
 /**
- * `whoAmI` for both capabilities, written once.
+ * `whoAmI`, written once and shared by the admin and employee capabilities alike.
  *
- * Shared as a function rather than through a base class so each class still declares every method
- * it serves: `@validateRpc()` and the `implements` check both read what is written on the class,
- * and an inherited method is exactly the kind of thing that could go missing from one of those
- * without anyone noticing.
+ * A plain function rather than a base class so each capability still declares every method it
+ * serves: `@validateRpc()` and the `implements` check both read what is written on the class, and
+ * an inherited method is exactly the kind of thing that could go missing from one of those without
+ * anyone noticing. Exported so `EmployeeKintaiApi` (in `kintai.ts`) answers `whoAmI` from the same
+ * resolution as `AdminKintaiApi` — the employee reads their OWN account code off it, which is the
+ * one thing every caller, admin or not, may do.
  */
-async function identify(
+export async function identify(
   store: DurableObjectStub<KintaiStore>, accountId: string,
 ): Promise<KintaiIdentity> {
   const employeeId = await store.resolveAccount(accountId, Date.now());
@@ -767,144 +759,5 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
    */
   async #actor(now: number): Promise<EmployeeId | null> {
     return this.#store.resolveAccount(this.#accountId, now);
-  }
-}
-
-/**
- * The capability handed to everyone who is not a Workshop administrator.
- *
- * Every member of `KintaiAdminApi` is written out, and all but `whoAmI` refuse. That is
- * deliberately more verbose than a check inside each admin method would be, and it buys the one
- * thing a check cannot: because this class `implements KintaiAdminApi`, a REQUIRED member added to
- * that interface in part 2 fails to compile here until a developer decides whether non-admins may
- * call it. The failure mode of forgetting is a build error, not a quietly-widened surface.
- *
- * The compiler's reach stops there. A public method added to THIS CLASS but not to the interface,
- * and an optional member added to the interface, both compile clean and would widen what a
- * non-admin can call — see the interface's own comment. The surface test is what covers those, and
- * it is not optional decoration.
- *
- * `never` as the return type rather than the interface's `Promise<...>`: `never` satisfies any
- * return type, and writing it says the body cannot produce a value at all, which is the point.
- * The parameters are still spelled out so the refusal cannot be dodged by shape.
- */
-@validateRpc()
-export class ViewerKintaiApi extends RpcTarget implements KintaiAdminApi {
-  readonly #store: DurableObjectStub<KintaiStore>;
-  readonly #accountId: string;
-
-  constructor(store: DurableObjectStub<KintaiStore>, accountId: string) {
-    super();
-    this.#store = store;
-    this.#accountId = accountId;
-  }
-
-  /** Allowed: reading your own account code is how you get yourself onboarded. */
-  async whoAmI(): Promise<KintaiIdentity> {
-    return identify(this.#store, this.#accountId);
-  }
-
-  /** Refused: the roster is the company's headcount, not a directory for every employee. */
-  listEmployees(): never {
-    throw new AdminRequiredError("listEmployees");
-  }
-
-  /** Refused: the org chart is administrative data. */
-  listReportingLines(): never {
-    throw new AdminRequiredError("listReportingLines");
-  }
-
-  /** Refused: creating employee records is HR's job. */
-  createEmployee(_input: NewEmployee): never {
-    throw new AdminRequiredError("createEmployee");
-  }
-
-  /**
-   * Refused, and this is the one that matters most: `linkAccount` maps an account capability onto
-   * an employee record. Reachable by a non-admin, it would let anyone become anyone — a manager
-   * included — and every authority check in the approval path would then pass for them honestly,
-   * because they really would be that employee as far as the store is concerned.
-   */
-  linkAccount(_accountId: string, _employeeId: EmployeeId): never {
-    throw new AdminRequiredError("linkAccount");
-  }
-
-  /**
-   * Refused: a reporting line grants authority over someone else's submissions, so writing one is
-   * granting approval power.
-   */
-  setReportingLine(_employeeId: EmployeeId, _managerId: EmployeeId): never {
-    throw new AdminRequiredError("setReportingLine");
-  }
-
-  /**
-   * Refused: naming a designated approver hands one person authority to sign for another, and the
-   * employee it names an approver FOR is the one at the root of the org chart, whose record nobody
-   * else reviews. Reachable by them, it would be a way to appoint whoever is most likely to agree.
-   */
-  setDesignatedApprover(_employeeId: EmployeeId, _approverId: EmployeeId): never {
-    throw new AdminRequiredError("setDesignatedApprover");
-  }
-
-  /**
-   * Refused: 管理監督者 is a determination about an employee's authority that exempts their
-   * overtime from premium pay. Reachable by the employee it describes, it would be a way to write
-   * one's own exemption from 労働基準法 §37 into the payroll record.
-   */
-  grantExemption(_employeeId: EmployeeId): never {
-    throw new AdminRequiredError("grantExemption");
-  }
-
-  /**
-   * Refused: which day a punch is filed against decides what an employee's night hours are worth.
-   * Reachable by the employee it describes, it would be a way to move one's own overnight hours
-   * onto a different day — and, on the other side, a way to split a colleague's shift in two and
-   * flag every day they work.
-   */
-  setWorkDatePolicy(_employeeId: EmployeeId, _policy: WorkDatePolicy): never {
-    throw new AdminRequiredError("setWorkDatePolicy");
-  }
-
-  /**
-   * Refused: this is every waiting request in the company, whose employee, whose filer and whose
-   * eligible approvers are all named in words. An employee's own requests are on their session
-   * (`listMySubmissions`), and an approver's are on theirs (`listPendingApprovals`) — both scoped
-   * to the person holding the capability, which is the property this read deliberately drops.
-   */
-  listPendingOverview(): never {
-    throw new AdminRequiredError("listPendingOverview");
-  }
-
-  /**
-   * Refused: a flagged day names an employee and says something about how they worked — a missing
-   * clock-out, a fourteen-hour span. Company-wide, it is a list of who is having a bad month.
-   */
-  listAnomalousDays(_period: string): never {
-    throw new AdminRequiredError("listAnomalousDays");
-  }
-
-  /** Refused: this is every employee's hours for a month, which is payroll input. */
-  monthlyReport(_period: string): never {
-    throw new AdminRequiredError("monthlyReport");
-  }
-
-  /**
-   * Refused, and this is the punch-level one: the times a named person clocked in and out on a
-   * named day, and where they were standing. An employee reads their OWN day through
-   * `KintaiSession.getDay`, which is scoped to the employee their capability resolves to and takes
-   * no employee id at all. This one takes an id, which is exactly why it is admin-only.
-   */
-  getEmployeeDay(_employeeId: EmployeeId, _workDate: string): never {
-    throw new AdminRequiredError("getEmployeeDay");
-  }
-
-  /**
-   * Refused: closing a month makes every punch in it final, and it cannot be undone. Reachable by
-   * an employee, it would be a way to freeze a month before a colleague's correction could be filed
-   * against it — or to close the live month over everybody's heads, which stops the whole company
-   * from clocking in.
-   */
-  lockPeriod(_period: string): never {
-    throw new AdminRequiredError("lockPeriod");
   }
 }

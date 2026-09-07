@@ -25,7 +25,9 @@ import type {
   SupportedResource,
   VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
-import type { ApprovalAction, EmployeeId, PunchKind } from "./types.js";
+import type {
+  ApprovalAction, EmployeeId, EmployeeMonth, KintaiIdentity, PunchKind,
+} from "./types.js";
 import type { AllocationEntry, AllocationRow, Reconciliation } from "./store/allocations.js";
 import type { PunchLocation, PunchRow } from "./store/punches.js";
 import type { ActPreview, SubmissionRow } from "./store/submissions.js";
@@ -41,9 +43,9 @@ import { isWorkDateRaced } from "./store/punches.js";
 // The store's schema module owns this: it is the same PRAGMA test, run for the same reason, and a
 // second copy of it is exactly the kind of duplication this package has been bitten by.
 import { hasColumn } from "./store/schema.js";
-import { AdminKintaiApi, ViewerKintaiApi } from "./admin-api.js";
+import { AdminKintaiApi, identify } from "./admin-api.js";
 import {
-  assertEmployeeId, assertMinutes, assertPunchKind, assertRequiredText, assertText,
+  assertEmployeeId, assertMinutes, assertPeriod, assertPunchKind, assertRequiredText, assertText,
   assertWorkDate, InvalidInputError, LIMITS,
 } from "./input.js";
 import { jstClockTime } from "./work-date.js";
@@ -643,23 +645,29 @@ export class KintaiAccount
   }
 
   /**
-   * Opens the HR administration app, with a capability SHAPED by the caller's admin status.
+   * Opens the app, with the capability CHOSEN by the caller's admin status.
    *
-   * This is the authorization decision for the whole admin surface, and it is made here, once, on
-   * the server. `context.isAdmin` is supplied fresh by the Workshop on every open (a user's admin
+   * This is the authorization decision for the whole surface, and it is made here, once, on the
+   * server. `context.isAdmin` is supplied fresh by the Workshop on every open (a user's admin
    * status can change), and it is consumed by this expression and never travels any further: it is
    * not put in the frame, not sent to the iframe, and not accepted back from it. The browser
-   * therefore has nothing to lie about — a non-admin holds `ViewerKintaiApi`, which has no admin
-   * behaviour to invoke under any argument.
+   * therefore has nothing to lie about — an administrator holds `AdminKintaiApi`; everyone else
+   * holds `EmployeeKintaiApi`, a DIFFERENT capability scoped to their own attendance, on which
+   * `linkAccount` and every other admin method simply does not exist. There is no flag for the app
+   * to respect and no method to refuse; the two are different objects.
    *
-   * The alternative — one capability plus a boolean the app is trusted to respect — would put
+   * The alternative — one capability plus a boolean the app is trusted to honour — would put
    * `linkAccount` one forged message away from anyone, and `linkAccount` grants identity.
+   *
+   * The bundle is the same `APP_HTML` for both today; splitting the employee view out of it is
+   * Task 3. What differs now is the capability behind the iframe, which is the half that decides
+   * what a browser can actually do.
    */
   async startAppUi(context: AppUiContext): Promise<GatekeeperUiFrame> {
     const ui = new NativeRpcStub(
       context.isAdmin
         ? new AdminKintaiApi(this.#store(), this.ctx.props.accountId)
-        : new ViewerKintaiApi(this.#store(), this.ctx.props.accountId),
+        : new EmployeeKintaiApi(this.#store(), this.ctx.props.accountId),
     );
     return { iframeHtml: APP_HTML, ui };
   }
@@ -741,6 +749,88 @@ export class KintaiVerifier
   implements GatekeeperUserVerifier
 {
   verify(): void {}
+}
+
+/** A punch write's receipt: the row created, whose it is, and the day it was filed against. */
+export type PunchReceipt = { punchId: number; employeeId: EmployeeId; workDate: string };
+
+/**
+ * THE punch implementation. Both facets that let a person clock in and out — `KintaiSession.punch`
+ * (the agent-facing session) and `EmployeeKintaiApi.punch` (the app-UI employee capability) — call
+ * exactly this, so the correctness-critical write has one code path rather than two that could
+ * drift. Resolve the employee from the capability, then punch, with the one retry the race needs.
+ *
+ * Three RPCs into the store, and each is its own turn of that Durable Object's input gate, so the
+ * gate opens twice inside this function. Deciding the date in `workDateFor` and writing it in
+ * `commitPunch` is therefore not atomic: a concurrent `punch("out")` can close the shift in
+ * between, and the `in` that read it would be filed against a shift that no longer exists.
+ * `commitPunch` closes that — it decides the date AGAIN under the write's own gate and refuses if
+ * the answer moved — and this function's job is to arrange the calls so that refusal can only ever
+ * happen against a date whose period lock has been checked.
+ *
+ * Hence `attemptPunch` and hence the single retry. The lock check stays out here rather than move
+ * into the store: the amendment path writes into closed periods and reaches the store directly, so
+ * the store's writes cannot enforce locks for everyone. If the store refuses the date, the whole
+ * sequence is redone — a fresh `workDateFor`, a fresh `assertWritable` against whatever it now
+ * says, then the write — so the second attempt is validated exactly as carefully as the first. It
+ * runs at most twice and the second attempt's refusal is surfaced, so there is no loop: a punch
+ * cannot spin, and a store that disagreed twice is reporting a real conflict rather than a lost
+ * race.
+ *
+ * `now` is captured by the CALLER and reused across both attempts, deliberately. It is when the
+ * employee actually tapped the button, it is the `occurred_at` that gets written, and it is what
+ * makes the store's recomputation a function of the punch table alone. Re-reading the clock on the
+ * retry would move the event — so the callers read `Date.now()` once and pass it, exactly as every
+ * instant in this package is a server clock and never a caller-supplied one.
+ */
+export async function performPunch(
+  store: DurableObjectStub<KintaiStore>,
+  accountId: string,
+  kind: PunchKind,
+  location: PunchLocation | undefined,
+  now: number,
+): Promise<PunchReceipt> {
+  const employeeId = await store.resolveAccount(accountId, now);
+  if (employeeId === null) throw new UnlinkedAccountError();
+  try {
+    return await attemptPunch(store, employeeId, kind, now, location);
+  } catch (caught) {
+    if (!isWorkDateRaced(caught)) throw caught;
+    // Exactly one retry, and it is not a loop: this is the only site that retries, and nothing
+    // `attemptPunch` calls can reach `performPunch` again.
+    return await attemptPunch(store, employeeId, kind, now, location);
+  }
+}
+
+/**
+ * One attempt at the punch: attribute, check the lock against what came back, write.
+ *
+ * Throws `WorkDateRacedError` — recognised by its message across the RPC boundary, see
+ * `isWorkDateRaced` — if the store's own recomputation disagrees with the date checked here.
+ */
+async function attemptPunch(
+  store: DurableObjectStub<KintaiStore>,
+  employeeId: EmployeeId, kind: PunchKind, now: number, location?: PunchLocation,
+): Promise<PunchReceipt> {
+  // Which day this punch belongs to is the employee's own `work_date_policy`, read from the record
+  // their capability resolved to and never from anything the caller said. For everyone on
+  // `calendar` this is `jstWorkDate(now)`; for `shift_start` it is the date of the shift open right
+  // now, so an overnight shift stays on one day. The rule lives in `store/punches.ts`; this asks
+  // for the answer. `kind` goes with it because the duplicate-window exception is keyed on it.
+  const workDate = await store.workDateFor(employeeId, now, kind);
+  // Period locks are enforced here, not inside the store's write functions: the amendment path has
+  // to be able to write into a closed period, and it reaches the store directly.
+  //
+  // Checked against the ATTRIBUTED date, not today's: a night worker clocking out at 06:00 on the
+  // first of the month is writing into the month that just closed, and that has to be refused the
+  // same as any other write into a locked period.
+  await store.assertWritable(workDate);
+  // `commitPunch`, not `recordPunch`: the date above was decided in a turn that has since ended,
+  // and this one refuses the write outright if it no longer holds.
+  const punchId = await store.commitPunch({
+    employeeId, workDate, kind, now, source: "gadget", location,
+  });
+  return { punchId, employeeId, workDate };
 }
 
 /**
@@ -863,74 +953,18 @@ export class KintaiSession extends RpcTarget {
   /**
    * Record a clock event, at one instant, on the day the server decides it belongs to.
    *
-   * Three RPCs into the store, and each is its own turn of that Durable Object's input gate, so
-   * the gate opens twice inside this method. Deciding the date in the first turn and writing it in
-   * the third is therefore not atomic: a concurrent `punch("out")` can close the shift in between,
-   * and the `in` that read it would be filed against a shift that no longer exists. `commitPunch`
-   * closes that — it decides the date AGAIN under the write's own gate and refuses if the answer
-   * moved — and this method's job is to arrange the three calls so that refusal can only ever
-   * happen against a date whose period lock has been checked.
+   * Delegates to the free `performPunch` (above), which is the ONE punch implementation this
+   * session shares with `EmployeeKintaiApi.punch`: resolve the employee from the capability,
+   * attribute the date, check the lock against it, write, with the single race retry. The
+   * orchestration and its reasoning live there so both callers are provably one path; this method
+   * is the session's door onto it, reading the server clock once and passing it down.
    *
-   * Hence `#attemptPunch` and hence the single retry. The lock check has to stay out here rather
-   * than move into the store: the amendment path writes into closed periods and reaches the store
-   * directly, so the store's writes cannot enforce locks for everyone. If the store refuses the
-   * date, the whole sequence is redone — a fresh `workDateFor`, a fresh `assertWritable` against
-   * whatever it now says, then the write — so the second attempt is validated exactly as carefully
-   * as the first. It runs at most twice and the second attempt's refusal is surfaced, so there is
-   * no loop here: a punch cannot spin, and a store that disagreed twice is reporting a real
-   * conflict rather than a lost race.
-   *
-   * `now` is captured once and reused across both attempts, deliberately. It is when the employee
-   * actually tapped the button, it is the `occurred_at` that gets written, and it is what makes
-   * the store's recomputation a function of the punch table alone. Re-reading the clock on the
-   * retry would move the event.
+   * `punch` takes `kind` and an optional `location` and NOTHING else — no work date, no policy, no
+   * timestamp. A Gadget can pass extra arguments and they are ignored by the signature, so the day
+   * a punch lands on and the moment it records stay the server's to decide.
    */
-  async punch(
-    kind: PunchKind, location?: PunchLocation,
-  ): Promise<{ punchId: number; employeeId: EmployeeId; workDate: string }> {
-    const now = Date.now();
-    const employeeId = await this.#requireEmployee(now);
-    try {
-      return await this.#attemptPunch(employeeId, kind, now, location);
-    } catch (caught) {
-      if (!isWorkDateRaced(caught)) throw caught;
-      // Exactly one retry, and it is not a loop: this is the only call site of `#attemptPunch`
-      // that retries, and nothing `#attemptPunch` calls can reach `punch` again.
-      return await this.#attemptPunch(employeeId, kind, now, location);
-    }
-  }
-
-  /**
-   * One attempt at the punch: attribute, check the lock against what came back, write.
-   *
-   * Throws `WorkDateRacedError` — recognised by its message across the RPC boundary, see
-   * `isWorkDateRaced` — if the store's own recomputation disagrees with the date checked here.
-   */
-  async #attemptPunch(
-    employeeId: EmployeeId, kind: PunchKind, now: number, location?: PunchLocation,
-  ): Promise<{ punchId: number; employeeId: EmployeeId; workDate: string }> {
-    // Which day this punch belongs to is the employee's own `work_date_policy`, read from the
-    // record their capability resolved to and never from anything the caller said. For everyone on
-    // `calendar` — the default, and everyone who existed before the policy did — this is
-    // `jstWorkDate(now)` and nothing more. For `shift_start` it is the date of the shift that is
-    // open right now, so an overnight shift stays on one day. The rule itself lives in
-    // `store/punches.ts`, where the punches it reads are; this asks for the answer. `kind` goes
-    // with it because the duplicate-window exception inside that rule is keyed on it.
-    const workDate = await this.#store.workDateFor(employeeId, now, kind);
-    // Period locks are enforced here, not inside the store's write functions: the amendment path
-    // has to be able to write into a closed period, and it reaches the store directly.
-    //
-    // Checked against the ATTRIBUTED date, not today's: a night worker clocking out at 06:00 on
-    // the first of the month is writing into the month that just closed, and that has to be
-    // refused the same as any other write into a locked period.
-    await this.#store.assertWritable(workDate);
-
-    // `commitPunch`, not `recordPunch`: the date above was decided in a turn that has since
-    // ended, and this one refuses the write outright if it no longer holds.
-    const punchId = await this.#store.commitPunch({
-      employeeId, workDate, kind, now, source: "gadget", location,
-    });
-    return { punchId, employeeId, workDate };
+  async punch(kind: PunchKind, location?: PunchLocation): Promise<PunchReceipt> {
+    return performPunch(this.#store, this.#accountId, kind, location, Date.now());
   }
 
   async getDay(workDate: string): Promise<{
@@ -1822,6 +1856,163 @@ export class KintaiGatekeeper
     _action: number,
   ): Promise<void | { message?: string; canRetry?: boolean; restart?: boolean }> {
     throw new RevertUnsupportedError();
+  }
+}
+
+/**
+ * One employee's own attendance capability, served to every non-admin by `startAppUi`.
+ *
+ * The employee-facing half of the same surface `AdminKintaiApi` is the HR half of: an app-UI
+ * capability built once, server-side, from `isAdmin`. It carries one employee's own record and
+ * nothing wider — no roster, no org chart, no other employee's day, and none of the on-behalf
+ * filing the session facet allows a manager. Which employee is decided by the capability, resolved
+ * from `ctx.props.accountId` on every call, and NO method takes an employee identifier: there is
+ * nothing for a Gadget-rewriting employee to name themselves as, exactly as on `KintaiSession`.
+ *
+ * A concrete class with NO throw-with-interface twin, unlike the admin pair. There is no "employee
+ * viewer" to refuse: a non-admin is precisely who this capability is FOR, so the structural line
+ * `ViewerKintaiApi` used to hold — a refuse-all twin implementing the admin interface — has no
+ * analogue here. The one thing that still has to be pinned is the surface itself: that this class
+ * exposes exactly its own methods and NONE of the admin ones, nor `listPendingApprovals` /
+ * `actOnSubmission` / any on-behalf `...For` — the approval and management surfaces belong to the
+ * session and admin facets, not here. That pin lives in `__tests__/employee-api.test.ts`.
+ *
+ * `#store` is `#`-private for the reason it is on `KintaiSession`: it is an UNAUTHENTICATED handle
+ * on the whole company's ledger, taking an `employeeId` on nearly every method, so a public field
+ * would itself become part of the RPC surface and hand a Gadget the very parameter this class
+ * withholds. `punch` is the shared `performPunch`, so an employee's clock-in and an agent's are one
+ * implementation; the amendment filings mirror `KintaiSession`'s own bodies, for one employee with
+ * no on-behalf variant, and record `createdBy = self` — never defaulted, because the origination
+ * rule that stops a filer approving their own request is only as strong as that column.
+ */
+@validateRpc()
+export class EmployeeKintaiApi extends RpcTarget {
+  readonly #store: DurableObjectStub<KintaiStore>;
+  readonly #accountId: string;
+
+  constructor(store: DurableObjectStub<KintaiStore>, accountId: string) {
+    super();
+    this.#store = store;
+    this.#accountId = accountId;
+  }
+
+  /**
+   * Who the caller is, from the same `identify` the admin capability answers with — the employee
+   * reads their OWN account code off it, which is the one thing an unlinked account may do.
+   */
+  async whoAmI(): Promise<KintaiIdentity> {
+    return identify(this.#store, this.#accountId);
+  }
+
+  /** One day's punches, allocations, reconciliation, flags and lock — the caller's own. */
+  async getDay(workDate: string): Promise<{
+    punches: PunchRow[];
+    allocations: AllocationRow[];
+    reconciliation: Reconciliation;
+    anomalies: string[];
+    locked: boolean;
+  }> {
+    assertWorkDate("workDate", workDate);
+    const now = Date.now();
+    const employeeId = await this.#requireEmployee(now);
+    return {
+      punches: await this.#store.currentPunches(employeeId, workDate),
+      allocations: await this.#store.currentAllocations(employeeId, workDate),
+      reconciliation: await this.#store.reconcile(employeeId, workDate),
+      // Surfaced alongside the day rather than left for the caller to derive: a forgotten clock-out
+      // contributes nothing to `workedMinutes`, so without this the day silently looks short.
+      anomalies: await this.#store.dayAnomalies(employeeId, workDate),
+      locked: await this.#store.isLocked(workDate),
+    };
+  }
+
+  /** One month of the caller's own days: worked minutes, flags and per-day overtime state. */
+  async myMonth(period: string): Promise<EmployeeMonth> {
+    assertPeriod("period", period);
+    const now = Date.now();
+    const employeeId = await this.#requireEmployee(now);
+    return this.#store.employeeMonth(employeeId, period);
+  }
+
+  /**
+   * Record a clock event, through the ONE punch implementation both facets share. `now` is the
+   * server's, read here and passed down; `punch` takes `kind` and an optional `location` and
+   * nothing else, so the day it lands on and the moment it records stay the server's to decide.
+   */
+  async punch(kind: PunchKind, location?: PunchLocation): Promise<PunchReceipt> {
+    return performPunch(this.#store, this.#accountId, kind, location, Date.now());
+  }
+
+  /**
+   * Ask for a punch that was never recorded to be added — the forgotten clock-out. A REQUEST, not
+   * an edit: nothing changes until an approver applies it. Mirrors `KintaiSession`'s own body, for
+   * the caller's own record only.
+   */
+  async requestMissingPunch(
+    workDate: string, kind: PunchKind, occurredAt: number, reason: string,
+  ): Promise<number> {
+    assertWorkDate("workDate", workDate);
+    assertPunchKind("kind", kind);
+    assertRequiredText("reason", reason, LIMITS.reason);
+    const now = Date.now();
+    const employeeId = await this.#requireEmployee(now);
+    const profile = await this.#store.employeeProfile(employeeId);
+    return this.#store.fileAmendment({
+      employeeId, targetPunchId: null, workDate, kind, occurredAt, reason, now,
+      department: profile.department, employmentType: profile.employment_type,
+      // Never defaulted. `checkMayAct` refuses an approver who filed the request, and that rule is
+      // only as strong as this column being populated — here the caller is the filer, and the
+      // capability proves it.
+      createdBy: employeeId,
+    });
+  }
+
+  /**
+   * Ask for a recorded punch to say a different time. A REQUEST, not an edit, exactly as
+   * `KintaiSession.requestPunchCorrection` is — and, like it, names nobody but the caller.
+   */
+  async requestPunchCorrection(
+    punchId: number, occurredAt: number, reason: string,
+  ): Promise<number> {
+    assertRequiredText("reason", reason, LIMITS.reason);
+    const now = Date.now();
+    const employeeId = await this.#requireEmployee(now);
+    const profile = await this.#store.employeeProfile(employeeId);
+    return this.#store.fileAmendment({
+      employeeId, targetPunchId: punchId, occurredAt, reason, now,
+      department: profile.department, employmentType: profile.employment_type,
+      createdBy: employeeId,
+    });
+  }
+
+  /** The caller's own submissions — the employee id comes from the capability, not the caller. */
+  async listMySubmissions(): Promise<SubmissionRow[]> {
+    const now = Date.now();
+    const employeeId = await this.#requireEmployee(now);
+    return this.#store.listSubmissionsFor(employeeId);
+  }
+
+  /** Withdraw one of the caller's own submissions. */
+  async withdrawSubmission(submissionId: number): Promise<void> {
+    const actorId = await this.#requireEmployee(Date.now());
+    await this.#store.withdrawSubmission(submissionId, actorId);
+  }
+
+  /** Move a returned submission back into the queue. The only path out of `draft`. */
+  async resubmit(submissionId: number): Promise<void> {
+    const now = Date.now();
+    const actorId = await this.#requireEmployee(now);
+    await this.#store.resubmit(submissionId, actorId, now);
+  }
+
+  /**
+   * Identity from the capability, never an argument, on every method above. Throws for an account
+   * HR has not linked, exactly as `KintaiSession` does — every method but `whoAmI` needs it.
+   */
+  async #requireEmployee(now: number): Promise<EmployeeId> {
+    const employeeId = await this.#store.resolveAccount(this.#accountId, now);
+    if (employeeId === null) throw new UnlinkedAccountError();
+    return employeeId;
   }
 }
 

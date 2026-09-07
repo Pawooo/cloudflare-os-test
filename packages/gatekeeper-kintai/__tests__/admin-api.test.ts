@@ -1,6 +1,6 @@
 import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import { AdminKintaiApi, ViewerKintaiApi } from "../src/admin-api.js";
+import { AdminKintaiApi } from "../src/admin-api.js";
 import { jstWorkDate } from "../src/work-date.js";
 
 // The HR admin surface, reached the way the Workshop reaches it: `KintaiAccount.startAppUi({
@@ -211,57 +211,39 @@ const ADMIN_ONLY: [string, unknown[]][] =
   INTERFACE_MEMBERS.filter((name) => name !== "whoAmI").map((name) => [name, CALL_ARGS[name]]);
 
 describe("the capability a non-admin receives", () => {
-  // The whole point of part 1. `linkAccount` maps an account capability onto an employee record —
-  // expose it to a non-admin and anyone becomes anyone, a manager included, which bypasses every
-  // authority check the approval path makes.
-  it.each(ADMIN_ONLY)("refuses %s", async (method, args) => {
+  // The whole point of part 1, now held in a stronger way than a refusal. A non-admin holds
+  // `EmployeeKintaiApi` — a DIFFERENT capability (see `kintai.ts`) scoped to their own attendance —
+  // so `linkAccount` and every other admin method is not refused, it does not exist to call. That
+  // is what `startAppUi` chooses server-side from `isAdmin`; the browser holds one object or the
+  // other and there is no flag on it to forge. (It used to be `ViewerKintaiApi`, a refuse-all twin
+  // that implemented this interface and threw on all but `whoAmI`; the employee gadget gave
+  // non-admins a real capability, and the throwing twin — the admin methods still spelled out on it
+  // — was then both dead and a wider surface than "the methods are absent".)
+  it.each(ADMIN_ONLY)("does not expose %s to a non-admin at all", async (method, args) => {
     const ui = appUi(`acct-nonadmin-${seq}`, false);
 
-    await expect(() => ui[method](...args)).rejects.toThrow(/KINTAI_ADMIN_REQUIRED/);
+    // Absent, not refused: the method is not on the employee capability, so the RPC layer itself
+    // reports it missing. That is a stronger guarantee than a `KINTAI_ADMIN_REQUIRED` stub would be.
+    await expect(() => ui[method](...args)).rejects.toThrow(/does not implement the method/);
   });
 
-  it("names the method it refused, so the app can say what was denied", async () => {
-    const ui = appUi(`acct-nonadmin-named-${seq}`, false);
+  it("hands a non-admin the employee capability, scoped to their own record", async () => {
+    const id = await employee("Nonadmin Employee");
+    const accountId = `acct-nonadmin-emp-${seq}`;
+    await store.linkAccount(accountId, id, Date.now());
+    const ui = appUi(accountId, false);
 
-    await expect(() => ui.linkAccount("acct-victim", 1)).rejects.toThrow(/linkAccount/);
+    // whoAmI, the one method every caller may reach, still answers — and an employee read it DOES
+    // carry works, bounded to this employee's own record. The employee surface is exercised in full
+    // in `employee-api.test.ts`; here it is only that the repoint landed on the right object.
+    expect(await ui.whoAmI()).toMatchObject({ linked: true, employeeId: id });
+    expect(await ui.myMonth("2026-07")).toEqual({ period: "2026-07", days: [] });
   });
 
-  /**
-   * The guard the `implements` check does NOT give us.
-   *
-   * `implements KintaiAdminApi` catches a method added to the INTERFACE — both classes then fail
-   * to compile until someone decides. It does not catch a method added to the CLASS: an extra
-   * public method on `ViewerKintaiApi` that is absent from the interface compiles clean and is
-   * callable over RPC. (Nor does an OPTIONAL interface member, which satisfies both classes
-   * without either implementing it.) Narrowing the decorator to `@validateRpc<KintaiAdminApi>()`
-   * does generate a narrowed `methods` map, but capnweb-validate 0.3.0's runtime wrapper
-   * dispatches the extra method anyway, so there is no decorator-level fix today.
-   *
-   * So the surface is pinned here instead, and pinned by *calling* rather than by reflection
-   * alone: every name reachable on the viewer must be a member of the interface, and every member
-   * but `whoAmI` must come back refused. The previous version of this test only tried invented
-   * names, which passed on "no such method" and never distinguished refused from absent — it would
-   * not have caught the hole this test exists for.
-   */
-  it("exposes exactly the interface, and refuses every member of it but whoAmI", async () => {
-    expect(callableSurface(ViewerKintaiApi)).toEqual(INTERFACE_MEMBERS.toSorted());
-
-    const ui = appUi(`acct-surface-${seq}`, false);
-    for (const method of callableSurface(ViewerKintaiApi)) {
-      const args = CALL_ARGS[method];
-      expect(args, `no arguments recorded for ${method}`).toBeDefined();
-      if (method === "whoAmI") {
-        expect(await ui.whoAmI()).toMatchObject({ linked: false });
-        continue;
-      }
-      // Refused, not absent: "no such method" would throw too, and would pass a weaker assertion.
-      await expect(() => ui[method](...args)).rejects.toThrow(/KINTAI_ADMIN_REQUIRED/);
-    }
-  });
-
-  // The admin class is pinned to the same interface, so an unreviewed public method cannot appear
-  // on the administrator's capability either.
-  it("keeps the admin capability to exactly the interface too", () => {
+  // The admin class is pinned to the interface, so an unreviewed public method cannot appear on the
+  // administrator's capability. The parallel pin for the non-admin capability —
+  // `EmployeeKintaiApi` exposes none of these — lives in `employee-api.test.ts`.
+  it("keeps the admin capability to exactly the interface", () => {
     expect(callableSurface(AdminKintaiApi)).toEqual(INTERFACE_MEMBERS.toSorted());
   });
 
@@ -736,12 +718,13 @@ describe("designating an approver", () => {
 
   // A designated approver can sign for the employee at the root of the tree. Reachable by that
   // employee, it would be a way to appoint whoever is most likely to say yes to their own record.
-  it("is refused to a non-administrator", async () => {
+  // A non-admin holds `EmployeeKintaiApi`, on which this method does not exist to call at all.
+  it("is not on a non-administrator's capability", async () => {
     const officer = await employee("Nonadmin Officer");
     const chair = await employee("Nonadmin Chair");
 
     await expect(() => appUi(`acct-nonadmin-designate-${seq}`, false)
-      .setDesignatedApprover(officer, chair)).rejects.toThrow(/KINTAI_ADMIN_REQUIRED/);
+      .setDesignatedApprover(officer, chair)).rejects.toThrow(/does not implement the method/);
     expect(await store.designatedApproverOf(officer)).toBeNull();
   });
 });
@@ -791,12 +774,13 @@ describe("recording 管理監督者", () => {
   });
 
   // 管理監督者 exempts overtime from a premium under 労働基準法 §37. An employee who could record
-  // it for themselves could write their own exemption into the payroll record.
-  it("is refused to a non-administrator", async () => {
+  // it for themselves could write their own exemption into the payroll record — so it is not on the
+  // employee capability at all.
+  it("is not on a non-administrator's capability", async () => {
     const officer = await employee("Self Officer");
 
     await expect(() => appUi(`acct-nonadmin-exempt-${seq}`, false).grantExemption(officer))
-      .rejects.toThrow(/KINTAI_ADMIN_REQUIRED/);
+      .rejects.toThrow(/does not implement the method/);
     expect(await store.isExempt(officer, Date.now())).toBe(false);
   });
 });
@@ -871,13 +855,14 @@ describe("recording an employee's work-date policy", () => {
   });
 
   // Which day a punch is filed against decides what a night worker's hours are worth. An employee
-  // who could set it for themselves could move their own overnight hours onto another day.
-  it("is refused to a non-administrator", async () => {
+  // who could set it for themselves could move their own overnight hours onto another day — so it
+  // is not on the employee capability at all.
+  it("is not on a non-administrator's capability", async () => {
     const crew = await employee("Self Crew");
 
     await expect(() =>
       appUi(`acct-nonadmin-policy-${seq}`, false).setWorkDatePolicy(crew, "shift_start"))
-      .rejects.toThrow(/KINTAI_ADMIN_REQUIRED/);
+      .rejects.toThrow(/does not implement the method/);
     expect((await store.listEmployees()).find((row) => row.id === crew))
       .toMatchObject({ work_date_policy: "calendar" });
   });
@@ -1127,10 +1112,11 @@ describe("closing a month", () => {
   });
 
   // Closing a month is the write that makes every punch in it final. Reachable by an employee, it
-  // would be a way to freeze a month before a colleague's correction could be filed against it.
-  it("is refused to a non-administrator", async () => {
+  // would be a way to freeze a month before a colleague's correction could be filed against it —
+  // so it is not on the employee capability at all.
+  it("is not on a non-administrator's capability", async () => {
     await expect(() => appUi(`acct-nonadmin-lock-${seq}`, false).lockPeriod("2025-10"))
-      .rejects.toThrow(/KINTAI_ADMIN_REQUIRED/);
+      .rejects.toThrow(/does not implement the method/);
 
     expect(await store.periodLock("2025-10")).toBeNull();
   });
