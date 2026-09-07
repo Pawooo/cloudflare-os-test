@@ -42,6 +42,14 @@ already carries `eligibleActorIds`, so a "yours to decide" badge is a client-sid
 new reads. Company-wide visibility with route-held authority is the DESIGN (triage, not override,
 per the 2026-09-04 ruling) — the badge makes the design legible instead of puzzling.
 
+Third finding: the day drill-down renders each punch's `source` verbatim, so an HR reader sees
+"gadget" — platform vocabulary leaking onto a payroll screen. The field is a TRUST statement and
+the granularity is right (`gadget` = self-recorded through the employee's own capability at the
+server's clock, the strongest provenance in the system; `amendment` = written by an approved
+correction): what needs work is the rendering. 本人打刻 for self-recorded; and a corrected punch
+should surface the who-approved and stated reason already carried on the row, not the bare word.
+Applies wherever punches render — the admin drill-down today, the employee gadget's my-day next.
+
 ## Constraints the spec inherits
 
 - This surface is a GADGET-side session UI: identity from the capability, no employee id
