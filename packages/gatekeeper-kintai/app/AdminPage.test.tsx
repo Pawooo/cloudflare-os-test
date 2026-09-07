@@ -1330,6 +1330,124 @@ describe("AdminPage", () => {
     });
   });
 
+  /**
+   * WHAT THE SCREEN RE-READS AFTER ITS OWN WRITES.
+   *
+   * Three panels mounted at once, each reading independently on mount, is what makes this a
+   * category of bug rather than one: a write performed on one tab changes what ANOTHER tab has
+   * already read and rendered, and a panel that only ever read once goes on asserting the old
+   * fact. Both tests below are the same defect seen from two directions, and both were probed on
+   * the running page before they were written here.
+   *
+   * The invalidation is deliberately narrow — see `AdminPage`'s `queueToken` and the comment on
+   * `useSectionRead`'s third argument for which write invalidates which read and why the other
+   * pairs are left alone. A blanket "re-read everything after any write" would also re-read the
+   * flagged days and the month, neither of which any write on this screen can change, and would
+   * put the mount-once tests above in permanent tension with the fix.
+   */
+  describe("a panel that contradicts a write made on the screen beside it", () => {
+    beforeEach(() => {
+      vi.spyOn(Date, "now").mockReturnValue(NOW);
+    });
+
+    /**
+     * The stranded alarm names a repair, the screen offers that repair, and the alarm has to go.
+     *
+     * "Nobody can decide this — it will wait for ever. Give Stranded a manager or a designated
+     * approver" is an instruction, and section 3 of this very tab is where it is carried out. With
+     * section 1 reading once on mount, the administrator did exactly what the alarm asked, watched
+     * section 3's blocker row react, and was still told the request would wait for ever. Only a
+     * full iframe reload cleared it. `eligibleActorNames` is computed by `eligibleActors` walking
+     * the org chart, so `setDesignatedApprover` is precisely the write that changes this read's
+     * answer — the stub below models that rather than asserting a call count.
+     */
+    it("stops warning that nobody can decide once the repair it named is performed", async () => {
+      let designated = false;
+      const api = adminApi({
+        listPendingOverview: vi.fn<KintaiAdminClient["listPendingOverview"]>(async () => [waiting({
+          employee_id: STRANDED.id,
+          created_by: STRANDED.id,
+          employeeName: STRANDED.display_name,
+          employeeNumber: STRANDED.employee_number,
+          filedByName: STRANDED.display_name,
+          eligibleActorIds: designated ? [TANAKA.id] : [],
+          eligibleActorNames: designated ? [TANAKA.display_name] : [],
+        })]),
+        setDesignatedApprover: vi.fn<KintaiAdminClient["setDesignatedApprover"]>(async () => {
+          designated = true;
+        }),
+      }, [TANAKA, SUZUKI, STRANDED]);
+      await render(<AdminPage api={api} />);
+
+      // The alarm, before the repair. Without this the test could pass on a screen that never
+      // rendered the row at all.
+      expect(within(pendingRow(71), '[data-testid="stranded"]')).toContain("Nobody can decide this");
+
+      // The repair, from the button the alarm's own tab offers, exactly as an administrator
+      // reaches it: the row's fix opens the Roster form with that employee already chosen.
+      await click(
+        `[data-testid="panel-overview"] [data-employee="${STRANDED.id}"] ` +
+        '[data-action="approver-for-this"]',
+      );
+      await choose('[data-form="set-designated-approver"] [name="approverId"]', String(TANAKA.id));
+      await submit("set-designated-approver");
+
+      expect(api.setDesignatedApprover).toHaveBeenCalledWith(STRANDED.id, TANAKA.id);
+      // The queue was read again, and now says what the org chart says.
+      expect(overviewMaybe('[data-submission="71"] [data-testid="stranded"]')).toBeNull();
+      expect(within(pendingRow(71), '[data-testid="deciders"]')).toContain(TANAKA.display_name);
+    });
+
+    /**
+     * Closing a month from 月次 has to reach the warning whose whole purpose is that month.
+     *
+     * `lockedPeriod` on a pending amendment is not a property of the request: it is a join onto
+     * `period_locks`, so `lockPeriod` changes this read's answer for every pending correction
+     * dated inside the month it closes. The screen used to show 締め済み on 月次 while 要対応
+     * rendered a correction into that same month with no marker at all — the two panels
+     * disagreeing about one row of one table, with the marker missing from the side that is one
+     * press away from approving the write it warns about.
+     */
+    it("marks a pending correction as landing in a closed month once that month is closed",
+      async () => {
+        const closed = new Set<string>();
+        const api = adminApi({
+          listPendingOverview: vi.fn<KintaiAdminClient["listPendingOverview"]>(async () => [
+            correction({
+              amendment: {
+                targetPunchId: 500,
+                currentOccurredAt: Date.parse("2026-09-02T09:00:00+09:00"),
+                requestedOccurredAt: Date.parse("2026-09-02T08:30:00+09:00"),
+                workDate: "2026-09-02",
+                kind: "in",
+                // The join, as the store computes it: the month this correction would write into.
+                lockedPeriod: closed.has("2026-09") ? "2026-09" : null,
+              },
+            }),
+          ]),
+          monthlyReport: vi.fn<KintaiAdminClient["monthlyReport"]>(async (period) =>
+            report({ period, locked: closed.has(period) })),
+          lockPeriod: vi.fn<KintaiAdminClient["lockPeriod"]>(async (period) => {
+            closed.add(period);
+          }),
+        }, [TANAKA, SUZUKI]);
+        await render(<AdminPage api={api} />);
+
+        // September is open, so no marker — the state the assertion below has to move away from.
+        expect(overviewMaybe('[data-submission="72"] [data-testid="closed-period"]')).toBeNull();
+
+        await click('[data-testid="panel-monthly"] [data-action="close-month"]');
+        await click('[data-testid="panel-monthly"] [data-action="confirm-close-month"]');
+
+        // 月次 says closed…
+        expect(monthlyText('[data-testid="monthly-locked"]')).toContain("締め済み");
+        // …and so does the row that is one approval away from writing into it.
+        const marker = within(pendingRow(72), '[data-testid="closed-period"]');
+        expect(marker).toContain("2026-09");
+        expect(marker).toContain("closed");
+      });
+  });
+
   describe("the forms", () => {
     it("creates an employee with what was typed, trimmed", async () => {
       const api = adminApi();
@@ -1847,7 +1965,9 @@ describe("AdminPage", () => {
   }
 
   /** One current punch as `getEmployeeDay` returns it. */
-  function punch(overrides: Partial<PunchRow> & Pick<PunchRow, "id" | "kind" | "occurred_at">) {
+  function punch(
+    overrides: Partial<PunchRow> & Pick<PunchRow, "id" | "kind" | "occurred_at">,
+  ): PunchRow {
     return {
       employee_id: TANAKA.id,
       work_date: "2026-09-02",

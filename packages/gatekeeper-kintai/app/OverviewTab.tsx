@@ -31,15 +31,26 @@ import { describeFailure } from "./errors";
  * what section 3 offers.
  */
 export function OverviewTab({
-  api, roster, fixes,
+  api, roster, fixes, queueToken,
 }: {
   api: KintaiAdminClient;
   roster: RosterEntry[];
   fixes: RowFixes;
+  /**
+   * How many writes the screen has made that section 1's read depends on. See `queueToken` in
+   * `AdminPage`, which owns it and states which writes bump it and why the other reads are left
+   * alone.
+   *
+   * Section 3 needs nothing like this: it renders the `roster` prop, so it already reacts to the
+   * re-read `AdminPage.submit` performs. That asymmetry is the whole shape of the bug this prop
+   * fixes — an administrator who repaired a stranded employee watched section 3 update and was
+   * still told by section 1 that the request would wait for ever.
+   */
+  queueToken: number;
 }) {
   return (
     <div className="flex flex-col gap-8">
-      <PendingSection api={api} />
+      <PendingSection api={api} queueToken={queueToken} />
       <AnomaliesSection api={api} />
       <BlockersSection roster={roster} fixes={fixes} />
     </div>
@@ -47,7 +58,8 @@ export function OverviewTab({
 }
 
 /**
- * One section's read: started once on mount, whether or not the tab is being looked at.
+ * One section's read: started on mount whether or not the tab is being looked at, and again when
+ * `reloadOn` changes — which only a write can make it do.
  *
  * All three panels are mounted from the first admin render (see the `hidden` panels in
  * `AdminPage`), which is what makes this the right shape rather than a compromise: the same
@@ -55,36 +67,74 @@ export function OverviewTab({
  * fetch on. Fetching on tab focus would need a visibility hack, would re-read on every flip, and
  * would leave the queue's first paint behind a click.
  *
+ * `reloadOn` is how a WRITE asks for the read again — never a render, and never a tab flip. It is
+ * a counter owned by `AdminPage`, and every caller states its own answer to "what could make this
+ * stale": a section no write on this screen can invalidate passes a constant and stays mount-once.
+ * A required argument rather than an optional one for exactly that reason — the next section added
+ * here has to answer the question rather than inherit an answer.
+ *
+ * `read` and `fallback` stay OUT of the dependency list, for the reason they always did: `read`
+ * closes over the `api` capability, which never changes for the life of the page, and re-running
+ * on a new closure would re-read the whole company's queue every time an ancestor rerenders —
+ * which `AdminPage` does on every keystroke in a roster form.
+ *
+ * The previous answer stays on screen while a re-read is in flight rather than being cleared to a
+ * spinner: the re-read follows a write the reader just performed, and blanking the queue in front
+ * of them to redraw almost the same rows reports nothing they need. A failure still replaces it —
+ * a section that cannot be read must say so rather than keep showing an answer it can no longer
+ * stand behind.
+ *
  * `live` is the same guard `AdminPage.load` uses: a panel unmounted mid-flight must not set state.
+ * It is re-armed on mount rather than only on the initial `useRef`, so a mount → unmount → remount
+ * (React StrictMode, or any future remount of this subtree) does not leave the panel permanently
+ * blank behind a `live` that is stuck false.
+ *
+ * `readId` is the same guard `MonthlyTab.readMonth` uses, and it earns its place here now that
+ * there can be two reads in flight: the first to come back is not necessarily the newer one, and
+ * an out-of-order landing would restore precisely the stale answer `reloadOn` exists to replace.
  */
-function useSectionRead<T>(read: () => Promise<T>, fallback: string) {
+function useSectionRead<T>(read: () => Promise<T>, fallback: string, reloadOn: number) {
   const [state, setState] = useState<{ data?: T; error?: string }>({});
   const live = useRef(true);
-  useEffect(() => () => { live.current = false; }, []);
+  const readId = useRef(0);
+  useEffect(() => {
+    live.current = true;
+    return () => { live.current = false; };
+  }, []);
 
   useEffect(() => {
+    const id = ++readId.current;
     void (async () => {
       try {
         const data = await read();
-        if (live.current) setState({ data });
+        if (live.current && id === readId.current) setState({ data });
       } catch (caught) {
-        if (live.current) setState({ error: describeFailure(caught, fallback) });
+        if (live.current && id === readId.current) {
+          setState({ error: describeFailure(caught, fallback) });
+        }
       }
     })();
-    // Deliberately once per mount, with `read` and `fallback` left out of the dependency list:
-    // `read` closes over the `api` capability, which never changes for the life of the page, and
-    // re-running this on a new closure would re-read the whole company's queue every time an
-    // ancestor rerenders — which `AdminPage` does on every keystroke in a roster form.
-  }, []);
+  }, [reloadOn]);
 
   return state;
 }
 
 // ---- 1. waiting on a decision ------------------------------------------------------------------
 
-function PendingSection({ api }: { api: KintaiAdminClient }) {
+function PendingSection({ api, queueToken }: { api: KintaiAdminClient; queueToken: number }) {
   const read = useCallback(() => api.listPendingOverview(), [api]);
-  const { data, error } = useSectionRead(read, "Couldn’t read the 承認待ち queue.");
+  /*
+   * The one read on this tab that the screen's own writes can invalidate, in two ways.
+   *
+   * `eligibleActorNames` is not a stored column: `pendingOverview` asks `eligibleActors`, which
+   * probes `checkMayAct` against the live org chart — so every roster repair in section 3 can
+   * change whether a row is stranded. `amendment.lockedPeriod` is not a property of the request
+   * either: it is a join onto `period_locks` — so closing a month in 月次 can change whether a
+   * pending correction is marked as writing into a closed month. Both are facts about the rest of
+   * the system as of the instant of the read, which is exactly what a mount-once read cannot tell
+   * the truth about once the reader starts writing.
+   */
+  const { data, error } = useSectionRead(read, "Couldn’t read the 承認待ち queue.", queueToken);
   const stranded = data?.filter((item) => item.eligibleActorNames.length === 0).length ?? 0;
 
   return (
@@ -269,7 +319,22 @@ function AnomaliesSection({ api }: { api: KintaiAdminClient }) {
    */
   const [period] = useState(() => jstWorkDate(Date.now()).slice(0, 7));
   const read = useCallback(() => api.listAnomalousDays(period), [api, period]);
-  const { data, error } = useSectionRead(read, "Couldn’t read the flagged days.");
+  /*
+   * No invalidator, so a constant: this read stays mount-once, and that is an argument rather
+   * than an omission.
+   *
+   * A flag comes from `dayAnomalies`, which groups punches by the stored `work_date` COLUMN and
+   * reads neither the org chart nor a policy — and NOTHING on this dashboard writes a punch. A
+   * roster repair changes who may approve; closing a month changes what may be written into it;
+   * neither moves a flag. `setWorkDatePolicy` is not the exception it looks like: the policy
+   * decides a punch's `work_date` at the moment that punch is recorded, and changing it never
+   * re-attributes a punch already stored.
+   *
+   * What would genuinely invalidate this is a new punch or an applied correction, and both of
+   * those happen elsewhere — by design, see this module's header. If a decide control ever lands
+   * on this tab, this is the paragraph that has to be redone rather than quietly outgrown.
+   */
+  const { data, error } = useSectionRead(read, "Couldn’t read the flagged days.", 0);
 
   // Grouped by employee, in the order the read returned them: one row per flagged day, but the
   // person named once. The read is already ordered by employee then date, so this preserves it.
@@ -340,7 +405,13 @@ function AnomalousDayRow({ day, api }: { day: AnomalousDay; api: KintaiAdminClie
   const [open, setOpen] = useState(false);
   const [detail, setDetail] = useState<{ day?: EmployeeDay; error?: string }>();
   const live = useRef(true);
-  useEffect(() => () => { live.current = false; }, []);
+  // Armed here, not only by `useRef`: on a mount → unmount → remount of this row the ref survives
+  // with `false` in it, and every later read would then be discarded on arrival — a row whose
+  // punches never appear, with no error to explain it. See the same guard in `useSectionRead`.
+  useEffect(() => {
+    live.current = true;
+    return () => { live.current = false; };
+  }, []);
 
   const toggle = () => {
     if (open) {

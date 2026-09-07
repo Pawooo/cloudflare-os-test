@@ -131,8 +131,53 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
     action: string; ref: React.RefObject<HTMLElement | null>; nonce: number;
   }>();
   const nonce = useRef(0);
+  /*
+   * HOW MANY WRITES THIS SCREEN HAS MADE THAT 要対応'S QUEUE READ DEPENDS ON.
+   *
+   * Bumped, never read for its value. `OverviewTab` threads it into the dependency list of
+   * section 1's read (see `useSectionRead`), so a bump re-runs that one read and nothing else.
+   *
+   * It exists because all three panels are mounted from the first admin render and each read
+   * independently on mount — which meant the screen went on asserting facts its own writes had
+   * already undone, with a full reload of the iframe the only way out. Two of those, both probed
+   * on the running page:
+   *
+   *  - Repair a stranded employee from 要対応's own third section and section 1 kept saying
+   *    "Nobody can decide this — it will wait for ever" about the request that repair had just
+   *    unblocked. Section 3 updated, because it renders the `roster` prop that `load` re-reads;
+   *    sections 1 and 2 had no equivalent. `eligibleActorNames` is not a stored column —
+   *    `pendingOverview` asks `eligibleActors`, a probe of the live org chart — so every repair
+   *    below can change that answer.
+   *  - Close a month in 月次 and a pending correction dated inside it still rendered without its
+   *    締め済み marker. `amendment.lockedPeriod` is a join onto `period_locks`, not a property of
+   *    the request.
+   *
+   * WHICH READS ARE DELIBERATELY NOT WIRED TO IT, because a blanket "re-read everything after any
+   * write" would be shorter to write and would put the two mount-once tests in permanent tension
+   * with this fix:
+   *
+   *  - The flagged days (`listAnomalousDays`). Nothing on this dashboard writes a punch, and a
+   *    flag is computed from punches grouped by their stored `work_date`. See the argument in
+   *    `AnomaliesSection`, including why `setWorkDatePolicy` is not the exception it resembles.
+   *  - 月次's report (`monthlyReport`). A roster repair moves no worked minutes and no day count:
+   *    every number there is arithmetic over punches, and an exemption or a reporting line
+   *    changes neither. A close DOES change that panel — and that panel already re-reads its own
+   *    month, with a guard for the picker having moved that this token must not disturb.
+   *  - The roster itself. `submit` already calls `load`, which is what section 3 reacts to.
+   *
+   * A tab flip bumps nothing, which is what keeps "reads once on mount, hidden or not, and never
+   * again on a tab flip" true and meaningful rather than merely still passing.
+   */
+  const [queueToken, setQueueToken] = useState(0);
+  const invalidateQueue = useCallback(() => setQueueToken((count) => count + 1), []);
 
-  useEffect(() => () => { live.current = false; }, []);
+  // Armed in the effect body, not only by `useRef`: the ref outlives a mount → unmount → remount
+  // (React StrictMode double-invokes exactly this pair) and a `live` left false would discard
+  // every read and every notice on arrival — the page stuck on "Loading your account…" for good.
+  useEffect(() => {
+    live.current = true;
+    return () => { live.current = false; };
+  }, []);
 
   useEffect(() => {
     if (toReveal) reveal(toReveal.ref.current, toReveal.action);
@@ -191,7 +236,12 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
       try {
         const done = await action();
         await load();
-        if (live.current) setNotices((current) => ({ ...current, [key]: { kind: "ok", text: done } }));
+        if (live.current) {
+          // Every repair here changes the org chart, and 要対応's queue answers "who can decide
+          // this" by probing that chart. See `queueToken`.
+          invalidateQueue();
+          setNotices((current) => ({ ...current, [key]: { kind: "ok", text: done } }));
+        }
         return true;
       } catch (caught) {
         if (live.current) {
@@ -204,7 +254,7 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
         if (live.current) setPending(undefined);
       }
     },
-    [load],
+    [load, invalidateQueue],
   );
 
   /**
@@ -290,7 +340,9 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
           <TabBar tab={tab} onSelect={setTab} />
 
           <div hidden={tab !== "overview"} data-testid="panel-overview">
-            <OverviewTab api={api} roster={view.roster} fixes={fixes} />
+            <OverviewTab
+              api={api} roster={view.roster} fixes={fixes} queueToken={queueToken}
+            />
           </div>
 
           <div hidden={tab !== "monthly"} data-testid="panel-monthly">
@@ -298,7 +350,14 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
                 the tab switch is this component's to perform, exactly as the roster repairs'
                 `openForm` is. Passing the setter down would let that panel decide which tab is
                 showing, which is the one piece of state this component exists to own. */}
-            <MonthlyTab api={api} onShowOverview={() => setTab("overview")} />
+            <MonthlyTab
+              api={api}
+              onShowOverview={() => setTab("overview")}
+              // A close changes `period_locks`, which 要対応's queue read joins against. This
+              // component owns the token because it owns both writes that invalidate that read;
+              // handing the panel the setter would let it decide what else on the page is stale.
+              onLockAttempted={invalidateQueue}
+            />
           </div>
 
           <div

@@ -19,7 +19,7 @@ import { describeFailure } from "./errors";
  * stored total anywhere for it to disagree with.
  */
 export function MonthlyTab({
-  api, onShowOverview,
+  api, onShowOverview, onLockAttempted,
 }: {
   api: KintaiAdminClient;
   /**
@@ -30,6 +30,16 @@ export function MonthlyTab({
    * screens to keep in agreement. `AdminPage` owns which tab is showing, so it owns this.
    */
   onShowOverview: () => void;
+  /**
+   * Tell the page that `period_locks` may have changed, so panels that read it can read it again.
+   *
+   * NOT named `onClosed`, and not called only on success, deliberately. See the call site: the
+   * likeliest refusal from `lockPeriod` is `KINTAI_ALREADY_LOCKED`, which means the month IS
+   * closed — by somebody else, between this page's read and this press — so the rest of the
+   * screen is stale on exactly that path too. What this reports is "a close was attempted against
+   * a month, and the lock table is no longer necessarily what anybody here last read".
+   */
+  onLockAttempted: () => void;
 }) {
   /*
    * The month the administrator is in, in JST, read ONCE for the life of the panel.
@@ -48,7 +58,13 @@ export function MonthlyTab({
   const [closeError, setCloseError] = useState<string>();
 
   const live = useRef(true);
-  useEffect(() => () => { live.current = false; }, []);
+  // Armed in the effect body, not only by `useRef`: the ref survives a mount → unmount → remount
+  // (React StrictMode double-invokes exactly this pair), and a `live` stuck false would discard
+  // every read on arrival — a panel that spins for ever with nothing to explain it.
+  useEffect(() => {
+    live.current = true;
+    return () => { live.current = false; };
+  }, []);
   // Which read is the current one. A reader pressing prev twice quickly has two reads in flight,
   // and the first to come back is not necessarily the month they are now looking at.
   const readId = useRef(0);
@@ -142,6 +158,24 @@ export function MonthlyTab({
       }
     }
     if (!live.current) return;
+    /*
+     * 要対応 read `period_locks` too, on mount, and its copy is now suspect.
+     *
+     * `amendment.lockedPeriod` on a pending correction is a join onto the very table this press
+     * writes, so closing the month a correction is dated in changes that row's answer — and the
+     * marker it gains ("approving this changes a month that has already been closed off") is the
+     * one thing about that decision its approver is least able to infer. Section 1 read once on
+     * mount and never again, so 月次 said 締め済み while the row beside it, one press from
+     * approving the write, said nothing at all.
+     *
+     * Announced BEFORE the picker guard below on purpose: where the picker now sits decides which
+     * month's REPORT this panel renders and says nothing about whether a lock changed. And not
+     * gated on success, for the reason on `onLockAttempted` — a refusal is the path where the
+     * screen is already KNOWN to be out of date. A refusal that really changed nothing (a future
+     * month, an unlinked administrator) costs one re-read of the queue, which then says what it
+     * said before.
+     */
+    onLockAttempted();
     /*
      * Re-read either way, and the failure case is the one that needs it.
      *
