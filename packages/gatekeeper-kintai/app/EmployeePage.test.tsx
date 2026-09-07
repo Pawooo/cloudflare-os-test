@@ -1,7 +1,8 @@
 import React, { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { KintaiEmployeeClient, PunchRow } from "../src/types";
+import type { EmployeeMonth, EmployeeMonthDay, KintaiEmployeeClient, PunchRow } from "../src/types";
+import { jstWorkDate } from "../src/work-date";
 import EmployeePage, { nextPunchKind } from "./EmployeePage";
 
 /** One current punch on today's day, everything but the fields under test defaulted to inert. */
@@ -33,6 +34,22 @@ function day(punches: PunchRow[], overrides: Partial<Awaited<ReturnType<KintaiEm
     reconciliation: { allocatedMinutes: 0, workedMinutes: 0, discrepancyMinutes: 0 },
     ...overrides,
   };
+}
+
+/** One day of the employee's own month, everything but the fields under test defaulted to inert. */
+function monthDay(overrides: Partial<EmployeeMonthDay> = {}): EmployeeMonthDay {
+  return {
+    workDate: "2026-09-01",
+    workedMinutes: 0,
+    anomalies: [],
+    overtime: null,
+    ...overrides,
+  };
+}
+
+/** A `myMonth` return for the given period built from a day list. */
+function employeeMonth(period: string, days: EmployeeMonthDay[]): EmployeeMonth {
+  return { period, days };
 }
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -297,6 +314,173 @@ describe("EmployeePage", () => {
     expect(container!.querySelectorAll("form, select, textarea")).toHaveLength(0);
   });
 
+  // ---- 今月: the month a worker reads back --------------------------------------------------
+  describe("今月 (my-month)", () => {
+    // The picker opens on the month the employee is in, in JST — never UTC, which reports the
+    // previous month for the first nine hours of every Japanese day. `myMonth` is asked for that
+    // same period on mount, so the read and the label agree.
+    it("defaults the picker to the current JST month and reads it", async () => {
+      const currentMonth = jstWorkDate(Date.now()).slice(0, 7);
+      const myMonth = vi.fn<KintaiEmployeeClient["myMonth"]>(
+        async (period) => employeeMonth(period, []),
+      );
+      const api = employeeApi({ myMonth });
+      await render(<EmployeePage api={api} />);
+
+      expect(inMonth('[data-testid="month-label"]').textContent).toBe(currentMonth);
+      expect(myMonth).toHaveBeenCalledWith(currentMonth);
+    });
+
+    // The same bound 月次 carries: the next button never walks past the current month (there is no
+    // month there yet to read), and going backwards has no bound at all.
+    it("bounds next at the current month and leaves prev unbounded, re-reading on a move", async () => {
+      const currentMonth = jstWorkDate(Date.now()).slice(0, 7);
+      const myMonth = vi.fn<KintaiEmployeeClient["myMonth"]>(
+        async (period) => employeeMonth(period, []),
+      );
+      const api = employeeApi({ myMonth });
+      await render(<EmployeePage api={api} />);
+
+      // At the current month the next button is disabled; prev is live.
+      expect(inMonth<HTMLButtonElement>('[data-action="next-month"]').disabled).toBe(true);
+      expect(inMonth<HTMLButtonElement>('[data-action="prev-month"]').disabled).toBe(false);
+
+      // Stepping back moves the label and reads the earlier month; next is now live.
+      const [prevYear, prevMonth] = shiftedMonth(currentMonth, -1);
+      await click('[data-testid="panel-month"] [data-action="prev-month"]');
+      expect(inMonth('[data-testid="month-label"]').textContent).toBe(`${prevYear}-${prevMonth}`);
+      expect(myMonth).toHaveBeenCalledWith(`${prevYear}-${prevMonth}`);
+      expect(inMonth<HTMLButtonElement>('[data-action="next-month"]').disabled).toBe(false);
+
+      // Prev keeps stepping back with no floor.
+      await click('[data-testid="panel-month"] [data-action="prev-month"]');
+      const [prev2Year, prev2Month] = shiftedMonth(currentMonth, -2);
+      expect(inMonth('[data-testid="month-label"]').textContent).toBe(`${prev2Year}-${prev2Month}`);
+
+      // Stepping forward returns to the current month, where next disables again.
+      await click('[data-testid="panel-month"] [data-action="next-month"]');
+      await click('[data-testid="panel-month"] [data-action="next-month"]');
+      expect(inMonth('[data-testid="month-label"]').textContent).toBe(currentMonth);
+      expect(inMonth<HTMLButtonElement>('[data-action="next-month"]').disabled).toBe(true);
+    });
+
+    // One row per EmployeeMonthDay, the worked column `Xh Ym` — the 月次 convention, always both
+    // units so the column stays flush.
+    it("renders one row per day with 労働時間 as Xh Ym", async () => {
+      const currentMonth = jstWorkDate(Date.now()).slice(0, 7);
+      const myMonth = vi.fn<KintaiEmployeeClient["myMonth"]>(async (period) => employeeMonth(period, [
+        monthDay({ workDate: `${currentMonth}-01`, workedMinutes: 495 }),
+        monthDay({ workDate: `${currentMonth}-02`, workedMinutes: 60 }),
+      ]));
+      await render(<EmployeePage api={employeeApi({ myMonth })} />);
+
+      const rows = month().querySelectorAll("[data-month-day]");
+      expect(rows).toHaveLength(2);
+      expect(inMonth(`[data-month-day="${currentMonth}-01"] [data-testid="worked"]`).textContent)
+        .toBe("8h 15m");
+      expect(inMonth(`[data-month-day="${currentMonth}-02"] [data-testid="worked"]`).textContent)
+        .toBe("1h 0m");
+    });
+
+    // A day WITH an overtime request shows the request and its state. A day WITHOUT one shows no
+    // overtime — never a zero that a reader could take for a claim of no minutes owed.
+    it("shows overtime + state where present, and nothing where absent", async () => {
+      const currentMonth = jstWorkDate(Date.now()).slice(0, 7);
+      const myMonth = vi.fn<KintaiEmployeeClient["myMonth"]>(async (period) => employeeMonth(period, [
+        monthDay({
+          workDate: `${currentMonth}-01`, workedMinutes: 600,
+          overtime: { minutes: 90, state: "pending" },
+        }),
+        monthDay({ workDate: `${currentMonth}-02`, workedMinutes: 480, overtime: null }),
+      ]));
+      await render(<EmployeePage api={employeeApi({ myMonth })} />);
+
+      const withOt = inMonth(`[data-month-day="${currentMonth}-01"] [data-testid="overtime"]`);
+      expect(withOt.textContent).toContain("1h 30m");
+      expect(withOt.textContent).toContain("承認待ち");
+
+      // The day with no request renders an empty overtime cell — no minutes, no state, no zero.
+      const noOt = inMonth(`[data-month-day="${currentMonth}-02"] [data-testid="overtime"]`);
+      expect(noOt.textContent!.trim()).toBe("");
+      expect(noOt.textContent).not.toContain("0h");
+      expect(noOt.textContent).not.toContain("承認");
+    });
+
+    // A flagged day carries a marker, in plain language — never the raw wire flag.
+    it("marks a day whose anomalies are non-empty, in plain language", async () => {
+      const currentMonth = jstWorkDate(Date.now()).slice(0, 7);
+      const myMonth = vi.fn<KintaiEmployeeClient["myMonth"]>(async (period) => employeeMonth(period, [
+        monthDay({ workDate: `${currentMonth}-01`, workedMinutes: 300, anomalies: ["unpaired_in"] }),
+        monthDay({ workDate: `${currentMonth}-02`, workedMinutes: 480, anomalies: [] }),
+      ]));
+      await render(<EmployeePage api={employeeApi({ myMonth })} />);
+
+      const flagged = inMonth(`[data-month-day="${currentMonth}-01"] [data-testid="day-anomalies"]`);
+      expect(flagged.textContent).toContain("退勤打刻なし");
+      expect(flagged.textContent).not.toContain("unpaired_in");
+      // The clean day carries no marker.
+      expect(month().querySelector(
+        `[data-month-day="${currentMonth}-02"] [data-testid="day-anomalies"]`,
+      )).toBeNull();
+    });
+
+    // The guardrail against a pending number reading as money owed: the claims-not-payouts line is
+    // present, and its exact wording is pinned here so it cannot quietly soften into a promise.
+    it("states that overtime figures are claims awaiting approval, not payouts", async () => {
+      await render(<EmployeePage api={employeeApi()} />);
+
+      expect(inMonth('[data-testid="claims-note"]').textContent).toBe(
+        "残業時間は承認待ちの申請であり、承認されるまで支給額ではありません — overtime shown here is a claim awaiting approval, not a payout.",
+      );
+    });
+
+    // An empty month is a statement, not a blank space.
+    it("says so when the month has no days", async () => {
+      const myMonth = vi.fn<KintaiEmployeeClient["myMonth"]>(
+        async (period) => employeeMonth(period, []),
+      );
+      await render(<EmployeePage api={employeeApi({ myMonth })} />);
+
+      expect(month().textContent).toContain("打刻がありません");
+      expect(month().querySelectorAll("[data-month-day]")).toHaveLength(0);
+    });
+
+    // A failed read is rendered through describeFailure, next to the picker that could re-ask.
+    it("renders a month read failure through describeFailure", async () => {
+      const myMonth = vi.fn<KintaiEmployeeClient["myMonth"]>(async () => {
+        throw new Error("KINTAI_INVALID_INPUT: period must be YYYY-MM.");
+      });
+      await render(<EmployeePage api={employeeApi({ myMonth })} />);
+
+      expect(month().textContent).toContain("Period must be YYYY-MM.");
+    });
+
+    // Nothing here navigates or submits, so every control — the picker buttons included — is an
+    // inert `type="button"`, and the panel adds no form/select/textarea the host sandbox forbids.
+    it("keeps every 今月 control an inert button and adds no form/select/textarea", async () => {
+      const currentMonth = jstWorkDate(Date.now()).slice(0, 7);
+      const myMonth = vi.fn<KintaiEmployeeClient["myMonth"]>(async (period) => employeeMonth(period, [
+        monthDay({ workDate: `${currentMonth}-01`, workedMinutes: 480, anomalies: ["unpaired_in"] }),
+      ]));
+      await render(<EmployeePage api={employeeApi({ myMonth })} />);
+
+      const buttons = month().querySelectorAll("button");
+      expect(buttons.length).toBeGreaterThan(0);
+      for (const button of buttons) {
+        expect(button.getAttribute("type")).toBe("button");
+      }
+      expect(month().querySelectorAll("form, select, textarea")).toHaveLength(0);
+    });
+  });
+
+  /** `period` moved by `delta` whole months, as `[year, month]` zero-padded strings. */
+  function shiftedMonth(period: string, delta: number): [string, string] {
+    const months = Number(period.slice(0, 4)) * 12 + (Number(period.slice(5, 7)) - 1) + delta;
+    const year = Math.floor(months / 12);
+    const monthNo = months - year * 12 + 1;
+    return [String(year).padStart(4, "0"), String(monthNo).padStart(2, "0")];
+  }
+
   async function render(element: React.ReactNode): Promise<void> {
     container = document.createElement("div");
     document.body.append(container);
@@ -322,6 +506,16 @@ describe("EmployeePage", () => {
   function inToday<T extends Element>(selector: string): T {
     const element = today().querySelector<T>(selector);
     if (!element) throw new Error(`Missing ${selector} in 今日`);
+    return element;
+  }
+
+  function month(): HTMLElement {
+    return field<HTMLElement>('[data-testid="panel-month"]');
+  }
+
+  function inMonth<T extends Element>(selector: string): T {
+    const element = month().querySelector<T>(selector);
+    if (!element) throw new Error(`Missing ${selector} in 今月`);
     return element;
   }
 

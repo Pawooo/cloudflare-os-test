@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { KintaiEmployeeClient, PunchKind, PunchRow } from "../src/types";
+import type {
+  EmployeeMonth, EmployeeMonthDay, KintaiEmployeeClient, PunchKind, PunchRow, SubmissionState,
+} from "../src/types";
 import { jstClockTime, jstWorkDate } from "../src/work-date";
 import { describeFailure } from "./errors";
 import { PunchSource } from "./PunchSource";
@@ -35,7 +37,7 @@ export default function EmployeePage({ api }: { api: KintaiEmployeeClient }) {
       </div>
 
       <div hidden={tab !== "month"} data-testid="panel-month">
-        <p className="text-sm text-kumo-subtle">今月 — coming soon.</p>
+        <MonthPanel api={api} />
       </div>
     </main>
   );
@@ -372,5 +374,221 @@ function MissingOutForm(
         </p>
       )}
     </div>
+  );
+}
+
+/**
+ * How each overtime state reads to the employee whose request it is.
+ *
+ * The keys are `SubmissionState`; an unknown one falls through to the raw state rather than to
+ * nothing, on the same principle as `ANOMALY_LABELS` above — a state added on the worker side must
+ * surface as an ugly word, never as a request that looks stateless. Every one of these is a CLAIM,
+ * which is why the panel carries a standing line saying so; the label names where in approval the
+ * claim currently sits, not what will be paid.
+ */
+const OVERTIME_STATE_LABELS: Record<SubmissionState, string> = {
+  draft: "下書き",
+  pending: "承認待ち",
+  approved: "承認済み",
+  rejected: "却下",
+  withdrawn: "取り下げ",
+};
+
+/**
+ * `8h 15m`, and always both units — the 月次 convention (`formatWorkedHours`), not `OverviewTab`'s
+ * `formatDuration` which drops the empty half. Both the worked column and the overtime column are
+ * numbers a reader runs their eye down, and `8h` beside `8h 15m` makes the column ragged.
+ *
+ * Arithmetic on a number that arrived already computed — `workedMinutes` in `store/punches.ts` is
+ * the only place worked time is decided, and the overtime minutes are the request's own figure.
+ * Nothing here recomputes anything.
+ */
+function formatHoursMinutes(minutes: number): string {
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+/**
+ * `period` moved by `delta` months, carrying across a year boundary.
+ *
+ * The same month arithmetic `MonthlyTab.shiftMonth` uses, and for the same reason: months counted
+ * from year zero rather than through a `Date`, so no timezone is dragged into an operation on a
+ * `YYYY-MM` string that has no instant in it, and `setMonth` on the 31st cannot go wrong.
+ */
+function shiftMonth(period: string, delta: number): string {
+  const months = Number(period.slice(0, 4)) * 12 + (Number(period.slice(5, 7)) - 1) + delta;
+  const year = Math.floor(months / 12);
+  const month = months - year * 12 + 1;
+  return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}`;
+}
+
+/**
+ * 今月 — the month a worker reads back.
+ *
+ * A picker over one employee's own months and a table of their days. Every number arrives from
+ * `myMonth` — the employee-side view of the same `monthlyTotals` rollup the admin 月次 tab reads,
+ * seen from the day side. This panel formats and it navigates; it owns no arithmetic over
+ * attendance.
+ *
+ * The month is read on mount and again whenever the picker moves — the same `live`/`readId` guard
+ * `TodayPanel` uses, so a reader stepping through months quickly cannot have an out-of-order
+ * landing paint the wrong month, and a set after unmount is dropped. There is no write on this
+ * screen, so no reload token: the picker is the only thing that re-reads.
+ *
+ * `currentMonth` is `jstWorkDate(now).slice(0,7)` decided ONCE for the life of the panel — the same
+ * hold 月次 keeps, so the future bound below cannot shift under a page left open across JST midnight
+ * on the 1st, which would silently turn the next button on for a month that has not started.
+ */
+function MonthPanel({ api }: { api: KintaiEmployeeClient }) {
+  const [currentMonth] = useState(() => jstWorkDate(Date.now()).slice(0, 7));
+  const [period, setPeriod] = useState(currentMonth);
+  const [state, setState] = useState<{ month?: EmployeeMonth; error?: string }>({});
+
+  const live = useRef(true);
+  const readId = useRef(0);
+  useEffect(() => {
+    live.current = true;
+    return () => { live.current = false; };
+  }, []);
+
+  useEffect(() => {
+    const id = ++readId.current;
+    setState({});
+    void (async () => {
+      try {
+        const someMonth = await api.myMonth(period);
+        if (live.current && id === readId.current) setState({ month: someMonth });
+      } catch (caught) {
+        if (live.current && id === readId.current) {
+          setState({ error: describeFailure(caught, "今月の勤怠を読み込めませんでした。") });
+        }
+      }
+    })();
+  }, [api, period]);
+
+  return (
+    <div className="flex flex-col gap-6">
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          data-action="prev-month"
+          aria-label="前の月"
+          className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-sm font-medium text-kumo-default hover:bg-kumo-tint"
+          onClick={() => setPeriod((current) => shiftMonth(current, -1))}
+        >
+          ←
+        </button>
+        {/* A label, not a field: the only months a reader can ask for are one step either side, so
+            there is no free text to validate. `YYYY-MM` is exactly what `myMonth` takes. */}
+        <h2
+          data-testid="month-label"
+          className="min-w-20 text-center font-mono text-base font-semibold text-kumo-default"
+        >
+          {period}
+        </h2>
+        <button
+          type="button"
+          data-action="next-month"
+          aria-label="次の月"
+          /* Disabled AT the current month, not after it — there is no month past this one to read
+             yet. Going backwards has no bound. The same rule 月次's next button follows. */
+          disabled={period >= currentMonth}
+          className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-sm font-medium text-kumo-default hover:bg-kumo-tint disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-kumo-control"
+          onClick={() => setPeriod((current) => shiftMonth(current, 1))}
+        >
+          →
+        </button>
+      </div>
+
+      {/* The guardrail: every overtime figure below is a CLAIM awaiting a decision, not a payout.
+          A pending number in a column headed 残業 reads as money owed unless something says
+          otherwise, and this is that something. Pinned in a test so it cannot soften. */}
+      <p data-testid="claims-note" className="text-xs text-kumo-subtle">
+        残業時間は承認待ちの申請であり、承認されるまで支給額ではありません — overtime shown here is a claim awaiting approval, not a payout.
+      </p>
+
+      <MonthTable state={state} />
+    </div>
+  );
+}
+
+/** One row per day the employee has punches in the month. Table, not cards. */
+function MonthTable({ state }: { state: { month?: EmployeeMonth; error?: string } }) {
+  if (state.error !== undefined) {
+    return <p className="text-sm text-kumo-danger" role="alert">{state.error}</p>;
+  }
+  if (state.month === undefined) {
+    return <p className="text-sm text-kumo-subtle">読み込み中…</p>;
+  }
+
+  const { period, days } = state.month;
+  if (days.length === 0) {
+    /* What "nothing here" means, never a blank space — the same rule 今日's empty day follows.
+       `myMonth` returns a row per day WITH punches, so an empty month is one nobody clocked into. */
+    return (
+      <p
+        className="rounded-lg border border-dashed border-kumo-line px-4 py-6 text-center text-sm text-kumo-subtle"
+        data-testid="month-empty"
+      >
+        {period} には打刻がありません。
+      </p>
+    );
+  }
+
+  return (
+    /* A real table: worked and overtime are numbers a reader compares down the column, which a
+       list of cards cannot do. It scrolls inside its own box rather than pushing the page sideways. */
+    <div className="overflow-x-auto">
+      <table className="w-full border-collapse text-sm">
+        <thead>
+          <tr className="border-b border-kumo-line text-left text-xs text-kumo-subtle">
+            <th scope="col" className="py-2 pr-4 font-medium">日付</th>
+            <th scope="col" className="py-2 pr-4 text-right font-medium">労働時間</th>
+            <th scope="col" className="py-2 pr-4 text-right font-medium">残業</th>
+            <th scope="col" className="py-2 font-medium">要確認</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-kumo-line">
+          {days.map((eachDay) => (
+            <MonthDayRow key={eachDay.workDate} day={eachDay} />
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function MonthDayRow({ day }: { day: EmployeeMonthDay }) {
+  return (
+    <tr data-month-day={day.workDate}>
+      <td className="py-2 pr-4 font-mono text-kumo-default">{day.workDate}</td>
+      <td className="py-2 pr-4 text-right font-mono text-kumo-default" data-testid="worked">
+        {formatHoursMinutes(day.workedMinutes)}
+      </td>
+      {/* A day with no request renders an EMPTY cell — never a zero, which in a 残業 column reads
+          as a claim of no minutes owed rather than as the absence of a claim. */}
+      <td className="py-2 pr-4 text-right font-mono text-kumo-default" data-testid="overtime">
+        {day.overtime !== null && (
+          <span>
+            {formatHoursMinutes(day.overtime.minutes)}
+            {" · "}
+            <span className="text-kumo-subtle">
+              {OVERTIME_STATE_LABELS[day.overtime.state] ?? day.overtime.state}
+            </span>
+          </span>
+        )}
+      </td>
+      {/* A marker only where the day is flagged, in plain language — the same `ANOMALY_LABELS`
+          translation 今日 uses, never the raw wire flag. No cell content at all on a clean day.
+          No link to 今日: that panel is fixed to today's date and reusing it for an arbitrary past
+          day would mean parameterising it, which is out of this task's scope — so the marker names
+          the problem and stops there. */}
+      <td className="py-2 text-xs text-kumo-danger">
+        {day.anomalies.length > 0 && (
+          <span data-testid="day-anomalies">
+            {day.anomalies.map((flag) => ANOMALY_LABELS[flag] ?? flag).join(" · ")}
+          </span>
+        )}
+      </td>
+    </tr>
   );
 }
