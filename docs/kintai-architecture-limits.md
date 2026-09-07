@@ -73,16 +73,22 @@ a freshly created row.
 Harmless today, and worth closing when onboarding is built out: getting the policy right at hire
 is the whole point of having it per employee.
 
-## Approval routes had no configuration surface — WAS INCIDENTAL, now mitigated
+## Approval routes had no configuration surface — WAS INCIDENTAL, unblocked 2026-09-04
 
 `createRoute` existed on the store with no admin method, no session method and no UI. On a store
 with no routes, `resolveRoute` threw `KINTAI_NO_ROUTE` and **no submission could be created at
 all** — with nothing in any API able to fix it.
 
 `applySchema` now seeds a catch-all fallback (one step, any manager, lowest specificity) so a fresh
-store can route an approval. That unblocks the flow; it does not make routes configurable. Real
-route management — department rules, minute thresholds, multi-step escalation — still belongs on
-the HR screen and is unbuilt.
+store can route an approval. That unblocks the flow; it does not make routes configurable.
+
+Be precise about which half closed, because the two halves have different owners. The BLOCKING
+half is gone: a fresh store routes an approval, and no state of the configuration can leave the
+system unable to create any submission at all. The CONFIGURATION half is untouched — there is
+still no `createRoute` on `KintaiAdminApi`, no session method and no form, so department rules,
+minute thresholds and multi-step escalation remain unreachable. Every submission in the system
+currently routes through one seeded fallback step. That is a working default, not a feature, and it
+belongs on the HR screen.
 
 ## The root of the org chart could not be given an approver — WAS REAL, now closed
 
@@ -103,12 +109,52 @@ Still open in the same area: there is no way to CLEAR a designated approver, clo
 line, or end an exemption. All three are de-authorisations, all three belong together, and none
 exists.
 
+## No month could ever be closed — WAS REAL, closed 2026-09-04
+
+The same shape as the two above and the most consequential of the three, because this one was load
+bearing rather than merely absent.
+
+`period_locks` has been enforced from the beginning. `assertWritable` reads it, `KintaiSession.punch`
+calls `assertWritable`, and a closed month refuses every ordinary write into it — the mechanism was
+complete, tested, and correct. What no surface could do was write a ROW into that table.
+`KintaiStore.lockPeriod` was public on the store and called by nothing but its own tests, so in
+practice **no month could ever be closed**, and the lock enforced a state the system could not
+enter.
+
+What that cost is not abstract. `setAllocations` is the one write in this package with no approval
+behind it, and the period lock is the only thing that ever stops it. With no way to close a month,
+it could rewrite a month somebody had already been paid on, indefinitely, with nothing in the
+architecture to say otherwise. "Append-only" only meant the table grows.
+
+`KintaiAdminApi.lockPeriod(period)` is the call, and 月次's 「この月を締める」 is the button. It is
+audited, `locked_by` is the caller's OWN employee id resolved from their own capability rather than
+an argument, and it is one-way: there is no unlock here and none on the store.
+
+Three things about it are worth having written down, because each looks like an omission and is
+not:
+
+- **No unlock, deliberately.** Reopening a month would have to say what happens to the amendments
+  filed against it and to a payroll run already made from it. Nobody has made that decision, and a
+  reopen that did not answer both would be worse than the absence.
+- **Closed is not frozen.** Applying an approved amendment is the one write a closed month still
+  accepts, so its totals can still move afterwards — by exactly the route that leaves a trail. The
+  confirmation on the HR screen says so in as many words, because "closed" reads as "final" to
+  everybody who has not read `actOnAmendment`.
+- **An administrator with no employee record cannot close a month at all**
+  (`KINTAI_ADMIN_NOT_LINKED`). `period_locks.locked_by` is NOT NULL, and unlike `linkAccount` this
+  write has no honest "unset" to fall back on: the whole point of the row is who closed the month.
+  The refusal is the column being right, not a gap — and it is one more reason the account card
+  shows an admin their own code whether or not they are linked.
+
 ## The pattern worth noticing
 
-Four of the five limits above are the same shape: **a capability implemented on the store, tested,
+Five of the six limits above are the same shape: **a capability implemented on the store, tested,
 and reachable from nowhere.** `createRoute` was one. `designated_approver_id`'s escape hatch was
 another. `correctPunch` is a third — it is what the amendment work exists to reach.
 `recordPunch`'s historical-write ability is a fourth, and that one should stay unreachable.
+`lockPeriod` is the fifth, and it is the one that shows what the shape actually costs: the lock it
+writes was enforced everywhere, so the gap did not read as a missing feature — it read as a system
+whose central compliance guarantee was watertight and permanently inert.
 
 A store method with no caller is not a feature. It is either a gap that will surface as
 "the system cannot do X and nothing can fix it", or a hole waiting for someone in a hurry.
