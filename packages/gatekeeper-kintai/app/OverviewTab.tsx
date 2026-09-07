@@ -4,6 +4,7 @@ import type {
 } from "../src/types";
 import { jstClockTime, jstWorkDate } from "../src/work-date";
 import type { KintaiAdminClient, RowFixes } from "./AdminPage";
+import { PunchSource } from "./PunchSource";
 import { isReady, RosterRow } from "./RosterRow";
 import { describeFailure } from "./errors";
 
@@ -470,7 +471,7 @@ function AnomalousDayRow({ day, api }: { day: AnomalousDay; api: KintaiAdminClie
                 {detail.day.punches.map((punch) => (
                   <li key={punch.id} className="font-mono text-xs text-kumo-default" data-testid="punch">
                     {jstClockTime(punch.occurred_at)} {punch.kind}
-                    <span className="ml-2 text-kumo-inactive">{punch.source}</span>
+                    <PunchSource punch={punch} />
                   </li>
                 ))}
               </ul>
