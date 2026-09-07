@@ -24,9 +24,10 @@
 import { assertPeriod } from "../input.js";
 import { currentPunches, dayAnomalies, workedMinutes } from "./punches.js";
 import { periodLock } from "./periods.js";
-import { eligibleActors, pendingSubmissions } from "./submissions.js";
+import { eligibleActors, listSubmissionsFor, pendingSubmissions } from "./submissions.js";
 import type {
-  AnomalousDay, EmployeeDay, EmployeeId, MonthlyReport, MonthlyTotalRow, PendingItem,
+  AnomalousDay, EmployeeDay, EmployeeId, EmployeeMonth, EmployeeMonthDay, MonthlyReport,
+  MonthlyTotalRow, PendingItem, SubmissionState,
 } from "../types.js";
 
 /*
@@ -44,16 +45,33 @@ import type {
  *
  * Nothing about how any of these rows is ASSEMBLED moved; that is still entirely below.
  */
-export type { AnomalousDay, EmployeeDay, MonthlyReport, MonthlyTotalRow, PendingItem };
+export type { AnomalousDay, EmployeeDay, EmployeeMonth, EmployeeMonthDay, MonthlyReport,
+  MonthlyTotalRow, PendingItem };
 
-/** Every (employee, day) in the month that holds punches -- the only days that can have state. */
+/**
+ * Every (employee, day) in the month that holds punches -- the only days that can have state.
+ *
+ * `employeeId`, when given, adds `AND employee_id = ?` to the same query rather than filtering the
+ * unscoped result in JS: `employeeMonth` reads one person's month out of a store that can hold a
+ * whole company's, and a scan of every employee's punches to keep one of them is exactly the cost
+ * this parameter exists to avoid. It is one query with an optional clause, not a second one --
+ * `monthlyTotals` and `anomalousDays` still call it unscoped, and `employeeMonth` is the only
+ * caller that ever passes the second argument.
+ */
 function daysWithPunches(
-  sql: SqlStorage, period: string,
+  sql: SqlStorage, period: string, employeeId?: EmployeeId,
 ): { employee_id: number; work_date: string }[] {
+  if (employeeId === undefined) {
+    return sql.exec<{ employee_id: number; work_date: string }>(
+      `SELECT DISTINCT employee_id, work_date FROM punches
+       WHERE work_date LIKE ? ORDER BY employee_id, work_date`,
+      `${period}-%`,
+    ).toArray();
+  }
   return sql.exec<{ employee_id: number; work_date: string }>(
     `SELECT DISTINCT employee_id, work_date FROM punches
-     WHERE work_date LIKE ? ORDER BY employee_id, work_date`,
-    `${period}-%`,
+     WHERE work_date LIKE ? AND employee_id = ? ORDER BY employee_id, work_date`,
+    `${period}-%`, employeeId,
   ).toArray();
 }
 
@@ -170,6 +188,55 @@ export function employeeDay(sql: SqlStorage, employeeId: EmployeeId, workDate: s
     anomalies: dayAnomalies(sql, employeeId, workDate),
     workedMinutes: workedMinutes(sql, employeeId, workDate),
   };
+}
+
+/**
+ * One employee's own month: one row per day they have punches in `period`, with that day's
+ * credited minutes, its anomaly flags, and its own overtime request state.
+ *
+ * The days themselves are `daysWithPunches` scoped to this employee -- the same query
+ * `monthlyTotals` runs unscoped -- and each row's `workedMinutes`/`anomalies` are the same
+ * `workedMinutes`/`dayAnomalies` calls `monthlyTotals` makes per day, not a re-derivation of
+ * either. There is no stored total to read instead, for the reason `monthlyTotals`'s own comment
+ * gives: `punches` is append-only, so a cached total would be a second copy of a fact the punch
+ * table already answers -- one an approved amendment could leave stale the moment it lands. A
+ * month with no punched days returns an empty list rather than one row per calendar day: like
+ * `daysWithPunches` itself, a day this employee never touched has no state to report.
+ *
+ * Overtime is read separately, from `listSubmissionsFor` -- the same read `KintaiStore` already
+ * exposes for an employee's own submissions list -- because a day's overtime REQUEST is not a fact
+ * about punches: a punched day can have no request at all, and (filed ahead of a shift) a request
+ * can exist for a day with no punches yet, which is exactly why `overtime` is looked up by
+ * `requested_for` rather than derived from the day's punch rows. `listSubmissionsFor` orders
+ * newest first by submission id, so the FIRST `'overtime'` row seen for a given `requested_for` is
+ * already the most recent one -- the "several exist, most recent wins" rule `EmployeeMonthDay`
+ * documents, held by iteration order rather than a second sort.
+ */
+export function employeeMonth(
+  sql: SqlStorage, employeeId: EmployeeId, period: string,
+): EmployeeMonth {
+  assertPeriod("period", period);
+
+  const days = daysWithPunches(sql, period, employeeId);
+  if (days.length === 0) return { period, days: [] };
+
+  const overtimeByDate = new Map<string, { minutes: number; state: SubmissionState }>();
+  for (const submission of listSubmissionsFor(sql, employeeId)) {
+    if (submission.kind !== "overtime") continue;
+    if (overtimeByDate.has(submission.requested_for)) continue;
+    overtimeByDate.set(submission.requested_for, {
+      minutes: submission.minutes, state: submission.state,
+    });
+  }
+
+  const rows: EmployeeMonthDay[] = days.map(({ work_date: workDate }) => ({
+    workDate,
+    workedMinutes: workedMinutes(sql, employeeId, workDate),
+    anomalies: dayAnomalies(sql, employeeId, workDate),
+    overtime: overtimeByDate.get(workDate) ?? null,
+  }));
+
+  return { period, days: rows };
 }
 
 /**

@@ -358,6 +358,26 @@ export type EmployeeDay = {
 };
 
 /**
+ * One day of one employee's own month, as the employee gadget shows it: the minutes credited, the
+ * flags the day raises, and that day's own overtime request, if it has one.
+ */
+export type EmployeeMonthDay = {
+  workDate: string;
+  workedMinutes: number;
+  anomalies: string[];
+  /** The day's own overtime submission state, or null if none. One request per day is the
+   *  common case; if several exist, the most recent by submission id. */
+  overtime: { minutes: number; state: SubmissionState } | null;
+};
+
+/**
+ * One employee's own month: one row per day they have punches in `period`, bounded to that one
+ * employee. `monthlyTotals`'s per-employee rollup for the admin dashboard, seen from the other
+ * side -- the days themselves, for the employee whose days they are.
+ */
+export type EmployeeMonth = { period: string; days: EmployeeMonthDay[] };
+
+/**
  * One waiting request, as an administrator triaging the whole company's queue needs to read it.
  *
  * Every field of the underlying `SubmissionRow` is kept, amendment detail included, so this row is

@@ -154,6 +154,7 @@ describe("assertPeriod at the boundary", () => {
     "refuses %o as a period", async (period) => {
       await expect(() => store.anomalousDays(period)).rejects.toThrow(/KINTAI_INVALID_INPUT/);
       await expect(() => store.monthlyTotals(period)).rejects.toThrow(/KINTAI_INVALID_INPUT/);
+      await expect(() => store.employeeMonth(worker, period)).rejects.toThrow(/KINTAI_INVALID_INPUT/);
     },
   );
 
@@ -161,6 +162,8 @@ describe("assertPeriod at the boundary", () => {
     await expect(store.anomalousDays("2026-07")).resolves.toEqual([]);
     await expect(store.monthlyTotals("2026-07"))
       .resolves.toMatchObject({ period: "2026-07", locked: false, rows: [] });
+    await expect(store.employeeMonth(worker, "2026-07"))
+      .resolves.toMatchObject({ period: "2026-07", days: [] });
   });
 });
 

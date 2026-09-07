@@ -18,8 +18,8 @@ import {
 } from "./employees.js";
 import { listRoster } from "./roster.js";
 import {
-  anomalousDays, employeeDay, monthlyTotals, pendingOverview,
-  type AnomalousDay, type EmployeeDay, type MonthlyReport, type PendingItem,
+  anomalousDays, employeeDay, employeeMonth, monthlyTotals, pendingOverview,
+  type AnomalousDay, type EmployeeDay, type EmployeeMonth, type MonthlyReport, type PendingItem,
 } from "./overview.js";
 import {
   assertApproverReachable, hasAuthorityOver, hasReachableApprover, listReportingLines, managersAt,
@@ -127,6 +127,14 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
   /** One employee's one day: punches, flags and credited minutes. See `employeeDay`. */
   async employeeDay(employeeId: EmployeeId, workDate: string): Promise<EmployeeDay> {
     return employeeDay(this.sql, employeeId, workDate);
+  }
+
+  /**
+   * One employee's own month: worked minutes, flags and overtime state per day they have punches
+   * in. The employee gadget's own read, scoped to one person -- see `employeeMonth`.
+   */
+  async employeeMonth(employeeId: EmployeeId, period: string): Promise<EmployeeMonth> {
+    return employeeMonth(this.sql, employeeId, period);
   }
 
   /**
