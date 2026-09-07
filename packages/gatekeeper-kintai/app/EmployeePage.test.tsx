@@ -242,6 +242,49 @@ describe("EmployeePage", () => {
     expect(today().textContent).toContain("You already clocked in.");
   });
 
+  // The core interaction: a punch must re-read the day so the control advances. Sequence `getDay`
+  // — an empty day, then a day carrying the new `in` — and prove the UI reflects the SECOND read
+  // (出勤 → 退勤/休憩開始), not just the first. If the reload after a punch is dropped, the button
+  // stays 出勤 and this goes red.
+  it("re-reads the day after a punch so the shift control advances", async () => {
+    const getDay = vi.fn<KintaiEmployeeClient["getDay"]>();
+    getDay.mockResolvedValueOnce(day([]));
+    getDay.mockResolvedValue(day([punchRow({ kind: "in" })]));
+    const api = employeeApi({ getDay });
+    await render(<EmployeePage api={api} />);
+
+    expect(getDay).toHaveBeenCalledTimes(1);
+    expect(inToday('[data-punch="in"]').textContent).toBe("出勤");
+
+    await click('[data-testid="panel-today"] [data-punch="in"]');
+
+    // The write re-read the day, and the control redrew from what came back the second time.
+    expect(getDay).toHaveBeenCalledTimes(2);
+    expect(inToday('[data-punch="out"]').textContent).toBe("退勤");
+    expect(inToday('[data-punch="break_start"]').textContent).toBe("休憩開始");
+    expect(today().querySelector('[data-punch="in"]')).toBeNull();
+  });
+
+  // A filed correction is a write too, and the same reload must follow it — otherwise a day that
+  // changed under an approver would keep showing the stale read. Assert the second `getDay`.
+  it("re-reads the day after filing a correction", async () => {
+    const getDay = vi.fn<KintaiEmployeeClient["getDay"]>(
+      async () => day([punchRow({ kind: "in" })], { anomalies: ["unpaired_in"] }),
+    );
+    const api = employeeApi({ getDay, requestMissingPunch: vi.fn(async () => 1) });
+    await render(<EmployeePage api={api} />);
+
+    expect(getDay).toHaveBeenCalledTimes(1);
+
+    await setInput('[data-testid="correction-time"]', "18:30");
+    await setInput('[data-testid="correction-reason"]', "退勤の打刻を忘れました");
+    await click('[data-testid="panel-today"] [data-testid="file-correction"]');
+
+    expect(api.requestMissingPunch).toHaveBeenCalledTimes(1);
+    expect(getDay).toHaveBeenCalledTimes(2);
+    expect(today().textContent).toContain("申請しました・承認待ち");
+  });
+
   it("keeps every 今日 control an inert button and adds no form/select/textarea", async () => {
     const api = employeeApi({
       getDay: vi.fn(async () => day([punchRow({ kind: "in" })], { anomalies: ["unpaired_in"] })),
