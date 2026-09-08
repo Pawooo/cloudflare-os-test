@@ -222,6 +222,10 @@ describe("EmployeePage", () => {
   });
 
   it("names an unpaired_in in plain language and files a correction as a REQUEST", async () => {
+    // Pinned: 今日 files against `jstWorkDate(Date.now())`, and the assertion below names the day
+    // the fixtures are built on. Left to the real clock this passed on the day it was written and
+    // failed the morning after.
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-09-07T12:00:00+09:00"));
     const requestMissingPunch = vi.fn(async () => 1);
     const api = employeeApi({
       getDay: vi.fn(async () => day([punchRow({ kind: "in" })], { anomalies: ["unpaired_in"] })),
