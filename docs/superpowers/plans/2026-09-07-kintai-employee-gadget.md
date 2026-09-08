@@ -257,11 +257,17 @@ This is the riskiest task — the build pipeline assumes one entry (`app/index.h
 
 Not a code task. Same procedure as `docs/superpowers/plans/2026-09-04-kintai-admin-dashboard-verification.md`: own stack on `--port 8799` (revert the ~18 `wrangler.dev.jsonc` and any `ADMINS` edit before commit), probe employees prefixed `PROBE-EMP-`, 2025 months for anything locked, never delete `.wrangler/state`.
 
-- [ ] Open the app as a **non-admin** in the real Workshop iframe (headless browser, as the sandbox history demands): confirm they get the EMPLOYEE screen, not the admin wall or the admin tabs.
-- [ ] Punch in and out via the buttons; confirm the shift-state control advances; confirm `source` renders 本人打刻.
-- [ ] Leave a gap; file the missing 打刻 from 今日; confirm it appears in a manager's `listPendingApprovals`, the screen says 承認待ち, and after the manager approves, 今日 and 今月 reflect it.
-- [ ] Confirm an admin still gets the admin dashboard unchanged, and the punch made from the employee button is byte-indistinguishable from an agent punch (same `source`, same `work_date` attribution) — the shared-path proof, live.
-- [ ] Rebuild both bundles server-stopped (build twice, compare — the 11-byte non-determinism), everything reverted, gates green (worker / app / tsc / typecheck:app). Record to `docs/superpowers/plans/2026-09-07-kintai-employee-gadget-verification.md`; commit.
+**Part 1 — driven 2026-09-08, recorded in `2026-09-07-kintai-employee-gadget-verification.md`:**
+
+- [x] Open the app as a **non-admin** in the real Workshop iframe (headless browser, as the sandbox history demands): confirm they get the EMPLOYEE screen, not the admin wall or the admin tabs.
+- [x] Punch in and out via the buttons; confirm the shift-state control advances; confirm `source` renders 本人打刻.
+- [x] Leave a gap; file the missing 打刻 from 今日; confirm it appears in a manager's `listPendingApprovals`, the screen says 承認待ち, and after the manager approves, 今日 and 今月 reflect it.
+- [x] Confirm an admin still gets the admin dashboard unchanged, and the punch made from the employee button is byte-indistinguishable from an agent punch (same `source`, same `work_date` attribution) — the shared-path proof, live.
+- [x] Rebuild both bundles server-stopped (build twice, compare — the 11-byte non-determinism), everything reverted, gates green (worker / app / tsc / typecheck:app). Record to `docs/superpowers/plans/2026-09-07-kintai-employee-gadget-verification.md`; commit.
+
+**Part 2 — the owner drives it:**
+
+- [ ] The owner's own pass over the employee screen (submission 53, a pending 90-minute overtime claim for `PROBE-EMP-W1`, is left waiting for it).
 
 ---
 
