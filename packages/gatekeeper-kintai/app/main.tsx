@@ -19,9 +19,10 @@ class AppIframe extends RpcTarget implements GatekeeperAppThemeReceiver {
 }
 
 /**
- * What the Workshop exposes to this iframe. `ui` is whatever `startAppUi` decided this viewer gets
- * — an admin capability or a viewer one — and the page cannot tell which, by design: there is no
- * admin flag on this side to read, and asking is what the refusal is for.
+ * What the Workshop exposes to this iframe. `ui` is the admin capability `startAppUi` handed this
+ * viewer; on this entry it is always `AdminKintaiApi`, because the Workshop only ever serves this
+ * bundle to an administrator (a non-admin gets `employee-main.tsx`'s). There is no admin flag on
+ * this side to read and nothing to probe — the same property `employee-main.tsx` documents.
  *
  * The host also offers workspace navigation to gatekeeper apps that want it. None is declared here
  * because this page opens nothing.

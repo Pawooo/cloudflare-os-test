@@ -18,7 +18,7 @@ import type {
   RosterEntry, WorkDatePolicy,
 } from "../src/types";
 import { WORK_DATE_POLICIES, WORK_DATE_POLICY_LABELS } from "../src/work-date";
-import { describeFailure, isAdminRequired } from "./errors";
+import { describeFailure } from "./errors";
 import { MonthlyTab } from "./MonthlyTab";
 import { OverviewTab } from "./OverviewTab";
 import { isReady, RosterRow } from "./RosterRow";
@@ -26,10 +26,11 @@ import { isReady, RosterRow } from "./RosterRow";
 /**
  * The capability this page calls, as the page sees it.
  *
- * The same shape whoever is looking: `startAppUi` decides server-side which class is behind it,
- * and both implement `KintaiAdminApi`. There is no admin flag on this side to branch on and
- * nothing to ask — a non-admin's stub simply refuses, which is why `listEmployees` doubles as the
- * probe below.
+ * Always `AdminKintaiApi` behind the stub: `startAppUi` decides server-side from `isAdmin`, and
+ * this bundle is only ever served alongside the admin capability — a non-admin is handed the
+ * employee bundle (`employee-main.tsx`) and `EmployeeKintaiApi` instead. There is no admin flag on
+ * this side to branch on, and nothing to probe for: whoever is reading this page is an
+ * administrator, or the Workshop would not have loaded it.
  */
 export type KintaiAdminClient = {
   whoAmI(): Promise<KintaiIdentity>;
@@ -77,8 +78,6 @@ export type RowFixes = {
 type View =
   | { status: "loading" }
   | { status: "failed"; message: string }
-  /** Not an administrator: their own account code, and nothing else. */
-  | { status: "employee"; identity: KintaiIdentity }
   | { status: "admin"; identity: KintaiIdentity; roster: RosterEntry[] };
 
 /** Which form a message or a spinner belongs to. Failures must land beside what failed. */
@@ -93,20 +92,20 @@ type Notice = { kind: "ok" | "error"; text: string };
 type Tab = "overview" | "monthly" | "roster";
 
 /**
- * The Kintai HR screens.
+ * The Kintai HR dashboard.
  *
- * Two views in one component, deliberately. Which one a person gets is a single piece of state
- * derived from one probe, and both share the account card, the loading state, the failure state
- * and the retry — splitting them into two roots would mean two copies of all of that, and the
- * thing most likely to drift is precisely the boundary between them. The admin half is a subtree
- * that is present or absent; it is not a permission this component decides, and there is nothing
- * it could decide differently, because a non-admin's capability has no admin behaviour behind it.
+ * One view: the administrator's. Which screen a person gets is not decided here — `startAppUi`
+ * chooses the bundle AND the capability from `isAdmin` in one server-side expression, so a
+ * non-admin never loads this file; they get the employee gadget. Until 2026-09-07 this component
+ * also held a stripped-down "employee" view, reached by calling `listEmployees()` and reading a
+ * `KINTAI_ADMIN_REQUIRED` refusal off the non-admin's refuse-all capability. That capability
+ * (`ViewerKintaiApi`) no longer exists and nothing produces that code, so the branch was retired
+ * rather than kept as insurance: were the pairing ever wrong, `listEmployees` on an
+ * `EmployeeKintaiApi` fails as a missing method, not as that refusal, and lands in the failure
+ * state below — which is the honest outcome, a visible error rather than a silently demoted page.
  *
- * How it learns which it is: it calls `listEmployees()` and reads the refusal. There is no admin
- * flag in the frame and no way to ask for one — `startAppUi` consumes `isAdmin` server-side and
- * never sends it — so a refusal IS the answer. Only `KINTAI_ADMIN_REQUIRED` means "not an
- * administrator"; any other failure is a failure, and is shown as one rather than quietly
- * degrading an administrator into a viewer.
+ * So `load` has two answers: a roster, or a failure shown as one. Any error from either read is
+ * a failure — there is no error that means "not an administrator" any more.
  */
 export default function AdminPage({ api }: { api: KintaiAdminClient }) {
   const [view, setView] = useState<View>({ status: "loading" });
@@ -208,8 +207,6 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
     if (!live.current) return;
     if ("roster" in result) {
       setView({ status: "admin", identity, roster: result.roster });
-    } else if (isAdminRequired(result.error)) {
-      setView({ status: "employee", identity });
     } else {
       setView({
         status: "failed",
@@ -331,9 +328,7 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
         </div>
       )}
 
-      {(view.status === "employee" || view.status === "admin") && (
-        <AccountCard identity={view.identity} admin={view.status === "admin"} />
-      )}
+      {view.status === "admin" && <AccountCard identity={view.identity} />}
 
       {view.status === "admin" && (
         <>
@@ -522,14 +517,15 @@ function reveal(node: HTMLElement | null, formAction: string): void {
 }
 
 /**
- * The caller's own account code.
+ * The administrator's own account code.
  *
- * Shown to administrators too, and not as a courtesy: an admin whose own account is not linked to
- * an employee record is recorded as `null` on every audit entry they write, so linking themselves
- * is a real first step — and this is the only place their code appears. There is no registry of
- * provisioned accounts for anyone to look one up in, which is the whole reason this card exists.
+ * Not a courtesy: an admin whose own account is not linked to an employee record is recorded as
+ * `null` on every audit entry they write, so linking themselves is a real first step — and this is
+ * the only place their code appears. There is no registry of provisioned accounts for anyone to
+ * look one up in, which is the whole reason this card exists. (An employee reads their own code
+ * off the employee gadget, not here.)
  */
-function AccountCard({ identity, admin }: { identity: KintaiIdentity; admin: boolean }) {
+function AccountCard({ identity }: { identity: KintaiIdentity }) {
   const [copied, setCopied] = useState<"copied" | "select" | undefined>();
   const codeRef = useRef<HTMLParagraphElement>(null);
 
@@ -588,17 +584,15 @@ function AccountCard({ identity, admin }: { identity: KintaiIdentity; admin: boo
       <p className="text-sm text-kumo-default" data-testid="linked">
         {identity.linked ? (
           <>
-            {/* The id, not a name: `whoAmI` is the one method a non-admin may call, and it answers
-                from `account_links` alone — the roster that holds display names is admin-only. The
-                number is still what HR asks for when someone needs help. */}
+            {/* The id, not a name: `whoAmI` answers from `account_links` alone — the roster that
+                holds display names is a separate read. The number is still what HR asks for when
+                someone needs help. */}
             You’re set up — this account is employee record{" "}
             <span data-testid="employee-id">{identity.employeeId}</span>.
           </>
-        ) : admin ? (
+        ) : (
           "Not linked to an employee record yet, so your changes are recorded without a name" +
           " against them. Link this code to your own record below."
-        ) : (
-          "Not linked yet — give the account code above to HR. Nobody can look it up for you."
         )}
       </p>
     </section>

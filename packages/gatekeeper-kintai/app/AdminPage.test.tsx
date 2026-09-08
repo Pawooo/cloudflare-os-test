@@ -8,13 +8,6 @@ import AdminPage, { type KintaiAdminClient } from "./AdminPage";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-/** The refusal a non-admin's capability throws, verbatim from `AdminRequiredError`. */
-const REFUSED = (method: string) =>
-  new Error(
-    `KINTAI_ADMIN_REQUIRED: ${method} is available to Workshop administrators only. ` +
-    "Ask an administrator to make this change.",
-  );
-
 function person(overrides: Partial<RosterEntry> & Pick<RosterEntry, "id">): RosterEntry {
   return {
     employee_number: `E-${overrides.id}`,
@@ -80,52 +73,6 @@ function adminApi(overrides: Partial<KintaiAdminClient> = {}, roster: RosterEntr
     lockPeriod: vi.fn<KintaiAdminClient["lockPeriod"]>(async () => {}),
     ...overrides,
   };
-}
-
-/** A non-admin's capability: `whoAmI` answers, everything else refuses. */
-function viewerApi(overrides: Partial<KintaiAdminClient> = {}) {
-  return adminApi({
-    whoAmI: vi.fn<KintaiAdminClient["whoAmI"]>(async () => ({
-      accountId: "acct-1234", linked: false, employeeId: null,
-    })),
-    listEmployees: vi.fn<KintaiAdminClient["listEmployees"]>(async () => {
-      throw REFUSED("listEmployees");
-    }),
-    createEmployee: vi.fn<KintaiAdminClient["createEmployee"]>(async () => {
-      throw REFUSED("createEmployee");
-    }),
-    linkAccount: vi.fn<KintaiAdminClient["linkAccount"]>(async () => {
-      throw REFUSED("linkAccount");
-    }),
-    setReportingLine: vi.fn<KintaiAdminClient["setReportingLine"]>(async () => {
-      throw REFUSED("setReportingLine");
-    }),
-    setDesignatedApprover: vi.fn<KintaiAdminClient["setDesignatedApprover"]>(async () => {
-      throw REFUSED("setDesignatedApprover");
-    }),
-    grantExemption: vi.fn<KintaiAdminClient["grantExemption"]>(async () => {
-      throw REFUSED("grantExemption");
-    }),
-    setWorkDatePolicy: vi.fn<KintaiAdminClient["setWorkDatePolicy"]>(async () => {
-      throw REFUSED("setWorkDatePolicy");
-    }),
-    listPendingOverview: vi.fn<KintaiAdminClient["listPendingOverview"]>(async () => {
-      throw REFUSED("listPendingOverview");
-    }),
-    listAnomalousDays: vi.fn<KintaiAdminClient["listAnomalousDays"]>(async () => {
-      throw REFUSED("listAnomalousDays");
-    }),
-    getEmployeeDay: vi.fn<KintaiAdminClient["getEmployeeDay"]>(async () => {
-      throw REFUSED("getEmployeeDay");
-    }),
-    monthlyReport: vi.fn<KintaiAdminClient["monthlyReport"]>(async () => {
-      throw REFUSED("monthlyReport");
-    }),
-    lockPeriod: vi.fn<KintaiAdminClient["lockPeriod"]>(async () => {
-      throw REFUSED("lockPeriod");
-    }),
-    ...overrides,
-  });
 }
 
 /**
@@ -223,62 +170,37 @@ describe("AdminPage", () => {
     vi.restoreAllMocks();
   });
 
-  describe("the view a non-administrator gets", () => {
-    // The account code is the whole point of showing an unlinked employee this page: there is no
-    // registry of provisioned accounts, so onboarding begins with them reading this string to HR.
-    it("shows the account code and how to get onboarded when the account is unlinked", async () => {
-      await render(<AdminPage api={viewerApi()} />);
-
-      expect(text('[data-testid="account-id"]')).toBe("acct-1234");
-      expect(text('[data-testid="linked"]')).toContain("HR");
-      expect(container!.querySelector('[data-testid="employee-id"]')).toBeNull();
-    });
-
-    it("reports the employee record once the account is linked", async () => {
-      const api = viewerApi({
+  // This page is only ever served to an administrator — a non-admin gets the employee bundle — so
+  // there is no "non-administrator view" to test here any more. Until 2026-09-07 there was: a
+  // refuse-all `ViewerKintaiApi` threw `KINTAI_ADMIN_REQUIRED` and this component read that
+  // refusal as "show them their account code only". Both the capability and the branch are gone.
+  describe("the administrator's own account card", () => {
+    // An admin whose account is unlinked writes every audit entry as `null`, so the card has to
+    // tell them to link themselves — and this is the only place their code appears.
+    it("shows the code and says to link it when the administrator is unlinked", async () => {
+      const api = adminApi({
         whoAmI: vi.fn<KintaiAdminClient["whoAmI"]>(async () => ({
-          accountId: "acct-5678", linked: true, employeeId: 42,
+          accountId: "acct-1234", linked: false, employeeId: null,
         })),
       });
       await render(<AdminPage api={api} />);
 
-      expect(text('[data-testid="account-id"]')).toBe("acct-5678");
-      expect(text('[data-testid="employee-id"]')).toBe("42");
+      expect(text('[data-testid="account-id"]')).toBe("acct-1234");
+      expect(text('[data-testid="linked"]')).toContain("Link this code to your own record");
+      expect(container!.querySelector('[data-testid="employee-id"]')).toBeNull();
     });
 
-    // The authorization boundary is the server's, not this component's — but a page that rendered
-    // admin controls a non-admin cannot use would be lying to them about what they may do.
-    it("offers no roster and no admin control at all", async () => {
-      const api = viewerApi();
-      await render(<AdminPage api={api} />);
+    it("reports the employee record once the account is linked", async () => {
+      await render(<AdminPage api={adminApi()} />);
 
-      expect(container!.querySelectorAll("form, select, textarea")).toHaveLength(0);
-      expect(container!.querySelector('[data-testid="roster-summary"]')).toBeNull();
-      expect(container!.textContent).not.toContain("Roster");
-      // The one control an employee gets is the one that helps them read their code out.
-      expect([...container!.querySelectorAll("button")].map((b) => b.dataset.action))
-        .toEqual(["copy-account-id"]);
-      expect(api.createEmployee).not.toHaveBeenCalled();
-      expect(api.linkAccount).not.toHaveBeenCalled();
-      expect(api.setReportingLine).not.toHaveBeenCalled();
-      expect(api.grantExemption).not.toHaveBeenCalled();
-    });
-
-    // The refusal is HOW the page learns it is not talking to an administrator. It must never
-    // reach the reader: `KINTAI_ADMIN_REQUIRED: listEmployees is available to…` is a fact about
-    // our RPC surface, and an employee reading their own code has done nothing wrong.
-    it("shows no error, and no code, for the refusal that told it who it is", async () => {
-      await render(<AdminPage api={viewerApi()} />);
-
-      expect(container!.querySelector('[data-testid="error"]')).toBeNull();
-      expect(container!.textContent).not.toContain("KINTAI_");
-      expect(container!.textContent).not.toContain("listEmployees");
+      expect(text('[data-testid="account-id"]')).toBe("acct-admin");
+      expect(text('[data-testid="employee-id"]')).toBe("9");
     });
   });
 
-  describe("failures that are not a refusal", () => {
+  describe("failures", () => {
     it("renders a message when the account cannot be read", async () => {
-      const api = viewerApi({
+      const api = adminApi({
         whoAmI: vi.fn<KintaiAdminClient["whoAmI"]>(async () => {
           throw new Error("the session went away");
         }),
@@ -289,10 +211,10 @@ describe("AdminPage", () => {
       expect(container!.querySelector('[data-testid="account-id"]')).toBeNull();
     });
 
-    // A roster read that fails for any reason OTHER than the refusal must not silently demote an
-    // administrator to the employee view: they would see no controls and no explanation, and would
-    // reasonably conclude their access had been taken away.
-    it("does not mistake a broken roster read for not being an administrator", async () => {
+    // There is no error that means "not an administrator" any more, so a roster read that fails
+    // for ANY reason is a failure and is shown as one — never a page with no controls and no
+    // explanation, which is what the reader would otherwise take for their access being revoked.
+    it("shows a broken roster read as a failure, with nothing quietly hidden", async () => {
       const api = adminApi({
         listEmployees: vi.fn<KintaiAdminClient["listEmployees"]>(async () => {
           throw new Error("connection lost");
@@ -1818,25 +1740,6 @@ describe("AdminPage", () => {
 
       expect(text('[data-testid="link-account-notice"]'))
         .toBe("That employee record no longer exists. Reload the roster and try again.");
-    });
-
-    it("does not name the RPC method when a refusal reaches a form", async () => {
-      const api = adminApi({
-        setReportingLine: vi.fn<KintaiAdminClient["setReportingLine"]>(async () => {
-          throw REFUSED("setReportingLine");
-        }),
-      }, [TANAKA, STRANDED]);
-      await render(<AdminPage api={api} />);
-
-      await choose('[data-form="set-reporting-line"] [name="employeeId"]', "3");
-      await choose('[data-form="set-reporting-line"] [name="managerId"]', "1");
-      await submit("set-reporting-line");
-
-      const notice = text('[data-testid="set-reporting-line-notice"]');
-      expect(notice).toBe(
-        "Only a Workshop administrator can do this. Ask an administrator to make the change.",
-      );
-      expect(notice).not.toContain("setReportingLine");
     });
 
     it("falls back to naming the action when the failure carries no code", async () => {

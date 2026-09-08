@@ -20,14 +20,15 @@ const CODED = /^(KINTAI_[A-Z_]+): ([\s\S]+)$/;
 /**
  * Codes whose own detail should not be shown.
  *
- * `KINTAI_ADMIN_REQUIRED` names the refused method (`linkAccount is available to…`), which is a
- * fact about our RPC surface and not about anything the reader did. `KINTAI_NOT_FOUND` says "there
- * is no employee 42", where the number came from a control the reader never typed into — the
- * useful half is that their copy of the roster is stale.
+ * `KINTAI_NOT_FOUND` says "there is no employee 42", where the number came from a control the
+ * reader never typed into — the useful half is that their copy of the roster is stale.
+ *
+ * `KINTAI_ADMIN_REQUIRED` used to be here too, rewritten because its detail named the refused RPC
+ * method. Nothing produces it any more: a non-admin is handed the employee bundle and
+ * `EmployeeKintaiApi`, on which the admin methods do not exist to refuse, so the entry went with
+ * the refuse-all capability that threw it.
  */
 const REWRITTEN: Record<string, string> = {
-  KINTAI_ADMIN_REQUIRED:
-    "Only a Workshop administrator can do this. Ask an administrator to make the change.",
   KINTAI_NOT_FOUND:
     "That employee record no longer exists. Reload the roster and try again.",
 };
@@ -65,11 +66,6 @@ export function describeFailure(error: unknown, fallback: string): string {
   if (REWRITTEN[code]) return REWRITTEN[code];
   const rewrite = DETAIL_REWRITES.find(([pattern]) => pattern.test(detail));
   return rewrite ? rewrite[1] : capitalize(detail);
-}
-
-/** Whether this failure is the capability refusing a non-administrator. */
-export function isAdminRequired(error: unknown): boolean {
-  return error instanceof Error && error.message.startsWith("KINTAI_ADMIN_REQUIRED:");
 }
 
 /**

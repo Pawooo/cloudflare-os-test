@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describeFailure, isAdminRequired } from "./errors";
+import { describeFailure } from "./errors";
 
 // The messages are the real ones this package throws, spelled out rather than constructed, so a
 // change to any of them fails here rather than quietly changing what an HR user reads.
@@ -16,7 +16,6 @@ describe("describeFailure", () => {
     const codes = [
       "KINTAI_INVALID_INPUT: employee number is required.",
       "KINTAI_NOT_FOUND: there is no employee 42.",
-      "KINTAI_ADMIN_REQUIRED: linkAccount is available to Workshop administrators only.",
       "KINTAI_ACCOUNT_NOT_LINKED: this account is not linked to an employee record.",
       "KINTAI_NO_APPROVER: employee 3 has no manager, no designated approver, and no 管理監督者 " +
       "exemption. Give them one before saving this organisation.",
@@ -25,18 +24,6 @@ describe("describeFailure", () => {
     for (const message of codes) {
       expect(describeFailure(new Error(message), "fallback")).not.toContain("KINTAI_");
     }
-  });
-
-  // The detail names the refused RPC method, which is a fact about our surface and not about
-  // anything the reader did.
-  it("replaces the admin refusal rather than repeating which method was refused", () => {
-    expect(describeFailure(
-      new Error(
-        "KINTAI_ADMIN_REQUIRED: linkAccount is available to Workshop administrators only. " +
-        "Ask an administrator to make this change.",
-      ),
-      "fallback",
-    )).toBe("Only a Workshop administrator can do this. Ask an administrator to make the change.");
   });
 
   // The id in a not-found came from a control, never from a keystroke, so quoting it back tells
@@ -93,27 +80,5 @@ describe("describeFailure", () => {
   ])("falls back for %o", (thrown) => {
     expect(describeFailure(thrown, "Couldn’t link that account code."))
       .toBe("Couldn’t link that account code.");
-  });
-});
-
-describe("isAdminRequired", () => {
-  it("recognises the refusal a non-administrator's capability throws", () => {
-    expect(isAdminRequired(new Error(
-      "KINTAI_ADMIN_REQUIRED: listEmployees is available to Workshop administrators only. " +
-      "Ask an administrator to make this change.",
-    ))).toBe(true);
-  });
-
-  // Anything else must NOT read as "not an administrator": the page uses this to decide whether to
-  // hide every admin control, and a dropped connection is not a demotion.
-  it.each([
-    new Error("KINTAI_INVALID_INPUT: employee number is required."),
-    new Error("KINTAI_NOT_FOUND: there is no employee 42."),
-    new Error("connection lost"),
-    new Error("the word KINTAI_ADMIN_REQUIRED: appears late in this message"),
-    "KINTAI_ADMIN_REQUIRED: thrown as a string",
-    undefined,
-  ])("does not mistake %o for a refusal", (thrown) => {
-    expect(isAdminRequired(thrown)).toBe(false);
   });
 });
