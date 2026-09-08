@@ -173,6 +173,7 @@ describe("EmployeePage", () => {
     await render(<EmployeePage api={api} />);
 
     expect(inToday('[data-punch="in"]').textContent).toBe("出勤");
+    expect(inToday<HTMLElement>('[data-punch="in"]').dataset.primary).toBe("true");
     await click('[data-testid="panel-today"] [data-punch="in"]');
 
     expect(api.punch).toHaveBeenCalledWith("in");
@@ -184,6 +185,10 @@ describe("EmployeePage", () => {
 
     expect(inToday('[data-punch="out"]').textContent).toBe("退勤");
     expect(inToday('[data-punch="break_start"]').textContent).toBe("休憩開始");
+    // The next legal action is the primary control; secondary actions are muted. Marked with a
+    // data attribute rather than asserting Tailwind classes, which would pin styling not intent.
+    expect(inToday<HTMLElement>('[data-punch="out"]').dataset.primary).toBe("true");
+    expect(inToday<HTMLElement>('[data-punch="break_start"]').dataset.primary).toBeUndefined();
     await click('[data-testid="panel-today"] [data-punch="break_start"]');
 
     expect(api.punch).toHaveBeenCalledWith("break_start");
@@ -428,6 +433,52 @@ describe("EmployeePage", () => {
       )).toBeNull();
     });
 
+    it("files a missed 打刻 for a past flagged day, keyed to that day's date", async () => {
+      // The gap you most need to fix is rarely today's — you notice last week's missing 退勤 when
+      // the month is closing. A flagged 今月 row must let you act on THAT day, not just today.
+      const currentMonth = jstWorkDate(Date.now()).slice(0, 7);
+      const flaggedDate = `${currentMonth}-03`;
+      const requestMissingPunch = vi.fn<KintaiEmployeeClient["requestMissingPunch"]>(
+        async () => 99,
+      );
+      let calls = 0;
+      const myMonth = vi.fn<KintaiEmployeeClient["myMonth"]>(async (period) => {
+        calls += 1;
+        return employeeMonth(period, [
+          monthDay({ workDate: flaggedDate, workedMinutes: 0, anomalies: ["unpaired_in"] }),
+        ]);
+      });
+      await render(<EmployeePage api={employeeApi({ myMonth, requestMissingPunch })} />);
+
+      // The flagged row exposes a way to act — a clean day does not.
+      await click(`[data-testid="panel-month"] [data-month-day="${flaggedDate}"] [data-action="fix-day"]`);
+      const timeSel = `[data-month-day="${flaggedDate}"] [data-testid="correction-time"]`;
+      const reasonSel = `[data-month-day="${flaggedDate}"] [data-testid="correction-reason"]`;
+      await setMonthInput(timeSel, "18:00");
+      await setMonthInput(reasonSel, "退勤を押し忘れました");
+      const before = calls;
+      await click(`[data-testid="panel-month"] [data-month-day="${flaggedDate}"] [data-testid="file-correction"]`);
+
+      // Filed against the FLAGGED day, not today; success reads as a request; the month re-reads.
+      expect(requestMissingPunch).toHaveBeenCalledWith(
+        flaggedDate, "out", Date.parse(`${flaggedDate}T18:00:00+09:00`), "退勤を押し忘れました",
+      );
+      expect(inMonth(`[data-month-day="${flaggedDate}"] [data-testid="correction-notice"]`).textContent)
+        .toBe("申請しました・承認待ち");
+      expect(calls).toBeGreaterThan(before);
+    });
+
+    it("offers no fix control on a day with no missing 打刻", async () => {
+      const currentMonth = jstWorkDate(Date.now()).slice(0, 7);
+      const myMonth = vi.fn<KintaiEmployeeClient["myMonth"]>(async (period) => employeeMonth(period, [
+        monthDay({ workDate: `${currentMonth}-04`, workedMinutes: 480, anomalies: [] }),
+      ]));
+      await render(<EmployeePage api={employeeApi({ myMonth })} />);
+      expect(month().querySelector(
+        `[data-month-day="${currentMonth}-04"] [data-action="fix-day"]`,
+      )).toBeNull();
+    });
+
     // The guardrail against a pending number reading as money owed: the claims-not-payouts line is
     // present, and its exact wording is pinned here so it cannot quietly soften into a promise.
     it("states that overtime figures are claims awaiting approval, not payouts", async () => {
@@ -541,6 +592,15 @@ describe("EmployeePage", () => {
     const element = field<HTMLElement>(selector);
     await act(async () => element.click());
     await settle();
+  }
+
+  async function setMonthInput(selector: string, value: string): Promise<void> {
+    const input = inMonth<HTMLInputElement>(selector);
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+    await act(async () => {
+      setter.call(input, value);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
   }
 
   async function setInput(selector: string, value: string): Promise<void> {

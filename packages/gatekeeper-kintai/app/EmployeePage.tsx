@@ -265,18 +265,28 @@ function ShiftControl(
   return (
     <section>
       <div className="flex flex-wrap gap-2">
-        {kinds.map((kind) => (
-          <button
-            key={kind}
-            type="button"
-            data-punch={kind}
-            disabled={busy}
-            className="press rounded-lg border border-kumo-line bg-kumo-control px-4 py-2 text-sm font-medium text-kumo-default hover:bg-kumo-tint disabled:opacity-60"
-            onClick={() => void doPunch(kind)}
-          >
-            {PUNCH_LABELS[kind]}
-          </button>
-        ))}
+        {kinds.map((kind, index) => {
+          // The FIRST kind is the next legal action (`nextPunchKind` returns it first: 出勤 when
+          // out, 退勤 when in, 休憩終了 within a break). It is what the worker opened the app to do,
+          // so it is the primary control — filled and larger; 休憩開始 stays a muted secondary
+          // beside 退勤. `data-primary` carries the intent for tests without pinning Tailwind classes.
+          const primary = index === 0;
+          return (
+            <button
+              key={kind}
+              type="button"
+              data-punch={kind}
+              data-primary={primary ? "true" : undefined}
+              disabled={busy}
+              className={primary
+                ? "press rounded-lg bg-kumo-brand px-5 py-2.5 text-base font-semibold text-white hover:bg-kumo-brand-hover disabled:opacity-60"
+                : "press rounded-lg border border-kumo-line bg-kumo-control px-4 py-2 text-sm font-medium text-kumo-default hover:bg-kumo-tint disabled:opacity-60"}
+              onClick={() => void doPunch(kind)}
+            >
+              {PUNCH_LABELS[kind]}
+            </button>
+          );
+        })}
       </div>
       {error !== undefined && (
         <p className="mt-2 text-xs text-kumo-danger" role="alert" data-testid="punch-error">
@@ -442,6 +452,11 @@ function MonthPanel({ api }: { api: KintaiEmployeeClient }) {
   const [currentMonth] = useState(() => jstWorkDate(Date.now()).slice(0, 7));
   const [period, setPeriod] = useState(currentMonth);
   const [state, setState] = useState<{ month?: EmployeeMonth; error?: string }>({});
+  // Bumped when a correction is filed from a flagged row, so the month re-reads and the fixed day's
+  // flag clears — the same reload-token pattern 今日 uses, and the reason the read effect below
+  // lists it as a dependency.
+  const [reloadToken, setReloadToken] = useState(0);
+  const reload = () => setReloadToken((n) => n + 1);
 
   const live = useRef(true);
   const readId = useRef(0);
@@ -452,7 +467,10 @@ function MonthPanel({ api }: { api: KintaiEmployeeClient }) {
 
   useEffect(() => {
     const id = ++readId.current;
-    setState({});
+    // Deliberately NOT blanking to a spinner on re-read: the previous month stays on screen while
+    // the new read lands, matching 今日. A blank-on-reload would unmount a flagged row's open
+    // correction form — and its 申請しました confirmation — the instant filing triggered the reload
+    // that clears the flag. The `readId` guard already drops an out-of-order landing.
     void (async () => {
       try {
         const someMonth = await api.myMonth(period);
@@ -463,7 +481,7 @@ function MonthPanel({ api }: { api: KintaiEmployeeClient }) {
         }
       }
     })();
-  }, [api, period]);
+  }, [api, period, reloadToken]);
 
   return (
     <div className="flex flex-col gap-6">
@@ -506,13 +524,20 @@ function MonthPanel({ api }: { api: KintaiEmployeeClient }) {
         残業時間は承認待ちの申請であり、承認されるまで支給額ではありません — overtime shown here is a claim awaiting approval, not a payout.
       </p>
 
-      <MonthTable state={state} />
+      <MonthTable state={state} api={api} reload={reload} live={live} />
     </div>
   );
 }
 
 /** One row per day the employee has punches in the month. Table, not cards. */
-function MonthTable({ state }: { state: { month?: EmployeeMonth; error?: string } }) {
+function MonthTable(
+  { state, api, reload, live }: {
+    state: { month?: EmployeeMonth; error?: string };
+    api: KintaiEmployeeClient;
+    reload: () => void;
+    live: React.RefObject<boolean>;
+  },
+) {
   if (state.error !== undefined) {
     return <p className="text-sm text-kumo-danger" role="alert">{state.error}</p>;
   }
@@ -549,7 +574,7 @@ function MonthTable({ state }: { state: { month?: EmployeeMonth; error?: string 
         </thead>
         <tbody className="divide-y divide-kumo-line">
           {days.map((eachDay) => (
-            <MonthDayRow key={eachDay.workDate} day={eachDay} />
+            <MonthDayRow key={eachDay.workDate} day={eachDay} api={api} reload={reload} live={live} />
           ))}
         </tbody>
       </table>
@@ -557,38 +582,73 @@ function MonthTable({ state }: { state: { month?: EmployeeMonth; error?: string 
   );
 }
 
-function MonthDayRow({ day }: { day: EmployeeMonthDay }) {
+function MonthDayRow(
+  { day, api, reload, live }: {
+    day: EmployeeMonthDay;
+    api: KintaiEmployeeClient;
+    reload: () => void;
+    live: React.RefObject<boolean>;
+  },
+) {
+  const [open, setOpen] = useState(false);
+  // A forgotten clock-out is the one flag a worker can fix themselves from here — it needs a 退勤
+  // time. Other flags (an unclosed 休憩, say) are not resolvable by adding an `out`, so the row
+  // stays informational for those; only `unpaired_in` earns the fix control.
+  const fixable = day.anomalies.includes("unpaired_in");
+
   return (
-    <tr data-month-day={day.workDate}>
-      <td className="py-2 pr-4 font-mono text-kumo-default">{day.workDate}</td>
-      <td className="py-2 pr-4 text-right font-mono text-kumo-default" data-testid="worked">
-        {formatHoursMinutes(day.workedMinutes)}
-      </td>
-      {/* A day with no request renders an EMPTY cell — never a zero, which in a 残業 column reads
-          as a claim of no minutes owed rather than as the absence of a claim. */}
-      <td className="py-2 pr-4 text-right font-mono text-kumo-default" data-testid="overtime">
-        {day.overtime !== null && (
-          <span>
-            {formatHoursMinutes(day.overtime.minutes)}
-            {" · "}
-            <span className="text-kumo-subtle">
-              {OVERTIME_STATE_LABELS[day.overtime.state] ?? day.overtime.state}
+    <>
+      <tr data-month-day={day.workDate}>
+        <td className="py-2 pr-4 font-mono text-kumo-default">{day.workDate}</td>
+        <td className="py-2 pr-4 text-right font-mono text-kumo-default" data-testid="worked">
+          {formatHoursMinutes(day.workedMinutes)}
+        </td>
+        {/* A day with no request renders an EMPTY cell — never a zero, which in a 残業 column reads
+            as a claim of no minutes owed rather than as the absence of a claim. */}
+        <td className="py-2 pr-4 text-right font-mono text-kumo-default" data-testid="overtime">
+          {day.overtime !== null && (
+            <span>
+              {formatHoursMinutes(day.overtime.minutes)}
+              {" · "}
+              <span className="text-kumo-subtle">
+                {OVERTIME_STATE_LABELS[day.overtime.state] ?? day.overtime.state}
+              </span>
             </span>
-          </span>
-        )}
-      </td>
-      {/* A marker only where the day is flagged, in plain language — the same `ANOMALY_LABELS`
-          translation 今日 uses, never the raw wire flag. No cell content at all on a clean day.
-          No link to 今日: that panel is fixed to today's date and reusing it for an arbitrary past
-          day would mean parameterising it, which is out of this task's scope — so the marker names
-          the problem and stops there. */}
-      <td className="py-2 text-xs text-kumo-danger">
-        {day.anomalies.length > 0 && (
-          <span data-testid="day-anomalies">
-            {day.anomalies.map((flag) => ANOMALY_LABELS[flag] ?? flag).join(" · ")}
-          </span>
-        )}
-      </td>
-    </tr>
+          )}
+        </td>
+        {/* A marker only where the day is flagged, in plain language — the same `ANOMALY_LABELS`
+            translation 今日 uses, never the raw wire flag. No cell content at all on a clean day.
+            Where the flag is a forgotten clock-out, the marker is a button that expands the same
+            correction form 今日 uses, keyed to THIS day — the gap you need to fix is rarely today's. */}
+        <td className="py-2 text-xs text-kumo-danger">
+          {day.anomalies.length > 0 && (
+            fixable ? (
+              <button
+                type="button"
+                data-action="fix-day"
+                aria-expanded={open}
+                className="press text-xs font-medium text-kumo-danger underline hover:text-kumo-brand-hover"
+                onClick={() => setOpen((was) => !was)}
+              >
+                <span data-testid="day-anomalies">
+                  {day.anomalies.map((flag) => ANOMALY_LABELS[flag] ?? flag).join(" · ")}
+                </span>
+              </button>
+            ) : (
+              <span data-testid="day-anomalies">
+                {day.anomalies.map((flag) => ANOMALY_LABELS[flag] ?? flag).join(" · ")}
+              </span>
+            )
+          )}
+        </td>
+      </tr>
+      {open && fixable && (
+        <tr data-month-day={day.workDate}>
+          <td colSpan={4} className="pb-3">
+            <MissingOutForm api={api} workDate={day.workDate} reload={reload} live={live} />
+          </td>
+        </tr>
+      )}
+    </>
   );
 }
