@@ -154,6 +154,30 @@ describe("describeFailure", () => {
     }
   });
 
+  /*
+   * The exemption pressed twice. `grantExemption` refuses a second open period, and says so with
+   * an `InvalidInputError` whose English detail carries 管理監督者 — the same wrong-language
+   * problem `KINTAI_NO_APPROVER` had, arriving under a code that is right for its other twenty
+   * details. So it is keyed on the DETAIL, and its neighbours under `KINTAI_INVALID_INPUT` are
+   * unaffected (the case below). Spelled out as `src/admin-api.ts` throws it.
+   */
+  const ALREADY_EXEMPT =
+    "KINTAI_INVALID_INPUT: this employee is already recorded as 管理監督者. Ending an exemption " +
+    "is not supported here yet.";
+
+  it.each([["en", en], ["ja", ja]] as const)(
+    "rewrites the second exemption rather than showing its 管理監督者 to an English reader (%s)",
+    (_language, t) => {
+      expect(describeFailure(new Error(ALREADY_EXEMPT), t.errors.fallbacks.grantExemption, t))
+        .toBe(t.errors.details.alreadyExempt);
+    },
+  );
+
+  it("writes the second-exemption sentence in one language each", () => {
+    expect(en.errors.details.alreadyExempt).not.toMatch(JAPANESE);
+    expect(ja.errors.details.alreadyExempt).toMatch(JAPANESE);
+  });
+
   // The rewrite is keyed on the detail, so it must not swallow its neighbours under the same code.
   // Unmapped details stay as the server wrote them — English, capitalised, in both languages.
   it("leaves other invalid-input details alone", () => {
@@ -162,10 +186,15 @@ describe("describeFailure", () => {
         new Error("KINTAI_INVALID_INPUT: employee number is required."), "fallback", t,
       )).toBe("Employee number is required.");
       expect(describeFailure(
-        new Error("KINTAI_INVALID_INPUT: this employee is already recorded as 管理監督者."),
+        new Error("KINTAI_INVALID_INPUT: joining date is required."), "fallback", t,
+      )).toBe("Joining date is required.");
+      // The exemption pattern is pinned by the whole sentence, not by "already recorded as", so a
+      // future determination about something else is not told it is about Article 41.
+      expect(describeFailure(
+        new Error("KINTAI_INVALID_INPUT: this employee is already recorded as a night-shift worker."),
         "fallback",
         t,
-      )).toBe("This employee is already recorded as 管理監督者.");
+      )).toBe("This employee is already recorded as a night-shift worker.");
     }
   });
 

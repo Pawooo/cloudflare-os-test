@@ -725,6 +725,17 @@ export const en = {
        * useless description of what the reader did, which is forget to pick somebody.
        */
       employeeIdRequired: "Choose someone from the list first.",
+
+      /**
+       * The exemption pressed twice. `grantExemption` refuses a second open period, and its
+       * English detail spells out 管理監督者 — so before this entry an English screen refused in
+       * 漢字. Glossed as Article 41 here, the way `roster.row.exempt` is, and it repeats the
+       * server's other half: ending an exemption is a genuine gap in the tab, not a mistake the
+       * reader made, so they are told that rather than left pressing the button again.
+       */
+      alreadyExempt:
+        "This employee is already recorded as exempt under Article 41. Ending an exemption is not" +
+        " supported here yet.",
     },
 
     /**
@@ -1111,6 +1122,8 @@ export const ja = {
 
     details: {
       employeeIdRequired: "先に一覧から従業員を選んでください。",
+      alreadyExempt:
+        "この従業員はすでに管理監督者として記録されています。認定の終了はこのタブではまだ行えません。",
     },
 
     fallbacks: {

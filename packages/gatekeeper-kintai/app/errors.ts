@@ -37,7 +37,7 @@ const CODED = /^(KINTAI_[A-Z_]+): ([\s\S]+)$/;
  * Keyed on the detail rather than the code, because `KINTAI_INVALID_INPUT` covers everything from
  * a bad date to a blank name and almost all of it already reads well.
  *
- * The one entry so far is the empty dropdown. Every employee id this page sends comes from a
+ * The FIRST entry is the empty dropdown. Every employee id this page sends comes from a
  * `<select>`, and an untouched one submits `""`, which `Number("")` turns into `0` — so the API
  * answers "employee must be a positive employee id", which is a true statement about an argument
  * and useless as a description of what the reader did, which is forget to pick somebody. It is
@@ -46,12 +46,29 @@ const CODED = /^(KINTAI_[A-Z_]+): ([\s\S]+)$/;
  * as it is — it is right for whoever called the method directly — and this rewrites it on the way
  * to a human. Rewriting is not re-checking: nothing here decides whether the value is valid.
  *
+ * The SECOND is the exemption pressed twice, and it is here for a different reason: the detail is
+ * not unhelpful, it is in the wrong language. `grantExemption` refuses a second open period with
+ * an English sentence that spells out 管理監督者 (`admin-api.ts`), so an English screen dropped
+ * into 漢字 for the word the refusal turns on — the same fault `KINTAI_NO_APPROVER` had, arriving
+ * under a code whose other twenty details are fine as they are. Which is exactly why it is keyed
+ * on the DETAIL: `KINTAI_INVALID_INPUT` must keep falling through for everything else.
+ *
+ * ITS PATTERN HAS A HOLE WHERE THE TERM IS, and that is deliberate twice over. The pattern is
+ * pinned by the English on either side of 管理監督者 — the determination it names and the sentence
+ * about ending it — rather than by the word, so it stays ASCII: a Japanese character in this file
+ * would trip `no-stray-literals`, whose premise is that Japanese outside the dictionary is a label
+ * that did not make the move, and evading that guard by escaping the codepoints would make its
+ * green sweep mean less. Matching the whole sentence is also STRICTER than matching the term: a
+ * future "already recorded as" about something other than an exemption falls through to its own
+ * detail instead of being told it is about Article 41.
+ *
  * The second element is a KEY and not a sentence, which is the whole point: the pattern is about
  * the wire and the words are about the reader, and a `keyof` makes a key that no longer exists in
  * the dictionary a compile error rather than a blank line on a payroll screen.
  */
 const DETAIL_REWRITES: ReadonlyArray<[RegExp, keyof Messages["errors"]["details"]]> = [
   [/ must be a positive employee id\.$/, "employeeIdRequired"],
+  [/^this employee is already recorded as .+\. Ending an exemption is not supported/, "alreadyExempt"],
 ];
 
 /**
