@@ -12,6 +12,15 @@ import { en, ja } from "./i18n";
 // stays English in both languages (see `errors` in `messages.ts`), so a test that expected a
 // Japanese sentence out of `capitalize` would be pinning a translation nobody wrote.
 
+/**
+ * Hiragana, katakana, CJK ideographs, halfwidth katakana — the same class `no-stray-literals`
+ * sweeps `app/` with, used here for the opposite direction: an `en` rewrite must contain NONE of
+ * it, and its `ja` twin must contain some. The two rewrites this file adds both exist because the
+ * server's English detail drops into 漢字 for its most consequential word, so "one language per
+ * screen" has to be asserted and not merely intended.
+ */
+const JAPANESE = /[぀-ゟ゠-ヿ㐀-䶿一-鿿ｦ-ﾟ]/;
+
 describe("describeFailure", () => {
   it.each([["en", en], ["ja", ja]] as const)(
     "strips the machine prefix and shows the sentence behind it (%s)",
@@ -64,6 +73,31 @@ describe("describeFailure", () => {
       )).toBe(t.errors.byCode.KINTAI_ADMIN_NOT_LINKED);
     },
   );
+
+  /*
+   * The first sentence a new hire reads. `#requireEmployee` throws this on EVERY read and write an
+   * unlinked worker attempts, so it is the whole of the 今日 tab for somebody HR has not linked
+   * yet — and the server's own detail ("Contact HR to be set up") names no fix they can carry out,
+   * because it cannot know they are holding an account code nobody has pointed at a record.
+   */
+  it.each([["en", en], ["ja", ja]] as const)(
+    "tells an unlinked worker what to hand HR (%s)",
+    (_language, t) => {
+      expect(describeFailure(
+        new Error(
+          "KINTAI_ACCOUNT_NOT_LINKED: this account is not linked to an employee record. " +
+          "Contact HR to be set up.",
+        ),
+        t.errors.fallbacks.readToday,
+        t,
+      )).toBe(t.errors.byCode.KINTAI_ACCOUNT_NOT_LINKED);
+    },
+  );
+
+  it("writes the unlinked-worker sentence in one language each", () => {
+    expect(en.errors.byCode.KINTAI_ACCOUNT_NOT_LINKED).not.toMatch(JAPANESE);
+    expect(ja.errors.byCode.KINTAI_ACCOUNT_NOT_LINKED).toMatch(JAPANESE);
+  });
 
   // Every employee id this page sends comes from a select, so `Number("")` is `0` and the API
   // answers with a fact about an argument. What the reader did was forget to pick somebody — and

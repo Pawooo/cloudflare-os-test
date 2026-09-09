@@ -93,6 +93,14 @@ const JA_ANOMALIES: Record<string, string> = {
  * perform a write that RECORDS who performed it — closing a month, deciding a request — because
  * there is nobody to record. The server's detail is about the missing link; what the reader needs
  * is that their own account card, one tab away, is where they repair it.
+ *
+ * `KINTAI_ACCOUNT_NOT_LINKED` is its worker-side twin, and the most-read sentence in this map.
+ * `#requireEmployee` throws it on EVERY read and write an unlinked account attempts, so it is the
+ * entire 今日 tab for a new hire — the first thing Kintai ever says to them. The server's detail
+ * says "Contact HR to be set up", which names no act they can perform: the fix is in their hand,
+ * because the account code they are signed in with is the thing HR has to point at a record. The
+ * rewrite says to read it out, and does not send them to a tab they cannot see — the employee
+ * screen has no roster and no account card, unlike the administrator's.
  */
 const EN_BY_CODE: Record<string, string> = {
   KINTAI_NOT_FOUND: "That employee record no longer exists. Reload the roster and try again.",
@@ -102,6 +110,9 @@ const EN_BY_CODE: Record<string, string> = {
   KINTAI_ADMIN_NOT_LINKED:
     "Your account is not linked to an employee record, so this action cannot be recorded against" +
     " you. Link your account code on the Roster tab first.",
+  KINTAI_ACCOUNT_NOT_LINKED:
+    "Your account is not linked to an employee record yet. Read your account code to HR so they" +
+    " can link it.",
 };
 
 const JA_BY_CODE: Record<string, string> = {
@@ -113,6 +124,9 @@ const JA_BY_CODE: Record<string, string> = {
   KINTAI_ADMIN_NOT_LINKED:
     "あなたのアカウントが従業員レコードに紐づいていないため、この操作をあなたの記録として残せません。" +
     "まず名簿タブでアカウントコードを紐づけてください。",
+  KINTAI_ACCOUNT_NOT_LINKED:
+    "あなたのアカウントはまだ従業員レコードに紐づいていません。アカウントコードを人事に伝えて、" +
+    "紐づけてもらってください。",
 };
 
 const EN_PUNCH_KINDS: Record<PunchKind, string> = {
