@@ -327,7 +327,11 @@ export function workedMinutes(
  *  - `duplicate_in`: a second clock-in recorded before the first was closed by a clock-out.
  *  - `negative_gross`: paired break time exceeds paired work time, i.e. the day's punches are
  *    internally inconsistent. `workedMinutes` clamps this case to zero; this flag is the signal
- *    that a zero doesn't just mean "no work happened."
+ *    that a zero doesn't just mean "no work happened." NOT raised while the day's only shift is
+ *    still open: with no clock-out, paired work time is zero by definition and any paired break
+ *    "exceeds" it — that is the same single problem `unpaired_in` already names, and a worker shown
+ *    both goes looking for a break to fix that is not broken. Once the 退勤 lands, the day is
+ *    re-measured and the flag applies on its own merits.
  *  - `long_span`: the day's paired clock-in/clock-out time reaches `LONG_SPAN_MS`. Unlike the
  *    others this one flags a day whose punches are perfectly well-formed, which is the point: a
  *    forgotten clock-out that a later clock-out eventually closed is a fully-credited day with
@@ -349,7 +353,11 @@ export function dayAnomalies(
   if (brk.openAt !== null) anomalies.push("unpaired_break");
   if (inOut.orphanCloses > 0) anomalies.push("orphan_out");
   if (inOut.duplicateOpens > 0) anomalies.push("duplicate_in");
-  if (grossMs < 0) anomalies.push("negative_gross");
+  // Suppressed only while the shift is open AND nothing has been credited yet: then the negative
+  // gross has exactly one cause, the missing clock-out above. A day with a closed pair AND a later
+  // open `in` keeps the flag — its paired work is real and a break really can exceed it.
+  const openWithNothingCredited = inOut.openAt !== null && inOut.totalMs === 0;
+  if (grossMs < 0 && !openWithNothingCredited) anomalies.push("negative_gross");
   // Measured on `inOut.totalMs` — the paired clock-in-to-clock-out time — and not on `grossMs`,
   // because a fourteen-hour presence with a long break inside it is still a fourteen-hour day a
   // human should look at, and because `grossMs` can be dragged negative by the very inconsistency

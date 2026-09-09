@@ -226,6 +226,27 @@ describe("EmployeePage", () => {
     expect(today().textContent).toContain("今日はまだ打刻がありません");
   });
 
+  it("guides the correction form: captions attached to their fields, a placeholder reason, a hint for the time", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-09-07T12:00:00+09:00"));
+    const api = employeeApi({
+      getDay: vi.fn(async () => day([punchRow({ kind: "in" })], { anomalies: ["unpaired_in"] })),
+    });
+    await render(<EmployeePage api={api} />);
+
+    const time = inToday<HTMLInputElement>('[data-testid="correction-time"]');
+    const reason = inToday<HTMLInputElement>('[data-testid="correction-reason"]');
+    // A caption points at its field, so tapping the words focuses the input — the "attached" feel.
+    expect(time.id).not.toBe("");
+    expect(inToday(`label[for="${time.id}"]`).textContent).toContain("退勤時刻");
+    expect(inToday(`label[for="${reason.id}"]`).textContent).toContain("理由");
+    // The reason field shows what a good reason looks like. A time input ignores placeholders in
+    // most browsers, so its guidance is visible text the field is described by.
+    expect(reason.placeholder).toMatch(/^例[:：]/);
+    const hint = inToday('[data-testid="correction-time-hint"]');
+    expect(hint.textContent?.trim()).not.toBe("");
+    expect(time.getAttribute("aria-describedby")).toBe(hint.id);
+  });
+
   it("names an unpaired_in in plain language and files a correction as a REQUEST", async () => {
     // Pinned: 今日 files against `jstWorkDate(Date.now())`, and the assertion below names the day
     // the fixtures are built on. Left to the real clock this passed on the day it was written and

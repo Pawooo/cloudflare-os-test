@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type {
   EmployeeMonth, EmployeeMonthDay, KintaiEmployeeClient, PunchKind, PunchRow, SubmissionState,
 } from "../src/types";
@@ -319,6 +319,11 @@ function MissingOutForm(
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<{ ok?: string; error?: string }>();
+  // Stable, unique per instance: 今日 and several 今月 rows can each hold one of these forms at once,
+  // and a caption has to point at ITS field for a tap on the words to focus the right input.
+  const timeId = useId();
+  const reasonId = useId();
+  const hintId = useId();
 
   const ready = time !== "" && reason.trim() !== "";
 
@@ -342,37 +347,54 @@ function MissingOutForm(
   return (
     <div className="mt-3 rounded-lg bg-kumo-tint px-3 py-3">
       <p className="text-xs text-kumo-subtle">退勤の打刻漏れを申請します。</p>
-      <div className="mt-2 flex flex-wrap items-center gap-2">
-        <label className="text-xs text-kumo-default">
-          退勤時刻
+      {/* Each field is a column — caption ABOVE its input, `htmlFor` pointing at it — and the row
+          aligns on the bottom edge so the two inputs and the button sit on one line whatever the
+          caption lengths. The earlier inline captions with an `ml-2` input inside them put the
+          two fields on different baselines and left the reason box floating. */}
+      <div className="mt-2 flex flex-wrap items-end gap-3">
+        <div className="flex flex-col gap-1">
+          <label htmlFor={timeId} className="text-xs font-medium text-kumo-default">
+            実際の退勤時刻
+          </label>
           <input
+            id={timeId}
             type="time"
             data-testid="correction-time"
+            aria-describedby={hintId}
             value={time}
             onChange={(event) => setTime(event.target.value)}
-            className="ml-2 rounded border border-kumo-line bg-kumo-control px-2 py-1 text-xs"
+            className="rounded border border-kumo-line bg-kumo-control px-2 py-1.5 text-sm text-kumo-default"
           />
-        </label>
-        <label className="flex-1 text-xs text-kumo-default">
-          理由
+        </div>
+        <div className="flex min-w-48 flex-1 flex-col gap-1">
+          <label htmlFor={reasonId} className="text-xs font-medium text-kumo-default">
+            理由
+          </label>
           <input
+            id={reasonId}
             type="text"
             data-testid="correction-reason"
+            placeholder="例: 退勤時に打刻を忘れました"
             value={reason}
             onChange={(event) => setReason(event.target.value)}
-            className="ml-2 w-full min-w-40 rounded border border-kumo-line bg-kumo-control px-2 py-1 text-xs"
+            className="w-full rounded border border-kumo-line bg-kumo-control px-2 py-1.5 text-sm text-kumo-default placeholder:text-kumo-inactive"
           />
-        </label>
+        </div>
         <button
           type="button"
           data-testid="file-correction"
           disabled={busy || !ready}
-          className="press rounded-lg border border-kumo-line bg-kumo-control px-3 py-1.5 text-xs font-medium text-kumo-default hover:bg-kumo-tint disabled:opacity-60"
+          className="press rounded-lg border border-kumo-line bg-kumo-control px-3 py-1.5 text-sm font-medium text-kumo-default hover:bg-kumo-tint disabled:opacity-60"
           onClick={() => void file()}
         >
           退勤の打刻漏れを申請
         </button>
       </div>
+      {/* A `type="time"` input ignores `placeholder` in most browsers, so the time field's guidance
+          is visible text it is described by, not a placeholder that never shows. */}
+      <p id={hintId} data-testid="correction-time-hint" className="mt-1.5 text-[11px] text-kumo-subtle">
+        実際に職場を離れた時刻を入力してください（例 18:30）。理由は承認する人が読みます。
+      </p>
       {notice?.ok !== undefined && (
         <p className="mt-2 text-xs text-kumo-success" data-testid="correction-notice">
           {notice.ok}

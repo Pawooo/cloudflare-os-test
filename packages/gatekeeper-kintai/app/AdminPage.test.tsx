@@ -590,6 +590,9 @@ describe("AdminPage", () => {
         const deciders = within(pendingRow(71), '[data-testid="deciders"]');
         expect(deciders).toContain("Suzuki");
         expect(deciders).toContain("Kato");
+        // WHO can decide was never the whole answer — an administrator reading this row asked "how
+        // do I pass it through?". The row says where the decision happens: not here.
+        expect(deciders).toContain("pending approvals");
         expect(overviewMaybe('[data-submission="71"] [data-testid="stranded"]')).toBeNull();
       });
 

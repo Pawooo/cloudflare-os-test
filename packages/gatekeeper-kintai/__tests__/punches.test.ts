@@ -266,6 +266,24 @@ describe("day anomalies", () => {
     // The clamp still applies so workedMinutes never goes negative...
     expect(await store.workedMinutes(employeeId, DAY)).toBe(0);
   });
+
+  it("does not also flag negative_gross when the only cause is a shift nobody has closed", async () => {
+    // in → break_start → break_end → (no out). Paired work time is ZERO because the shift is still
+    // open, so any paired break "exceeds" it — but that is one problem, not two: the missing 退勤.
+    // A worker shown 休憩が労働時間を超過 beside 退勤打刻なし goes looking for a break to fix that
+    // is not broken. The flag stays for a genuinely inconsistent CLOSED day (the test above).
+    await store.recordPunch({
+      employeeId, workDate: DAY, kind: "in", now: NINE_AM, source: "gadget",
+    });
+    await store.recordPunch({
+      employeeId, workDate: DAY, kind: "break_start", now: NINE_AM + 3 * 3_600_000, source: "gadget",
+    });
+    await store.recordPunch({
+      employeeId, workDate: DAY, kind: "break_end", now: NINE_AM + 4 * 3_600_000, source: "gadget",
+    });
+
+    expect(await store.dayAnomalies(employeeId, DAY)).toEqual(["unpaired_in"]);
+  });
 });
 
 /**

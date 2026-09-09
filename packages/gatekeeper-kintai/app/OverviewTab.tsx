@@ -205,7 +205,8 @@ function PendingRow({ item }: { item: PendingItem }) {
           </p>
         ) : (
           <p className="text-xs text-kumo-subtle" data-testid="deciders">
-            Can be decided by {item.eligibleActorNames.join(", ")}
+            Can be decided by {item.eligibleActorNames.join(", ")} — not here: one of them asks
+            their assistant for their pending approvals and approves, returns, or rejects it there.
           </p>
         )}
       </div>
