@@ -16,6 +16,7 @@
     "@gadgets/backend-utils": "workspace:*",
     "@gadgets/error-reporting": "workspace:*",
     "@gadgets/workshop-shared": "workspace:*",
+    "@phosphor-icons/react": "^2.1.10",
     "capnweb": "catalog:",
     "capnweb-validate": "catalog:"
   },
