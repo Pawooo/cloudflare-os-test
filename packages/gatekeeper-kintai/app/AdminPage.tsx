@@ -14,6 +14,7 @@ import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 
  * See the note in `src/types.ts`.
  */
 import type {
+  SubmissionState,
   ApprovalAction,
   AnomalousDay, EmployeeDay, EmployeeId, KintaiIdentity, MonthlyReport, NewEmployee, PendingItem,
   RosterEntry, WorkDatePolicy,
@@ -65,7 +66,9 @@ export type KintaiAdminClient = {
    * caller as a decider — being an administrator buys nothing — and refused for the request's own
    * filer. Confirmed inline and written directly; see `AdminKintaiApi.decideSubmission`.
    */
-  decideSubmission(submissionId: number, action: ApprovalAction, comment?: string): Promise<void>;
+  decideSubmission(
+    submissionId: number, action: ApprovalAction, afterEventId: number, comment?: string,
+  ): Promise<SubmissionState>;
 };
 
 /**

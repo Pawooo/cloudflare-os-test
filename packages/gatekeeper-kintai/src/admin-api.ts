@@ -1,7 +1,7 @@
 import { RpcTarget } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import type {
-  ApprovalAction, EmployeeId, KintaiIdentity, RosterEntry, WorkDatePolicy,
+  ApprovalAction, EmployeeId, KintaiIdentity, RosterEntry, SubmissionState, WorkDatePolicy,
 } from "./types.js";
 import type { NewEmployee } from "./store/employees.js";
 import { EmployeeNotFoundError } from "./store/employees.js";
@@ -230,7 +230,9 @@ export interface KintaiAdminApi {
    * step, and refused for its own filer; being an administrator buys nothing. See
    * `AdminKintaiApi.decideSubmission` for why this writes directly rather than through the OS card.
    */
-  decideSubmission(submissionId: number, action: ApprovalAction, comment?: string): Promise<void>;
+  decideSubmission(
+    submissionId: number, action: ApprovalAction, afterEventId: number, comment?: string,
+  ): Promise<SubmissionState>;
 }
 
 // Re-exported so worker-side callers of this API read its return type from the API's own module.
@@ -719,13 +721,25 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
    * `eligibleActorIds` name the viewer, and that list is computed by the same check — so what the
    * buttons promise is what the write accepts, and a row that moved in between is refused here.
    *
+   * `afterEventId` is REQUIRED, and is the marker the row was read with (`PendingItem.afterEventId`).
+   * The agent path stages a decision with the marker it saw and the store refuses to apply it if
+   * the request's history moved in between; without the same guard here, one manager on a route
+   * with two manager steps approved step 0, watched the row re-render unchanged, clicked again, and
+   * approved step 1 — one intent, two approvals. Now the second click is refused with
+   * `KINTAI_STALE_DECISION`, and a deliberate second decision needs a fresh read. The compare
+   * and the write are one synchronous run inside the store, so nothing slips between them.
+   *
+   * Answers with the request's state AFTER the decision: `"pending"` means the route advanced to
+   * another step and the row will still be on the screen — the caller has to say so, because a
+   * click that landed and a click that did nothing otherwise look identical.
+   *
    * `approval_events` is the decision's record, exactly as for the agent path. The audit row adds
    * the one fact that record cannot carry: which channel it came through, so a reader can tell a
    * dashboard decision from a staged one.
    */
   async decideSubmission(
-    submissionId: number, action: ApprovalAction, comment?: string,
-  ): Promise<void> {
+    submissionId: number, action: ApprovalAction, afterEventId: number, comment?: string,
+  ): Promise<SubmissionState> {
     const now = Date.now();
     if (comment !== undefined) assertText("comment", comment, LIMITS.comment);
     // An empty comment is no comment — the same rule `KintaiSession.actOnSubmission` applies, so
@@ -735,12 +749,14 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
     if (actorEmployeeId === null) throw new UnlinkedAdminError("decideSubmission");
     const state = await this.#store.actOnSubmission({
       submissionId, actorId: actorEmployeeId, action, comment, now,
+      expectedAfterEventId: afterEventId,
     });
     await this.#store.appendAudit({
       at: now, actorEmployeeId, action: "decide_submission", entity: "submissions",
       entityId: submissionId,
       after: { submissionId, decision: action, state, channel: "dashboard" },
     });
+    return state;
   }
 
   /**

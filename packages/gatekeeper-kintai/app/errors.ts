@@ -31,6 +31,13 @@ const CODED = /^(KINTAI_[A-Z_]+): ([\s\S]+)$/;
 const REWRITTEN: Record<string, string> = {
   KINTAI_NOT_FOUND:
     "That employee record no longer exists. Reload the roster and try again.",
+  // Both mean the same thing to the person in front of the queue: the row they are looking at is
+  // not the request as it now stands. The API's wording ("state 'approved' cannot be acted on";
+  // "history has moved") is true and gives them nothing to do; "reload" does.
+  KINTAI_INVALID_TRANSITION:
+    "Somebody already decided this request. Reload the page to see where it stands.",
+  KINTAI_STALE_DECISION:
+    "This request changed since you read it. Reload the page, then decide again.",
 };
 
 /**
@@ -66,6 +73,21 @@ export function describeFailure(error: unknown, fallback: string): string {
   if (REWRITTEN[code]) return REWRITTEN[code];
   const rewrite = DETAIL_REWRITES.find(([pattern]) => pattern.test(detail));
   return rewrite ? rewrite[1] : capitalize(detail);
+}
+
+/**
+ * The raw text of a failure that is NOT one of Kintai's coded refusals, or undefined when it is.
+ *
+ * `describeFailure` deliberately hides internals behind a fallback for anything uncoded — the right
+ * call for the sentence a reader acts on, and the wrong call for the line under it: the first live
+ * failure of the queue's decision control showed "決定できませんでした。" and nothing else, and the
+ * cause existed only in the server log. Render this beneath the fallback, small and monospaced, so
+ * the person who hits it can report what actually happened.
+ */
+export function failureDetail(error: unknown): string | undefined {
+  const message = error instanceof Error ? error.message : "";
+  if (message === "" || CODED.test(message)) return undefined;
+  return message;
 }
 
 /**

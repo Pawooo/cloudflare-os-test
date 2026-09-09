@@ -402,6 +402,12 @@ export type PendingItem = SubmissionRow & {
   /** Who can decide it right now. Empty means STRANDED — surface loudly, never hide. */
   eligibleActorIds: EmployeeId[];
   eligibleActorNames: string[];
+  /**
+   * `latestEventId` at the moment of this read. A decision made from this row states it back, so
+   * a click against a row that moved in between is refused (`KINTAI_STALE_DECISION`) rather
+   * than counted at whatever step is now current.
+   */
+  afterEventId: number;
 };
 
 // ---- the wire shapes the EMPLOYEE gadget renders -----------------------------------------------

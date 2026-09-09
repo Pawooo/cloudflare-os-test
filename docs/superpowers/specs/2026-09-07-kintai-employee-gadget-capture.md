@@ -39,8 +39,19 @@ admin "this one is yours" versus "chase that person" — the owner, logged in as
 not the eligible approver, spent real minutes working out why a decidable-looking row was not
 theirs to decide. The page already holds the admin's linked employee id (`whoAmI`) and the row
 already carries `eligibleActorIds`, so a "yours to decide" badge is a client-side comparison, no
-new reads. Company-wide visibility with route-held authority is the DESIGN (triage, not override,
-per the 2026-09-04 ruling) — the badge makes the design legible instead of puzzling.
+new reads. Company-wide visibility with route-held authority is the DESIGN — the badge makes the
+design legible instead of puzzling. *(Overtaken 2026-09-09: the badge became the decision itself.
+A row the viewer may decide shows 承認・差し戻し・却下; the triage-only ruling was reversed. See
+`docs/kintai-architecture-limits.md`.)*
+
+**Backburner, 2026-09-09 — the employee's view of a decided request.** 差し戻し and 却下 now require
+a comment the employee is meant to read, and the employee gadget renders none of it: a rejected
+correction is visible only as the day's flag that never cleared. `listMySubmissions` already
+exists on the employee capability, so the cheap form is a pull — request state and the manager's
+comment beside the flagged day in 今日/今月, with a refile control. The owner parked it: it may
+belong to a global notification system (a gateway? a gadget?) rather than to Kintai alone. Push
+of any kind needs an OS channel a gatekeeper does not have today — that belongs on the limits
+board.
 
 Third finding: the day drill-down renders each punch's `source` verbatim, so an HR reader sees
 "gadget" — platform vocabulary leaking onto a payroll screen. The field is a TRUST statement and

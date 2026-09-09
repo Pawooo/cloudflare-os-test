@@ -125,7 +125,7 @@ const CALL_ARGS: Record<string, unknown[]> = {
   // a period named here must still be one no later test wants open, because a refusal that stopped
   // working would silently close it. See the note on "closing a month" for the 2025 convention.
   lockPeriod: ["2025-11"],
-  decideSubmission: [1, "approve"],
+  decideSubmission: [1, "approve", 0],
 };
 
 /**
@@ -169,9 +169,10 @@ const RETURN_SHAPES: Record<string, string[]> = {
   // Every column of `submissions` plus the six the dashboard adds. An amendment row carries one
   // more key, `amendment`, and ABSENCE of it is the discriminator — see the assertion below.
   listPendingOverview: [
-    "calculation_inputs", "created_by", "current_step", "eligibleActorIds", "eligibleActorNames",
-    "employeeName", "employeeNumber", "employee_id", "filedByName", "id", "kind", "minutes",
-    "reason", "requested_for", "route_snapshot", "state", "submitted_at", "waitingMs",
+    "afterEventId", "calculation_inputs", "created_by", "current_step", "eligibleActorIds",
+    "eligibleActorNames", "employeeName", "employeeNumber", "employee_id", "filedByName", "id",
+    "kind", "minutes", "reason", "requested_for", "route_snapshot", "state", "submitted_at",
+    "waitingMs",
   ],
 };
 
@@ -1369,11 +1370,20 @@ describe("decideSubmission — a decision made from the dashboard", () => {
     return appUi(accountId, true);
   }
 
+  /** The staleness marker the dashboard read off the row — what a decision must state it saw. */
+  async function markerOf(hr: any, submissionId: number): Promise<number> {
+    const row = (await hr.listPendingOverview()).find((r: { id: number }) => r.id === submissionId);
+    if (!row) throw new Error(`submission ${submissionId} is not in the queue`);
+    return row.afterEventId;
+  }
+
   it("lets the employee's manager approve, records the event, and audits the channel", async () => {
     const { boss, overtimeId } = await attendance("decide-ok", "2026-06");
     const hr = await admin("boss", boss);
 
-    expect(await hr.decideSubmission(overtimeId, "approve")).toBeUndefined();
+    // Answers with the state the request is in now — "approved" on the seeded single-step route.
+    expect(await hr.decideSubmission(overtimeId, "approve", await markerOf(hr, overtimeId)))
+      .toBe("approved");
 
     expect((await store.getSubmission(overtimeId)).state).toBe("approved");
     // approval_events is the decision's record; audit_log records that it came from the dashboard
@@ -1381,11 +1391,25 @@ describe("decideSubmission — a decision made from the dashboard", () => {
     expect(JSON.stringify(await store.auditEntries())).toContain("decide_submission");
   });
 
+  it("lets the manager approve a punch CORRECTION, which writes the corrected punch", async () => {
+    // The live failure: an approved overtime request worked, an approved correction answered with
+    // the UI's generic fallback — i.e. something threw that was not a KINTAI_ refusal.
+    const { boss, correctionId, worker, day } = await attendance("decide-correction", "2026-06");
+    const hr = await admin("boss3", boss);
+
+    await hr.decideSubmission(correctionId, "approve", await markerOf(hr, correctionId));
+
+    expect((await store.getSubmission(correctionId)).state).toBe("approved");
+    const punches = await store.currentPunches(worker, day);
+    expect(punches.some((p) => p.source === "amendment")).toBe(true);
+  });
+
   it("refuses an administrator the org chart does not list, and leaves the request pending", async () => {
     const { overtimeId } = await attendance("decide-outsider", "2026-06");
     const outsider = await admin("outsider", await employee("Outsider"));
 
-    await expect(() => outsider.decideSubmission(overtimeId, "approve"))
+    const marker = await markerOf(outsider, overtimeId);
+    await expect(() => outsider.decideSubmission(overtimeId, "approve", marker))
       .rejects.toThrow(/KINTAI_NOT_AUTHORIZED/);
     expect((await store.getSubmission(overtimeId)).state).toBe("pending");
   });
@@ -1396,7 +1420,8 @@ describe("decideSubmission — a decision made from the dashboard", () => {
 
     // The store's own word for it — a code of its own, not the generic authority refusal, because
     // "you filed this" is a different fact from "you are not their manager" and the UI says so.
-    await expect(() => self.decideSubmission(overtimeId, "approve"))
+    const marker = await markerOf(self, overtimeId);
+    await expect(() => self.decideSubmission(overtimeId, "approve", marker))
       .rejects.toThrow(/KINTAI_SELF_APPROVAL/);
     expect((await store.getSubmission(overtimeId)).state).toBe("pending");
   });
@@ -1405,7 +1430,7 @@ describe("decideSubmission — a decision made from the dashboard", () => {
     const { overtimeId } = await attendance("decide-unlinked", "2026-06");
     const nobody = await admin("nobody", null);
 
-    await expect(() => nobody.decideSubmission(overtimeId, "approve"))
+    await expect(() => nobody.decideSubmission(overtimeId, "approve", 0))
       .rejects.toThrow(/KINTAI_ADMIN_NOT_LINKED/);
   });
 
@@ -1413,11 +1438,50 @@ describe("decideSubmission — a decision made from the dashboard", () => {
     const { boss, correctionId, overtimeId } = await attendance("decide-comment", "2026-06");
     const hr = await admin("boss2", boss);
 
-    await hr.decideSubmission(correctionId, "reject", "現場の記録と一致しません");
+    await hr.decideSubmission(
+      correctionId, "reject", await markerOf(hr, correctionId), "現場の記録と一致しません",
+    );
     expect((await store.getSubmission(correctionId)).state).toBe("rejected");
     expect(JSON.stringify(await store.approvalEvents(correctionId))).toContain("現場の記録と一致しません");
 
-    await hr.decideSubmission(overtimeId, "approve", "");
+    await hr.decideSubmission(overtimeId, "approve", await markerOf(hr, overtimeId), "");
     expect((await store.getSubmission(overtimeId)).state).toBe("approved");
+    // "" is no comment: the record holds NULL, as it would for the agent path's omitted comment.
+    const approval = (await store.approvalEvents(overtimeId)).find((e) => e.action === "approve");
+    expect(approval?.comment).toBeNull();
+  });
+
+  it("refuses a decision made against a row that has moved since it was read", async () => {
+    // The defect the review found: on a route with two manager steps and one manager, click one
+    // approved step 0 and the row re-rendered unchanged — click two approved step 1. One intent,
+    // two approvals: precisely what the agent path's staged marker prevents. The dashboard now
+    // states the marker it read, and the store refuses a decision whose view is stale.
+    const worker = await employee("two-step-worker");
+    const boss = await employee("two-step-boss");
+    await store.setReportingLine(worker, boss, 0);
+    await store.createRoute({
+      name: `two-step-${seq}`, department: `DECIDE-${seq}`,
+      steps: [
+        { rule: "any_of", approverKind: "manager", approverEmployeeId: null },
+        { rule: "any_of", approverKind: "manager", approverEmployeeId: null },
+      ],
+    });
+    const nine = Date.parse("2026-06-02T00:00:00Z");
+    const overtimeId = await store.submitOvertime({
+      employeeId: worker, requestedFor: "2026-06-02", minutes: 60, reason: "two-step",
+      now: nine, department: `DECIDE-${seq}`, employmentType: null,
+    });
+    const hr = await admin("two-step", boss);
+
+    const marker = await markerOf(hr, overtimeId);
+    // Step 0 approved; the request is still pending, now at step 1 — the caller is told so.
+    expect(await hr.decideSubmission(overtimeId, "approve", marker)).toBe("pending");
+    expect((await store.getSubmission(overtimeId)).current_step).toBe(1);
+
+    // The same click again, with the marker from BEFORE the first decision: refused, not counted.
+    await expect(() => hr.decideSubmission(overtimeId, "approve", marker))
+      .rejects.toThrow(/KINTAI_STALE_DECISION/);
+    expect((await store.getSubmission(overtimeId)).state).toBe("pending");
+    expect((await store.approvalEvents(overtimeId))).toHaveLength(1);
   });
 });

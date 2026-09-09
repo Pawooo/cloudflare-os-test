@@ -412,7 +412,7 @@ function lastReturnEventId(sql: SqlStorage, submissionId: number): number {
  * remember that `NULL` is not equal to itself. A freshly filed submission nobody has acted on gets
  * a real marker like any other.
  */
-function latestEventId(sql: SqlStorage, submissionId: number): number {
+export function latestEventId(sql: SqlStorage, submissionId: number): number {
   const row = sql
     .exec<{ id: number | null }>(
       `SELECT MAX(id) AS id FROM approval_events WHERE submission_id = ?`, submissionId,

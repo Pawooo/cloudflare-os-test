@@ -7,7 +7,7 @@ import { jstClockTime, jstWorkDate } from "../src/work-date";
 import type { KintaiAdminClient, RowFixes } from "./AdminPage";
 import { PunchSource } from "./PunchSource";
 import { isReady, RosterRow } from "./RosterRow";
-import { describeFailure } from "./errors";
+import { describeFailure, failureDetail } from "./errors";
 
 /**
  * 要対応: what needs a human right now, and who that human is.
@@ -297,7 +297,11 @@ function DecisionControls(
   const [armed, setArmed] = useState<ApprovalAction | null>(null);
   const [comment, setComment] = useState("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string>();
+  const [error, setError] = useState<{ message: string; detail?: string }>();
+  // Set when a decision landed but the request is still pending — the route advanced to another
+  // step — so the row that re-renders says what happened. A terminal decision needs no notice: the
+  // re-read removes the row, and its absence is the feedback.
+  const [notice, setNotice] = useState<string>();
   const commentId = useId();
   const live = useRef(true);
   useEffect(() => {
@@ -319,20 +323,35 @@ function DecisionControls(
   };
   const decide = async () => {
     if (armed === null || !ready) return;
+    const decision = armed;
     setBusy(true);
     setError(undefined);
+    setNotice(undefined);
     try {
       const trimmed = comment.trim();
-      await api.decideSubmission(item.id, armed, trimmed === "" ? undefined : trimmed);
+      // `afterEventId` is the marker this row was read with: the store refuses the decision if the
+      // request moved since, rather than counting it at whatever step is now current.
+      const state = await api.decideSubmission(
+        item.id, decision, item.afterEventId, trimmed === "" ? undefined : trimmed,
+      );
       if (live.current) {
         setArmed(null);
         setComment("");
         setBusy(false);
+        if (state === "pending") {
+          setNotice(`${DECISION_LABELS[decision]}を記録しました。次の承認者の決定待ちです — this request moved to its next step and is waiting on somebody else.`);
+        }
       }
       onDecided();
     } catch (caught) {
       if (live.current) {
-        setError(describeFailure(caught, "決定できませんでした。"));
+        // A coded refusal reads as its own sentence. Anything else gets the fallback AND its raw
+        // text underneath: the first live failure of this control showed the fallback alone, and
+        // the cause was only in the server log.
+        setError({
+          message: describeFailure(caught, "決定できませんでした。"),
+          detail: failureDetail(caught),
+        });
         setBusy(false);
       }
     }
@@ -340,6 +359,9 @@ function DecisionControls(
 
   return (
     <div className="mt-2" data-testid="decision-controls">
+      {notice !== undefined && (
+        <p className="mb-2 text-xs text-kumo-success" data-testid="decision-notice">{notice}</p>
+      )}
       {armed === null ? (
         <div className="flex flex-wrap gap-2">
           {(["approve", "return", "reject"] as const).map((action) => (
@@ -403,9 +425,14 @@ function DecisionControls(
             </button>
           </div>
           {error !== undefined && (
-            <p className="mt-2 text-xs text-kumo-danger" role="alert" data-testid="decision-error">
-              {error}
-            </p>
+            <div className="mt-2" role="alert">
+              <p className="text-xs text-kumo-danger" data-testid="decision-error">{error.message}</p>
+              {error.detail !== undefined && (
+                <p className="mt-0.5 font-mono text-[11px] text-kumo-inactive" data-testid="decision-error-detail">
+                  {error.detail}
+                </p>
+              )}
+            </div>
           )}
         </div>
       )}

@@ -24,7 +24,7 @@
 import { assertPeriod } from "../input.js";
 import { currentPunches, dayAnomalies, workedMinutes } from "./punches.js";
 import { periodLock } from "./periods.js";
-import { eligibleActors, listSubmissionsFor, pendingSubmissions } from "./submissions.js";
+import { eligibleActors, listSubmissionsFor, pendingSubmissions, latestEventId } from "./submissions.js";
 import type {
   AnomalousDay, EmployeeDay, EmployeeId, EmployeeMonth, EmployeeMonthDay, MonthlyReport,
   MonthlyTotalRow, PendingItem, SubmissionState,
@@ -297,6 +297,10 @@ export function pendingOverview(sql: SqlStorage, now: number): PendingItem[] {
         : labels.get(row.created_by)!.display_name,
       waitingMs: row.submitted_at === null ? 0 : now - row.submitted_at,
       eligibleActorIds: actorIds,
+      // The staleness marker as of THIS read. A dashboard decision hands it back, and the store
+      // refuses the decision if the request's history has moved since — the same guard the agent
+      // path's staged row carries as `staged_after_event_id`.
+      afterEventId: latestEventId(sql, row.id),
       eligibleActorNames: actorIds.map((actorId) => labels.get(actorId)!.display_name),
     };
   });
