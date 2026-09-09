@@ -125,6 +125,7 @@ const CALL_ARGS: Record<string, unknown[]> = {
   // a period named here must still be one no later test wants open, because a refusal that stopped
   // working would silently close it. See the note on "closing a month" for the 2025 convention.
   lockPeriod: ["2025-11"],
+  decideSubmission: [1, "approve"],
 };
 
 /**
@@ -137,7 +138,7 @@ const CALL_ARGS: Record<string, unknown[]> = {
 const INTERFACE_MEMBERS = [
   "createEmployee", "getEmployeeDay", "grantExemption", "linkAccount", "listAnomalousDays",
   "listEmployees", "listPendingOverview", "listReportingLines", "lockPeriod", "monthlyReport",
-  "setDesignatedApprover", "setReportingLine", "setWorkDatePolicy", "whoAmI",
+  "decideSubmission", "setDesignatedApprover", "setReportingLine", "setWorkDatePolicy", "whoAmI",
 ];
 
 /**
@@ -1349,4 +1350,74 @@ describe("closing the live month, end to end", () => {
       expect(after.rows.find((row: { employeeId: number }) => row.employeeId === worker))
         .toMatchObject({ workedMinutes: 540 });
     });
+});
+
+
+/**
+ * Deciding from the dashboard.
+ *
+ * The OS confirmation card is not reachable from `startAppUi` — the Workshop hands it only
+ * `{ isAdmin }`, and the `ApprovalQueue` goes to `startSession` alone — so a dashboard decision is
+ * confirmed in Kintai's own UI and written directly, like every other dashboard write. What must
+ * NOT change is the authority: the store's `checkMayAct` runs at the write, identity comes from
+ * the capability, and being an administrator buys nothing here.
+ */
+describe("decideSubmission — a decision made from the dashboard", () => {
+  async function admin(tag: string, employeeId: number | null) {
+    const accountId = `acct-decide-${tag}-${seq}`;
+    if (employeeId !== null) await store.linkAccount(accountId, employeeId, Date.now());
+    return appUi(accountId, true);
+  }
+
+  it("lets the employee's manager approve, records the event, and audits the channel", async () => {
+    const { boss, overtimeId } = await attendance("decide-ok", "2026-06");
+    const hr = await admin("boss", boss);
+
+    expect(await hr.decideSubmission(overtimeId, "approve")).toBeUndefined();
+
+    expect((await store.getSubmission(overtimeId)).state).toBe("approved");
+    // approval_events is the decision's record; audit_log records that it came from the dashboard
+    // rather than through the agent's staged path.
+    expect(JSON.stringify(await store.auditEntries())).toContain("decide_submission");
+  });
+
+  it("refuses an administrator the org chart does not list, and leaves the request pending", async () => {
+    const { overtimeId } = await attendance("decide-outsider", "2026-06");
+    const outsider = await admin("outsider", await employee("Outsider"));
+
+    await expect(() => outsider.decideSubmission(overtimeId, "approve"))
+      .rejects.toThrow(/KINTAI_NOT_AUTHORIZED/);
+    expect((await store.getSubmission(overtimeId)).state).toBe("pending");
+  });
+
+  it("refuses the person who filed it, administrator or not", async () => {
+    const { worker, overtimeId } = await attendance("decide-self", "2026-06");
+    const self = await admin("self", worker);
+
+    // The store's own word for it — a code of its own, not the generic authority refusal, because
+    // "you filed this" is a different fact from "you are not their manager" and the UI says so.
+    await expect(() => self.decideSubmission(overtimeId, "approve"))
+      .rejects.toThrow(/KINTAI_SELF_APPROVAL/);
+    expect((await store.getSubmission(overtimeId)).state).toBe("pending");
+  });
+
+  it("refuses an administrator whose account is not linked to any employee", async () => {
+    const { overtimeId } = await attendance("decide-unlinked", "2026-06");
+    const nobody = await admin("nobody", null);
+
+    await expect(() => nobody.decideSubmission(overtimeId, "approve"))
+      .rejects.toThrow(/KINTAI_ADMIN_NOT_LINKED/);
+  });
+
+  it("carries a rejection's comment into the record, and treats an empty comment as none", async () => {
+    const { boss, correctionId, overtimeId } = await attendance("decide-comment", "2026-06");
+    const hr = await admin("boss2", boss);
+
+    await hr.decideSubmission(correctionId, "reject", "現場の記録と一致しません");
+    expect((await store.getSubmission(correctionId)).state).toBe("rejected");
+    expect(JSON.stringify(await store.approvalEvents(correctionId))).toContain("現場の記録と一致しません");
+
+    await hr.decideSubmission(overtimeId, "approve", "");
+    expect((await store.getSubmission(overtimeId)).state).toBe("approved");
+  });
 });

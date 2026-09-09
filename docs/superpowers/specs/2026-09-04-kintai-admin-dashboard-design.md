@@ -21,7 +21,7 @@ Settled with the project owner on 2026-09-04:
 | Question | Decision |
 | --- | --- |
 | Whose eyes | **Company-wide, Workshop admins.** The admin capability deliberately widens from "manages the org" to "reads all attendance", including punch-level days. A knowing privacy decision, recorded here and in the interface header. Managers' scoped views are later work. |
-| See or act | **Triage for approvals, act on org blockers.** Approvals show WHO can decide and how long it has waited; the admin's move is to chase that person. Admin-override deciding is rejected — it would make every route guarantee conditional. Org repairs (link, approver, exemption) keep their existing buttons. |
+| See or act | **Amended 2026-09-09: a viewer the org chart names as a decider may approve / return / reject from the row; everyone else sees triage.** See `docs/kintai-architecture-limits.md`. Original: **Triage for approvals, act on org blockers.** Approvals show WHO can decide and how long it has waited; the admin's move is to chase that person. Admin-override deciding is rejected — it would make every route guarantee conditional. Org repairs (link, approver, exemption) keep their existing buttons. |
 | Reporting before the overtime engine | **Raw hours + month closing.** Per-employee monthly minutes and anomaly counts now; premium columns when the engine lands; `lockPeriod` becomes reachable, closing the `setAllocations` hole. |
 | Structure | **Exceptions-first, in tabs**: 要対応 (needs a human now) · 月次 (monthly/payroll) · Roster (the existing screen, unchanged, as the third tab). Verification and reporting are different jobs at different cadences. |
 

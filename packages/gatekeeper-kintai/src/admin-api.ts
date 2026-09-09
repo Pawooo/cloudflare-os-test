@@ -1,6 +1,8 @@
 import { RpcTarget } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
-import type { EmployeeId, KintaiIdentity, RosterEntry, WorkDatePolicy } from "./types.js";
+import type {
+  ApprovalAction, EmployeeId, KintaiIdentity, RosterEntry, WorkDatePolicy,
+} from "./types.js";
 import type { NewEmployee } from "./store/employees.js";
 import { EmployeeNotFoundError } from "./store/employees.js";
 import type { ReportingLineRow } from "./store/org.js";
@@ -221,6 +223,14 @@ export interface KintaiAdminApi {
    * ONE-WAY — see `AdminKintaiApi.lockPeriod`.
    */
   lockPeriod(period: string): Promise<void>;
+
+  /**
+   * Decide a waiting request from this screen — approve, return, or reject, with an optional
+   * comment. Refused unless the org chart names the caller as a decider for it at its current
+   * step, and refused for its own filer; being an administrator buys nothing. See
+   * `AdminKintaiApi.decideSubmission` for why this writes directly rather than through the OS card.
+   */
+  decideSubmission(submissionId: number, action: ApprovalAction, comment?: string): Promise<void>;
 }
 
 // Re-exported so worker-side callers of this API read its return type from the API's own module.
@@ -688,6 +698,48 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
       at: now, actorEmployeeId, action: "lock_period", entity: "period_locks",
       before: { period, locked: previous !== null },
       after: { period, lockedBy: actorEmployeeId, lockedAt: now },
+    });
+  }
+
+  /**
+   * Decide a waiting request from the dashboard.
+   *
+   * The agent path stages a decision and submits it to the Overseer's `ApprovalQueue`; a human
+   * confirms it on an OS card, and `KintaiGatekeeper.applyAction` performs the write later. That
+   * queue is not reachable from here: the Workshop hands `startAppUi` only `{ isAdmin }`, and the
+   * queue goes to `startSession` alone. So this decision is confirmed in Kintai's own UI and written
+   * directly — the same shape as every other write on this class, and for the same reason the OS
+   * gate does not apply to them: the gate exists to keep a possibly prompt-injected AGENT from
+   * exercising authority unattended, and the person pressing this button is the human the gate
+   * would have asked.
+   *
+   * What does not change is the authority. `store.actOnSubmission` runs `checkMayAct` in the same
+   * call as the write: the caller must be a decider the org chart names for THIS request at its
+   * CURRENT step, and may not be its filer. The dashboard shows the buttons only on rows whose
+   * `eligibleActorIds` name the viewer, and that list is computed by the same check — so what the
+   * buttons promise is what the write accepts, and a row that moved in between is refused here.
+   *
+   * `approval_events` is the decision's record, exactly as for the agent path. The audit row adds
+   * the one fact that record cannot carry: which channel it came through, so a reader can tell a
+   * dashboard decision from a staged one.
+   */
+  async decideSubmission(
+    submissionId: number, action: ApprovalAction, comment?: string,
+  ): Promise<void> {
+    const now = Date.now();
+    if (comment !== undefined) assertText("comment", comment, LIMITS.comment);
+    // An empty comment is no comment — the same rule `KintaiSession.actOnSubmission` applies, so
+    // the two channels record the same thing for the same input.
+    if (comment === "") comment = undefined;
+    const actorEmployeeId = await this.#actor(now);
+    if (actorEmployeeId === null) throw new UnlinkedAdminError("decideSubmission");
+    const state = await this.#store.actOnSubmission({
+      submissionId, actorId: actorEmployeeId, action, comment, now,
+    });
+    await this.#store.appendAudit({
+      at: now, actorEmployeeId, action: "decide_submission", entity: "submissions",
+      entityId: submissionId,
+      after: { submissionId, decision: action, state, channel: "dashboard" },
     });
   }
 

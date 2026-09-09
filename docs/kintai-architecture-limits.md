@@ -146,6 +146,36 @@ not:
   The refusal is the column being right, not a gap — and it is one more reason the account card
   shows an admin their own code whether or not they are linked.
 
+## The dashboard could not decide a request — WAS A RULING, reversed 2026-09-09
+
+The admin dashboard's 要対応 tab was designed triage-only: it named WHO could decide a waiting
+request and how long it had waited, and sent that person to the agent to decide it. The ruling was
+made to keep administrators out of the approval chain — admin does not equal approver — and it was
+sound on that point. It failed on another: in the owner's own manual pass, the screen named the
+decider and then offered nothing to do. "What am I supposed to start then?"
+
+Reversed as follows. A row shows 承認・差し戻し・却下 only when the org chart names the viewer among
+its deciders (`eligibleActorIds`, computed by the same `checkMayAct` the write runs). Being an
+administrator still buys nothing: an unlisted caller is refused at the write whatever the screen
+showed. The write is `AdminKintaiApi.decideSubmission`, confirmed inline and written directly.
+
+Two things this surfaced that are limits of the OS, not of Kintai:
+
+- **`startAppUi` receives only `{ isAdmin }`.** The Overseer's `ApprovalQueue` — the confirmation
+  card the agent path stages every decision through — goes to `startSession` alone. An app UI
+  cannot stage an action; it can only write. So a dashboard decision is confirmed by Kintai's own
+  two-step control, like every other dashboard write, and the OS card is reserved for the agent.
+  The gate's purpose (a human in the loop for a possibly prompt-injected agent) is served either
+  way: on the dashboard the human IS the initiator. But if the Workshop ever hands app UIs a queue,
+  this is the write that should move onto it first.
+- **Managers who are not Workshop admins have no dashboard.** They receive the employee gadget, so
+  for them the agent stays the only path to a decision until a manager-scoped view exists.
+
+And a principle the owner stated, which changes the earlier "LLM-first" framing and should steer
+every surface decision from here: **conventional UI for routine flows, the agent for the long
+tail.** The cost of a manager reasoning through a routine approval in natural language outpaces a
+button many times over; the agent earns its tokens on the questions a form cannot anticipate.
+
 ## The pattern worth noticing
 
 Four of the six limits above are the same shape: **a capability implemented on the store, tested,

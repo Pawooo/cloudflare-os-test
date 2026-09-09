@@ -14,6 +14,7 @@ import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 
  * See the note in `src/types.ts`.
  */
 import type {
+  ApprovalAction,
   AnomalousDay, EmployeeDay, EmployeeId, KintaiIdentity, MonthlyReport, NewEmployee, PendingItem,
   RosterEntry, WorkDatePolicy,
 } from "../src/types";
@@ -58,6 +59,13 @@ export type KintaiAdminClient = {
    * records who performed it).
    */
   lockPeriod(period: string): Promise<void>;
+  /**
+   * Decide a waiting request from this screen: approve, return, or reject, with an optional
+   * comment (this UI requires one for return and reject). Refused unless the org chart names the
+   * caller as a decider — being an administrator buys nothing — and refused for the request's own
+   * filer. Confirmed inline and written directly; see `AdminKintaiApi.decideSubmission`.
+   */
+  decideSubmission(submissionId: number, action: ApprovalAction, comment?: string): Promise<void>;
 };
 
 /**
@@ -337,6 +345,7 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
           <div hidden={tab !== "overview"} data-testid="panel-overview">
             <OverviewTab
               api={api} roster={view.roster} fixes={fixes} queueToken={queueToken}
+              viewerEmployeeId={view.identity.employeeId} onDecided={invalidateQueue}
             />
           </div>
 

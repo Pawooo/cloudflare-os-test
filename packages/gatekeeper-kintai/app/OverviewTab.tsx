@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import type {
+  ApprovalAction,
   AnomalousDay, EmployeeDay, EmployeeId, PendingItem, RosterEntry,
 } from "../src/types";
 import { jstClockTime, jstWorkDate } from "../src/work-date";
@@ -24,19 +25,36 @@ import { describeFailure } from "./errors";
  *  3. An employee the system will turn away the first time they file anything. Upstream of both
  *     of the above: a row here is why a request that should exist does not.
  *
- * NOTHING HERE DECIDES ANYTHING. Sections 1 and 2 are reads; the only writes on this tab are
- * section 3's roster repairs, which are the Roster tab's own controls rendered here rather than
- * copied. An "approve" button on section 1 would put an administrator in the approval chain, which
- * is the org chart's job and is re-checked at the moment of the write anyway — the honest fix for
- * a stranded request is to repair the organisation until somebody is eligible, which is exactly
- * what section 3 offers.
+ * WHAT THIS TAB MAY DECIDE. Section 2 is a read. Section 3's writes are the Roster tab's own
+ * controls rendered here rather than copied. Section 1 shows 承認・差し戻し・却下 on a row ONLY when
+ * the org chart names the viewer as one of its deciders (`eligibleActorIds`, computed by the same
+ * `checkMayAct` the write runs) — being an administrator buys nothing, and the store refuses an
+ * unlisted caller regardless of what the screen showed. So an administrator who is also the
+ * employee's manager decides here; an administrator who is not sees who can, and the honest fix
+ * for a stranded request is still section 3: repair the organisation until somebody is eligible.
+ *
+ * This replaced the original triage-only rule (decide through the agent, never here) once the
+ * owner's own use showed the rule's cost: the screen named the decider and then sent them to
+ * a chat to do it. Routine decisions belong on a button; the agent is for the long tail. See
+ * `AdminKintaiApi.decideSubmission` for why the decision is confirmed here rather than on the OS
+ * card the agent path uses.
  */
 export function OverviewTab({
-  api, roster, fixes, queueToken,
+  api, roster, fixes, queueToken, viewerEmployeeId, onDecided,
 }: {
   api: KintaiAdminClient;
   roster: RosterEntry[];
   fixes: RowFixes;
+  /**
+   * The viewer's own employee id, or null when their account is not linked. Section 1 shows its
+   * decision controls only on rows whose `eligibleActorIds` name this id — the list the store
+   * computed with the same `checkMayAct` the write runs, so the buttons promise exactly what the
+   * write will accept. Presentation only: an unlinked or unlisted viewer who somehow called the
+   * method anyway is refused by the store.
+   */
+  viewerEmployeeId: EmployeeId | null;
+  /** A decision was written: the owner of `queueToken` should bump it so section 1 re-reads. */
+  onDecided: () => void;
   /**
    * How many writes the screen has made that section 1's read depends on. See `queueToken` in
    * `AdminPage`, which owns it and states which writes bump it and why the other reads are left
@@ -51,7 +69,9 @@ export function OverviewTab({
 }) {
   return (
     <div className="flex flex-col gap-8">
-      <PendingSection api={api} queueToken={queueToken} />
+      <PendingSection
+        api={api} queueToken={queueToken} viewerEmployeeId={viewerEmployeeId} onDecided={onDecided}
+      />
       <AnomaliesSection api={api} />
       <BlockersSection roster={roster} fixes={fixes} />
     </div>
@@ -122,7 +142,14 @@ function useSectionRead<T>(read: () => Promise<T>, fallback: string, reloadOn: n
 
 // ---- 1. waiting on a decision ------------------------------------------------------------------
 
-function PendingSection({ api, queueToken }: { api: KintaiAdminClient; queueToken: number }) {
+function PendingSection(
+  { api, queueToken, viewerEmployeeId, onDecided }: {
+    api: KintaiAdminClient;
+    queueToken: number;
+    viewerEmployeeId: EmployeeId | null;
+    onDecided: () => void;
+  },
+) {
   const read = useCallback(() => api.listPendingOverview(), [api]);
   /*
    * The one read on this tab that the screen's own writes can invalidate, in two ways.
@@ -157,15 +184,28 @@ function PendingSection({ api, queueToken }: { api: KintaiAdminClient; queueToke
         </Empty>
       ) : (
         <ul className="divide-y divide-kumo-line border-y border-kumo-line">
-          {data.map((item) => <PendingRow key={item.id} item={item} />)}
+          {data.map((item) => (
+            <PendingRow
+              key={item.id} item={item} api={api} viewerEmployeeId={viewerEmployeeId}
+              onDecided={onDecided}
+            />
+          ))}
         </ul>
       )}
     </Section>
   );
 }
 
-function PendingRow({ item }: { item: PendingItem }) {
+function PendingRow(
+  { item, api, viewerEmployeeId, onDecided }: {
+    item: PendingItem;
+    api: KintaiAdminClient;
+    viewerEmployeeId: EmployeeId | null;
+    onDecided: () => void;
+  },
+) {
   const closed = item.amendment?.lockedPeriod ?? null;
+  const mine = viewerEmployeeId !== null && item.eligibleActorIds.includes(viewerEmployeeId);
   return (
     <li
       className="flex flex-wrap items-start gap-x-4 gap-y-2 py-3"
@@ -203,10 +243,21 @@ function PendingRow({ item }: { item: PendingItem }) {
             designated approver on the Roster tab, or look at who filed it: whoever files a request
             can never be the one who decides it.
           </p>
+        ) : mine ? (
+          <>
+            <p className="text-xs font-medium text-kumo-default" data-testid="deciders">
+              Yours to decide
+              {item.eligibleActorNames.length > 1
+                ? ` — you are one of: ${item.eligibleActorNames.join(", ")}`
+                : ""}
+            </p>
+            <DecisionControls item={item} api={api} onDecided={onDecided} />
+          </>
         ) : (
           <p className="text-xs text-kumo-subtle" data-testid="deciders">
-            Can be decided by {item.eligibleActorNames.join(", ")} — not here: one of them asks
-            their assistant for their pending approvals and approves, returns, or rejects it there.
+            Can be decided by {item.eligibleActorNames.join(", ")} — not by you, and not here: one
+            of them decides it from their own dashboard, or by asking their assistant for their
+            pending approvals.
           </p>
         )}
       </div>
@@ -218,6 +269,147 @@ function PendingRow({ item }: { item: PendingItem }) {
         {formatAge(item.waitingMs)}
       </p>
     </li>
+  );
+}
+
+const DECISION_LABELS: Record<ApprovalAction, string> = {
+  approve: "承認",
+  return: "差し戻し",
+  reject: "却下",
+};
+
+/**
+ * The three decisions, two-step and inline — the same shape as 月次's month close, and for the same
+ * reasons: never `window.confirm`, and the confirmation is pinned to ONE request, restating it in
+ * the words the agent's OS card would have used (`describeAsk`), so a manager reads what they are
+ * about to decide before they decide it. 差し戻し and 却下 require a comment: the employee reads it
+ * as the reason, and a bare rejection tells them nothing they can act on. 承認 does not, matching
+ * the agent path where the comment is optional.
+ *
+ * On success this calls `onDecided` and otherwise leaves the row alone: the queue is re-read and
+ * the store's answer decides whether the row disappears (decided) or stays (a multi-step route
+ * advanced to somebody else's step). Optimistically removing it here would be the panel
+ * contradicting the write beside it, which is the bug `queueToken` exists to prevent.
+ */
+function DecisionControls(
+  { item, api, onDecided }: { item: PendingItem; api: KintaiAdminClient; onDecided: () => void },
+) {
+  const [armed, setArmed] = useState<ApprovalAction | null>(null);
+  const [comment, setComment] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const commentId = useId();
+  const live = useRef(true);
+  useEffect(() => {
+    live.current = true;
+    return () => { live.current = false; };
+  }, []);
+
+  const needsComment = armed !== null && armed !== "approve";
+  const ready = armed !== null && (!needsComment || comment.trim() !== "");
+
+  const arm = (action: ApprovalAction) => {
+    setArmed(action);
+    setError(undefined);
+  };
+  const cancel = () => {
+    setArmed(null);
+    setComment("");
+    setError(undefined);
+  };
+  const decide = async () => {
+    if (armed === null || !ready) return;
+    setBusy(true);
+    setError(undefined);
+    try {
+      const trimmed = comment.trim();
+      await api.decideSubmission(item.id, armed, trimmed === "" ? undefined : trimmed);
+      if (live.current) {
+        setArmed(null);
+        setComment("");
+        setBusy(false);
+      }
+      onDecided();
+    } catch (caught) {
+      if (live.current) {
+        setError(describeFailure(caught, "決定できませんでした。"));
+        setBusy(false);
+      }
+    }
+  };
+
+  return (
+    <div className="mt-2" data-testid="decision-controls">
+      {armed === null ? (
+        <div className="flex flex-wrap gap-2">
+          {(["approve", "return", "reject"] as const).map((action) => (
+            <button
+              key={action}
+              type="button"
+              data-action={`decide-${action}`}
+              className={action === "approve"
+                ? "press rounded-lg bg-kumo-brand px-3 py-1.5 text-xs font-medium text-white hover:bg-kumo-brand-hover"
+                : "press rounded-lg border border-kumo-line bg-kumo-control px-3 py-1.5 text-xs font-medium text-kumo-default hover:bg-kumo-tint"}
+              onClick={() => arm(action)}
+            >
+              {DECISION_LABELS[action]}
+            </button>
+          ))}
+        </div>
+      ) : (
+        <div className="rounded-lg bg-kumo-tint px-3 py-3" data-testid="decision-confirm">
+          <p className="text-xs text-kumo-default">
+            <span className="font-medium">{DECISION_LABELS[armed]}</span>
+            {` — ${item.employeeName}: ${describeAsk(item)}`}
+          </p>
+          {needsComment && (
+            <div className="mt-2 flex flex-col gap-1">
+              <label htmlFor={commentId} className="text-xs font-medium text-kumo-default">
+                理由（本人に表示されます）
+              </label>
+              <input
+                id={commentId}
+                type="text"
+                data-testid="decision-comment"
+                placeholder={armed === "return"
+                  ? "例: 退勤時刻を確認して再申請してください"
+                  : "例: 現場の記録と一致しません"}
+                value={comment}
+                onChange={(event) => setComment(event.target.value)}
+                className="w-full rounded border border-kumo-line bg-kumo-control px-2 py-1.5 text-sm text-kumo-default placeholder:text-kumo-inactive"
+              />
+            </div>
+          )}
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              type="button"
+              data-action="confirm-decision"
+              disabled={busy || !ready}
+              className={armed === "approve"
+                ? "press rounded-lg bg-kumo-brand px-3 py-1.5 text-xs font-medium text-white hover:bg-kumo-brand-hover disabled:opacity-60"
+                : "press rounded-lg border border-kumo-danger bg-kumo-control px-3 py-1.5 text-xs font-medium text-kumo-danger hover:bg-kumo-tint disabled:opacity-60"}
+              onClick={() => void decide()}
+            >
+              {DECISION_LABELS[armed]}する
+            </button>
+            <button
+              type="button"
+              data-action="cancel-decision"
+              disabled={busy}
+              className="press rounded-lg px-3 py-1.5 text-xs font-medium text-kumo-subtle hover:bg-kumo-tint"
+              onClick={cancel}
+            >
+              取り消す
+            </button>
+          </div>
+          {error !== undefined && (
+            <p className="mt-2 text-xs text-kumo-danger" role="alert" data-testid="decision-error">
+              {error}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 

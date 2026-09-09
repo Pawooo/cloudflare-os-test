@@ -71,6 +71,7 @@ function adminApi(overrides: Partial<KintaiAdminClient> = {}, roster: RosterEntr
       period, locked: false, rows: [],
     })),
     lockPeriod: vi.fn<KintaiAdminClient["lockPeriod"]>(async () => {}),
+    decideSubmission: vi.fn<KintaiAdminClient["decideSubmission"]>(async () => {}),
     ...overrides,
   };
 }
@@ -594,6 +595,89 @@ describe("AdminPage", () => {
         // do I pass it through?". The row says where the decision happens: not here.
         expect(deciders).toContain("pending approvals");
         expect(overviewMaybe('[data-submission="71"] [data-testid="stranded"]')).toBeNull();
+      });
+
+      // The viewer's own employee id is 9 (see `adminApi`). A row is "mine" when the org chart
+      // lists 9 among its deciders — the same list `pendingOverview` computes with `checkMayAct`,
+      // so what the buttons promise is exactly what the write will accept.
+      it("offers 承認・差し戻し・却下 only on rows the viewer can decide", async () => {
+        const api = adminApi({
+          listPendingOverview: vi.fn(async () => [
+            waiting({ id: 71, eligibleActorIds: [SUZUKI.id], eligibleActorNames: ["Suzuki"] }),
+            waiting({ id: 72, eligibleActorIds: [9, SUZUKI.id], eligibleActorNames: ["Me", "Suzuki"] }),
+          ]),
+        }, [TANAKA, SUZUKI]);
+        await render(<AdminPage api={api} />);
+
+        expect(overviewMaybe('[data-submission="71"] [data-action="decide-approve"]')).toBeNull();
+        expect(within(pendingRow(71), '[data-testid="deciders"]')).toContain("Suzuki");
+        for (const action of ["approve", "return", "reject"]) {
+          const button = pendingRow(72).querySelector<HTMLButtonElement>(`[data-action="decide-${action}"]`);
+          expect(button, action).not.toBeNull();
+          expect(button!.type).toBe("button");
+        }
+        expect(within(pendingRow(72), '[data-testid="deciders"]')).toContain("Yours to decide");
+        expect(pendingRow(72).querySelector("form")).toBeNull();
+      });
+
+      it("approves after an inline confirm that restates the request, then re-reads the queue", async () => {
+        const listPendingOverview = vi.fn(async () => [
+          waiting({ id: 72, eligibleActorIds: [9], eligibleActorNames: ["Me"] }),
+        ]);
+        const decideSubmission = vi.fn<KintaiAdminClient["decideSubmission"]>(async () => {});
+        const api = adminApi({ listPendingOverview, decideSubmission });
+        await render(<AdminPage api={api} />);
+        const reads = listPendingOverview.mock.calls.length;
+
+        // Nothing is decided by the first press.
+        await click('[data-submission="72"] [data-action="decide-approve"]');
+        expect(decideSubmission).not.toHaveBeenCalled();
+        const confirm = within(pendingRow(72), '[data-testid="decision-confirm"]');
+        expect(confirm).toContain("2h 30m of overtime on 2026-09-01");
+        expect(confirm).toContain("承認");
+
+        await click('[data-submission="72"] [data-action="confirm-decision"]');
+        expect(decideSubmission).toHaveBeenCalledWith(72, "approve", undefined);
+        // The queue is re-read, so the decided row leaves the screen on the store's word, not ours.
+        expect(listPendingOverview.mock.calls.length).toBeGreaterThan(reads);
+      });
+
+      it("requires a comment to 差し戻し or 却下, and sends it", async () => {
+        const decideSubmission = vi.fn<KintaiAdminClient["decideSubmission"]>(async () => {});
+        const api = adminApi({
+          listPendingOverview: vi.fn(async () => [
+            waiting({ id: 72, eligibleActorIds: [9], eligibleActorNames: ["Me"] }),
+          ]),
+          decideSubmission,
+        });
+        await render(<AdminPage api={api} />);
+
+        await click('[data-submission="72"] [data-action="decide-reject"]');
+        const confirmButton = () =>
+          pendingRow(72).querySelector<HTMLButtonElement>('[data-action="confirm-decision"]')!;
+        expect(confirmButton().disabled).toBe(true);
+        await type('[data-submission="72"] [data-testid="decision-comment"]', "現場の記録と一致しません");
+        expect(confirmButton().disabled).toBe(false);
+        await click('[data-submission="72"] [data-action="confirm-decision"]');
+        expect(decideSubmission).toHaveBeenCalledWith(72, "reject", "現場の記録と一致しません");
+      });
+
+      it("shows the store's refusal in the row and leaves the request where it was", async () => {
+        const api = adminApi({
+          listPendingOverview: vi.fn(async () => [
+            waiting({ id: 72, eligibleActorIds: [9], eligibleActorNames: ["Me"] }),
+          ]),
+          decideSubmission: vi.fn(async () => {
+            throw new Error("KINTAI_NOT_AUTHORIZED: you are not an approver for this submission.");
+          }),
+        });
+        await render(<AdminPage api={api} />);
+
+        await click('[data-submission="72"] [data-action="decide-approve"]');
+        await click('[data-submission="72"] [data-action="confirm-decision"]');
+        expect(within(pendingRow(72), '[data-testid="decision-error"]'))
+          .toContain("You are not an approver for this submission.");
+        expect(overviewMaybe('[data-submission="72"]')).not.toBeNull();
       });
 
       /**
