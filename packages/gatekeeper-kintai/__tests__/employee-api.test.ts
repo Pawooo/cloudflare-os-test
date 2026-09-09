@@ -215,7 +215,7 @@ function callableSurface(cls: { prototype: object }): string[] {
 describe("the employee capability's surface", () => {
   const EXPECTED = [
     "getDay", "listMySubmissions", "myMonth", "punch", "requestMissingPunch",
-    "requestPunchCorrection", "resubmit", "whoAmI", "withdrawSubmission",
+    "requestPunchCorrection", "resubmit", "setLanguage", "whoAmI", "withdrawSubmission",
   ];
 
   it("exposes exactly its own methods, and nothing more", () => {
@@ -301,6 +301,46 @@ describe("the shapes the employee reads hand back", () => {
   it("still answers whoAmI, which is how an employee reads their code for HR", async () => {
     const accountId = `acct-emp-unlinked-${seq}`;
     expect(await appUi(accountId).whoAmI())
-      .toEqual({ accountId, linked: false, employeeId: null });
+      .toEqual({ accountId, linked: false, employeeId: null, language: null });
+  });
+});
+
+// The employee-facing twin of `AdminKintaiApi.setLanguage`, exercised through the capability a
+// non-admin actually holds. Identity comes from the capability, never an argument, and an
+// unlinked account may still choose a language — see the doc comment on `EmployeeKintaiApi.
+// setLanguage`.
+describe("setLanguage", () => {
+  it("is null on a fresh account, until chosen", async () => {
+    const accountId = `acct-emp-lang-${seq}`;
+
+    expect((await appUi(accountId).whoAmI()).language).toBeNull();
+  });
+
+  it("records the caller's choice, read back on whoAmI, even unlinked", async () => {
+    const accountId = `acct-emp-lang-set-${seq}`;
+
+    expect(await appUi(accountId).setLanguage("ja")).toBeUndefined();
+
+    expect((await appUi(accountId).whoAmI()).language).toBe("ja");
+  });
+
+  // Refused by `@validateRpc()`, the literal union, before the method body -- and so before any
+  // write -- exactly as `setWorkDatePolicy` is pinned in `admin-api.test.ts`.
+  it("refuses anything but the two literals, before any write", async () => {
+    const accountId = `acct-emp-lang-refuse-${seq}`;
+
+    await expect(() => appUi(accountId).setLanguage("fr"))
+      .rejects.toThrow(/capnweb-validate.*setLanguage\[0\]: expected union/);
+
+    expect(await env.KINTAI_STORE.getByName("").languageFor(accountId)).toBeNull();
+  });
+
+  it("is scoped to the caller's own account, and never another's", async () => {
+    const mine = `acct-emp-lang-mine-${seq}`;
+    const theirs = `acct-emp-lang-theirs-${seq}`;
+
+    await appUi(mine).setLanguage("ja");
+
+    expect((await appUi(theirs).whoAmI()).language).toBeNull();
   });
 });

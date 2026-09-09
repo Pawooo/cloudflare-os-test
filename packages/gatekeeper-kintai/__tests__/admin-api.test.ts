@@ -117,6 +117,7 @@ const CALL_ARGS: Record<string, unknown[]> = {
   setDesignatedApprover: [1, 2],
   grantExemption: [1],
   setWorkDatePolicy: [1, "shift_start"],
+  setLanguage: ["ja"],
   listPendingOverview: [],
   listAnomalousDays: ["2026-07"],
   monthlyReport: ["2026-07"],
@@ -138,7 +139,8 @@ const CALL_ARGS: Record<string, unknown[]> = {
 const INTERFACE_MEMBERS = [
   "createEmployee", "getEmployeeDay", "grantExemption", "linkAccount", "listAnomalousDays",
   "listEmployees", "listPendingOverview", "listReportingLines", "lockPeriod", "monthlyReport",
-  "decideSubmission", "setDesignatedApprover", "setReportingLine", "setWorkDatePolicy", "whoAmI",
+  "decideSubmission", "setDesignatedApprover", "setLanguage", "setReportingLine",
+  "setWorkDatePolicy", "whoAmI",
 ];
 
 /**
@@ -156,7 +158,7 @@ const INTERFACE_MEMBERS = [
  * than against a type that would move with the code.
  */
 const RETURN_SHAPES: Record<string, string[]> = {
-  whoAmI: ["accountId", "employeeId", "linked"],
+  whoAmI: ["accountId", "employeeId", "language", "linked"],
   listEmployees: [
     "approverReachable", "departed_on", "department", "designated_approver_id", "display_name",
     "employee_number", "employment_type", "exempt", "id", "joined_on", "linked", "managerIds",
@@ -208,9 +210,12 @@ function callableSurface(cls: { prototype: object }): string[] {
     .toSorted();
 }
 
-// Everything admin-only: the mutations plus the two admin-only reads.
-const ADMIN_ONLY: [string, unknown[]][] =
-  INTERFACE_MEMBERS.filter((name) => name !== "whoAmI").map((name) => [name, CALL_ARGS[name]]);
+// Everything admin-only: the mutations plus the two admin-only reads. `whoAmI` and `setLanguage`
+// are excluded because both are ALSO on the non-admin's own capability (`EmployeeKintaiApi`) —
+// identity and a personal display preference are things every caller may reach, admin or not.
+const ADMIN_ONLY: [string, unknown[]][] = INTERFACE_MEMBERS
+  .filter((name) => name !== "whoAmI" && name !== "setLanguage")
+  .map((name) => [name, CALL_ARGS[name]]);
 
 describe("the capability a non-admin receives", () => {
   // The whole point of part 1, now held in a stronger way than a refusal. A non-admin holds
@@ -346,7 +351,7 @@ describe("the capability a non-admin receives", () => {
     const accountId = `acct-unlinked-${seq}`;
 
     expect(await appUi(accountId, false).whoAmI())
-      .toEqual({ accountId, linked: false, employeeId: null });
+      .toEqual({ accountId, linked: false, employeeId: null, language: null });
   });
 });
 
@@ -355,7 +360,7 @@ describe("whoAmI", () => {
     const accountId = `acct-admin-unlinked-${seq}`;
 
     expect(await appUi(accountId, true).whoAmI())
-      .toEqual({ accountId, linked: false, employeeId: null });
+      .toEqual({ accountId, linked: false, employeeId: null, language: null });
   });
 
   it("reports the linked employee, for admin and non-admin alike", async () => {
@@ -363,7 +368,7 @@ describe("whoAmI", () => {
     const accountId = `acct-linked-${seq}`;
     await store.linkAccount(accountId, employeeId, Date.now());
 
-    const expected = { accountId, linked: true, employeeId };
+    const expected = { accountId, linked: true, employeeId, language: null };
     expect(await appUi(accountId, true).whoAmI()).toEqual(expected);
     expect(await appUi(accountId, false).whoAmI()).toEqual(expected);
   });
@@ -377,7 +382,48 @@ describe("whoAmI", () => {
     await store.linkAccount(theirs, employeeId, Date.now());
 
     expect(await appUi(mine, false).whoAmI())
-      .toEqual({ accountId: mine, linked: false, employeeId: null });
+      .toEqual({ accountId: mine, linked: false, employeeId: null, language: null });
+  });
+});
+
+// `setLanguage` is on BOTH facets, not admin-only -- see `ADMIN_ONLY`'s exclusion above. This
+// block exercises it through the admin capability; the same trio runs through the employee
+// capability in `employee-api.test.ts`.
+describe("setLanguage", () => {
+  it("is null on a fresh account, until chosen", async () => {
+    const accountId = `acct-lang-${seq}`;
+
+    expect((await appUi(accountId, true).whoAmI()).language).toBeNull();
+  });
+
+  it("records the caller's choice, read back on whoAmI", async () => {
+    const accountId = `acct-lang-set-${seq}`;
+    const hr = appUi(accountId, true);
+
+    expect(await hr.setLanguage("ja")).toBeUndefined();
+
+    expect((await hr.whoAmI()).language).toBe("ja");
+  });
+
+  // Refused by `@validateRpc()`, the literal union, before the method body runs -- and so before
+  // any write. Same message shape as `setWorkDatePolicy`'s refusal, pinned below.
+  it("refuses anything but the two literals, before any write", async () => {
+    const accountId = `acct-lang-refuse-${seq}`;
+    const hr = appUi(accountId, true);
+
+    await expect(() => hr.setLanguage("fr"))
+      .rejects.toThrow(/capnweb-validate.*setLanguage\[0\]: expected union/);
+
+    expect(await store.languageFor(accountId)).toBeNull();
+  });
+
+  it("is scoped to the caller's own account, and never another's", async () => {
+    const mine = `acct-lang-mine-${seq}`;
+    const theirs = `acct-lang-theirs-${seq}`;
+
+    await appUi(mine, true).setLanguage("ja");
+
+    expect((await appUi(theirs, true).whoAmI()).language).toBeNull();
   });
 });
 
@@ -427,7 +473,7 @@ describe("the capability an admin receives", () => {
     const newHire = `acct-newhire-${seq}`;
 
     expect(await appUi(newHire, false).whoAmI())
-      .toEqual({ accountId: newHire, linked: false, employeeId: null });
+      .toEqual({ accountId: newHire, linked: false, employeeId: null, language: null });
 
     const employeeId = await hr.createEmployee({
       employeeNumber: `E-hire-${seq}`, displayName: "Yamada", joinedOn: "2026-04-01",
@@ -435,7 +481,7 @@ describe("the capability an admin receives", () => {
     await hr.linkAccount(newHire, employeeId);
 
     expect(await appUi(newHire, false).whoAmI())
-      .toEqual({ accountId: newHire, linked: true, employeeId });
+      .toEqual({ accountId: newHire, linked: true, employeeId, language: null });
   });
 
   // Who performed the link is the audit trail for the one operation that grants identity, and it
@@ -468,9 +514,9 @@ describe("the capability an admin receives", () => {
     await hr.linkAccount(newAccount, employeeId);
 
     expect(await appUi(newAccount, false).whoAmI())
-      .toEqual({ accountId: newAccount, linked: true, employeeId });
+      .toEqual({ accountId: newAccount, linked: true, employeeId, language: null });
     expect(await appUi(oldAccount, false).whoAmI())
-      .toEqual({ accountId: oldAccount, linked: false, employeeId: null });
+      .toEqual({ accountId: oldAccount, linked: false, employeeId: null, language: null });
   });
 });
 
@@ -1252,7 +1298,8 @@ describe("the frame the Workshop hosts", () => {
     // The bundle, not the un-built source: an iframe served the source would fetch nothing.
     expect(frame.iframeHtml).toContain("Generated from packages/gatekeeper-kintai/app");
     expect(frame.iframeHtml).not.toContain('src="./main.tsx"');
-    expect(await frame.ui.whoAmI()).toEqual({ accountId, linked: false, employeeId: null });
+    expect(await frame.ui.whoAmI())
+      .toEqual({ accountId, linked: false, employeeId: null, language: null });
   });
 
   // The role decides the BUNDLE, server-side, in the same expression it decides the capability —

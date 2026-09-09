@@ -46,6 +46,17 @@ export type SubmissionKind = (typeof SUBMISSION_KINDS)[number];
 /** How a punch entered the record. See `SUBMISSION_KINDS` for why this is an array. */
 export const PUNCH_SOURCES = ["gadget", "admin", "import", "amendment"] as const;
 export type PunchSource = (typeof PUNCH_SOURCES)[number];
+
+/**
+ * The languages either app-UI screen can render, written once as values, for the same reason
+ * `SUBMISSION_KINDS` above is: `account_preferences.language` is a foreign key onto a seeded
+ * lookup table (`ui_languages`) rather than a CHECK constraint, so the set has to exist as
+ * database rows as well as a TypeScript union, and `schema.ts` seeds the rows from this exact
+ * array. `@validateRpc()` on `setLanguage` refuses anything outside the union before the store is
+ * ever asked, and the lookup table is the backstop behind that.
+ */
+export const UI_LANGUAGES = ["en", "ja"] as const;
+export type UiLanguage = (typeof UI_LANGUAGES)[number];
 export type LocationSource = "gps" | "denied" | "unavailable" | "manual";
 export type SubmissionState = "draft" | "pending" | "approved" | "rejected" | "withdrawn";
 export type ApprovalAction = "approve" | "reject" | "return";
@@ -82,6 +93,21 @@ export type KintaiIdentity = {
   accountId: string;
   linked: boolean;
   employeeId: EmployeeId | null;
+  /**
+   * The caller's own saved UI language, or `null` if they have never chosen one. Read by
+   * `identify()` off `account_preferences`, keyed on `accountId` — see that table's comment in
+   * `schema.ts` for why the key is the account and not the employee. `null` is not a default: the
+   * page decides what to show a caller who has never chosen (the browser's own language), and
+   * conflating "never chosen" with "chose English" would make that decision impossible to tell
+   * from a real one.
+   *
+   * OPTIONAL ON THE TYPE, never on the wire: `identify()` always sets this key, `null` included,
+   * on every `whoAmI()` response — the RPC surface pin in `admin-api.test.ts` checks for the key
+   * by name. The `?` exists only so the older `whoAmI` mocks in `app/AdminPage.test.tsx` and
+   * `app/EmployeePage.test.tsx` keep compiling without this task editing `app/`; the screens that
+   * consume `language` are later work (see the i18n design doc) and will read it explicitly.
+   */
+  language?: UiLanguage | null;
 };
 
 /**
@@ -480,4 +506,9 @@ export type KintaiEmployeeClient = {
   listMySubmissions(): Promise<SubmissionRow[]>;
   withdrawSubmission(submissionId: number): Promise<void>;
   resubmit(submissionId: number): Promise<void>;
+  // `setLanguage` is NOT here yet, deliberately: this type is the app-facing mirror of
+  // `EmployeeKintaiApi`'s callable surface, and this task's brief scopes app/ changes to the tasks
+  // that build the dictionary and wire up the toggle -- see the i18n design doc. The method exists
+  // on the real capability (`EmployeeKintaiApi.setLanguage`, `kintai.ts`) starting this task; it
+  // joins this mirror when a screen first calls it.
 };

@@ -1,7 +1,8 @@
 import { RpcTarget } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import type {
-  ApprovalAction, EmployeeId, KintaiIdentity, RosterEntry, SubmissionState, WorkDatePolicy,
+  ApprovalAction, EmployeeId, KintaiIdentity, RosterEntry, SubmissionState, UiLanguage,
+  WorkDatePolicy,
 } from "./types.js";
 import type { NewEmployee } from "./store/employees.js";
 import { EmployeeNotFoundError } from "./store/employees.js";
@@ -87,6 +88,13 @@ export interface KintaiAdminApi {
    * capability already is.
    */
   whoAmI(): Promise<KintaiIdentity>;
+
+  /**
+   * Save the caller's own UI language. Identity from the capability, like everywhere else on this
+   * package — there is no account or employee argument, so nobody can set anyone's language but
+   * their own. See `AdminKintaiApi.setLanguage`.
+   */
+  setLanguage(language: UiLanguage): Promise<void>;
 
   /**
    * The whole roster, with the computed columns HR reads it for. Admin only — this is the
@@ -283,7 +291,8 @@ export async function identify(
   store: DurableObjectStub<KintaiStore>, accountId: string,
 ): Promise<KintaiIdentity> {
   const employeeId = await store.resolveAccount(accountId, Date.now());
-  return { accountId, linked: employeeId !== null, employeeId };
+  const language = await store.languageFor(accountId);
+  return { accountId, linked: employeeId !== null, employeeId, language };
 }
 
 /**
@@ -307,6 +316,22 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
 
   async whoAmI(): Promise<KintaiIdentity> {
     return identify(this.#store, this.#accountId);
+  }
+
+  /**
+   * Save the caller's own UI language, keyed on `this.#accountId` — never an argument, so there is
+   * nothing for a caller to name but themselves.
+   *
+   * `language` is not re-checked here: it is `UiLanguage`, a string-literal union, and
+   * `@validateRpc()` refuses anything outside it before this body runs — the same reason
+   * `setWorkDatePolicy` above does not re-check its own literal union either. No `appendAudit`
+   * call, unlike every other mutation on this class: a UI language is a personal display
+   * preference, not an administrative act over the org or its records, so `audit_log` — which
+   * exists to record authority-relevant change — has nothing to say about it. See the doc comment
+   * on `account_preferences` in `schema.ts`.
+   */
+  async setLanguage(language: UiLanguage): Promise<void> {
+    await this.#store.setLanguage(this.#accountId, language, Date.now());
   }
 
   /**

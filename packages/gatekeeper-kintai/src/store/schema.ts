@@ -7,7 +7,7 @@
 // punches, approval_events and audit_log are append-only: corrections insert a new row rather
 // than updating an existing one. See the design doc's data model section.
 
-import { PUNCH_SOURCES, SUBMISSION_KINDS } from "../types.js";
+import { PUNCH_SOURCES, SUBMISSION_KINDS, UI_LANGUAGES } from "../types.js";
 
 /** Whether `table` already has `column`. The test every ADD COLUMN below is guarded by. */
 export function hasColumn(sql: SqlStorage, table: string, column: string): boolean {
@@ -80,6 +80,36 @@ export function applySchema(sql: SqlStorage): void {
   for (const source of PUNCH_SOURCES) {
     sql.exec(`INSERT OR IGNORE INTO punch_sources (source) VALUES (?)`, source);
   }
+
+  // A third growing enumeration, same rule as the two above: `account_preferences.language` is a
+  // foreign key onto this lookup table rather than a CHECK, seeded from `UI_LANGUAGES` in
+  // `src/types.ts` so the seed and the type cannot disagree. Adding a language (the design doc's
+  // "adding one is a dictionary file plus a row in UI_LANGUAGES") is an edit there, not a migration
+  // here.
+  sql.exec(`CREATE TABLE IF NOT EXISTS ui_languages (code TEXT PRIMARY KEY) STRICT`);
+  for (const code of UI_LANGUAGES) {
+    sql.exec(`INSERT OR IGNORE INTO ui_languages (code) VALUES (?)`, code);
+  }
+
+  // Keyed on the OPAQUE ACCOUNT ID, not on `employees.id`, and that is the whole design of this
+  // table. Every other per-person setting in this file (`work_date_policy`, `exemption_periods`)
+  // is a column or a row on the employee record, because those are administrative facts about
+  // someone's employment. A UI language is not: it is a preference about how one browser session
+  // reads a screen, and it has to be answerable BEFORE HR has linked the account to anyone —
+  // `identify()` calls this for every caller, including an unlinked one, on the same `whoAmI` that
+  // is the one thing an unlinked account may call. Keying it on `employees.id` would make an
+  // unlinked person's choice unrecordable and would forget it the moment an account is re-linked
+  // to a different employee record, which is exactly the account holder it must NOT forget.
+  //
+  // No audit row for a write here, unlike every mutating admin method in this package: a personal
+  // display preference is not an administrative act over the org or its records — nobody's
+  // authority, pay, or attendance changes because of it — so `audit_log`, which exists to record
+  // authority-relevant change, has nothing to say about it.
+  sql.exec(`CREATE TABLE IF NOT EXISTS account_preferences (
+    account_id TEXT PRIMARY KEY,
+    language TEXT NOT NULL REFERENCES ui_languages(code),
+    updated_at INTEGER NOT NULL
+  ) STRICT`);
 
   assertSchemaCurrent(sql);
 

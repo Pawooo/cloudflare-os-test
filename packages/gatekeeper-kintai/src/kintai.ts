@@ -26,7 +26,7 @@ import type {
   VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type {
-  ApprovalAction, EmployeeId, EmployeeMonth, KintaiIdentity, PunchKind, PunchReceipt,
+  ApprovalAction, EmployeeId, EmployeeMonth, KintaiIdentity, PunchKind, PunchReceipt, UiLanguage,
 } from "./types.js";
 import type { AllocationEntry, AllocationRow, Reconciliation } from "./store/allocations.js";
 import type { PunchLocation, PunchRow } from "./store/punches.js";
@@ -2009,6 +2009,21 @@ export class EmployeeKintaiApi extends RpcTarget {
     const now = Date.now();
     const actorId = await this.#requireEmployee(now);
     await this.#store.resubmit(submissionId, actorId, now);
+  }
+
+  /**
+   * Save the caller's own UI language, keyed on `this.#accountId` and not on an employee record —
+   * see `account_preferences` in `schema.ts`. Deliberately NOT behind `#requireEmployee`: an
+   * unlinked account may still choose a language, the same way it may still call `whoAmI`, because
+   * the choice is about which language this browser reads in, not about anything HR has recorded.
+   *
+   * `language` is `UiLanguage`, a string-literal union, so `@validateRpc()` refuses anything
+   * outside it before this body runs — mirroring `AdminKintaiApi.setLanguage`, which this method
+   * is the employee-facing twin of. No `appendAudit` call, for the same reason that one has none:
+   * a personal display preference is not an administrative act.
+   */
+  async setLanguage(language: UiLanguage): Promise<void> {
+    await this.#store.setLanguage(this.#accountId, language, Date.now());
   }
 
   /**

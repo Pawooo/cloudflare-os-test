@@ -16,6 +16,7 @@ import {
   type AccountLinkRow, type EmployeeLabel, type EmployeeProfile, type EmployeeRow,
   type NewEmployee,
 } from "./employees.js";
+import { languageFor, setLanguage } from "./preferences.js";
 import { listRoster } from "./roster.js";
 import {
   anomalousDays, employeeDay, employeeMonth, monthlyTotals, pendingOverview,
@@ -45,7 +46,7 @@ import {
 import { assertWritable, isLocked, lockPeriod, periodLock, type PeriodLock } from "./periods.js";
 import { appendAudit, auditEntries, type AuditEntry, type AuditRow } from "./audit.js";
 import type {
-  EmployeeId, PunchKind, RosterEntry, SubmissionState, WorkDatePolicy,
+  EmployeeId, PunchKind, RosterEntry, SubmissionState, UiLanguage, WorkDatePolicy,
 } from "../types.js";
 
 @validateRpc()
@@ -490,6 +491,16 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
   /** The lock record for `period`, or null if it isn't locked. See `periodLock`. */
   async periodLock(period: string): Promise<PeriodLock | null> {
     return periodLock(this.sql, period);
+  }
+
+  /** The caller's own saved UI language, or null if never chosen. See `languageFor`. */
+  async languageFor(accountId: string): Promise<UiLanguage | null> {
+    return languageFor(this.sql, accountId);
+  }
+
+  /** Record the caller's UI language, keyed on the account. See `setLanguage`. */
+  async setLanguage(accountId: string, language: UiLanguage, now: number): Promise<void> {
+    setLanguage(this.sql, accountId, language, now);
   }
 
   async appendAudit(entry: AuditEntry): Promise<void> {

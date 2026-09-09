@@ -8,6 +8,9 @@ describe("kintai schema", () => {
 
     expect(tables).toEqual([
       "account_links",
+      // One row per account, keyed on the opaque account id rather than the employee -- a
+      // personal display preference, not a fact about employment. See its comment in `schema.ts`.
+      "account_preferences",
       // What a correction request asks for, keyed one-to-one on the submission carrying its
       // approval. Created after both `submissions` and `punches`, which it references.
       "amendment_requests",
@@ -23,13 +26,14 @@ describe("kintai schema", () => {
       // Location is its own table so a coordinate purge never has to touch the append-only
       // punches row. `punch_locations` sorts before `punches` ('_' < 'e').
       "punch_locations",
-      // The two growing enumerations. Lookup tables rather than CHECK constraints, so adding a
+      // The three growing enumerations. Lookup tables rather than CHECK constraints, so adding a
       // value is an INSERT and never a table rebuild. See `applySchema`.
       "punch_sources",
       "punches",
       "sites",
       "submission_kinds",
       "submissions",
+      "ui_languages",
     ]);
   });
 
