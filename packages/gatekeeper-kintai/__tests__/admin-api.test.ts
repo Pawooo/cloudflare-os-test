@@ -1311,17 +1311,23 @@ describe("the frame the Workshop hosts", () => {
     const employeeFrame = await host.openAppUi(`acct-bundle-emp-${seq}`, false);
     const adminFrame = await host.openAppUi(`acct-bundle-hr-${seq}`, true);
 
-    // The tab-bar LABELS are the markers, each a literal present in one bundle and absent from the
-    // other: the employee gadget's 今日 / 今月, the admin dashboard's 要対応. (The `tab-*` testids
-    // are built at runtime — `data-testid={`tab-${id}`}` — so they are no literal to grep for; the
-    // labels are.) Present-in-one AND absent-from-the-other on both sides is what proves the role
+    // The PANEL ids are the markers — `panel-today` from `data-testid="panel-today"` in
+    // `EmployeePage.tsx`, `panel-overview` from `AdminPage.tsx` — each a literal in one page's own
+    // JSX and in no other. Quoted, because what is inlined here is the minified JS that builds the
+    // markup, where the id survives as a string and the attribute name does not. Present-in-one AND absent-from-the-other on both sides is what proves the role
     // picked the bundle, rather than one bundle that happens to carry both surfaces.
-    expect(employeeFrame.iframeHtml).toContain("今日");
-    expect(employeeFrame.iframeHtml).toContain("今月");
-    expect(employeeFrame.iframeHtml).not.toContain("要対応");
+    //
+    // NOT the tab-bar labels, which is what this used to grep for. Since the i18n work both
+    // bundles inline the same dictionary (`app/i18n/messages.ts`), so every screen's words are in
+    // both files whether that screen is in the bundle or not: 要対応 ships in the employee gadget
+    // as a string the employee gadget never renders. Copy stopped distinguishing the bundles the
+    // moment there was one dictionary; the markup each page builds still does.
+    expect(employeeFrame.iframeHtml).toContain('"panel-today"');
+    expect(employeeFrame.iframeHtml).toContain('"panel-month"');
+    expect(employeeFrame.iframeHtml).not.toContain('"panel-overview"');
 
-    expect(adminFrame.iframeHtml).toContain("要対応");
-    expect(adminFrame.iframeHtml).not.toContain("今日");
+    expect(adminFrame.iframeHtml).toContain('"panel-overview"');
+    expect(adminFrame.iframeHtml).not.toContain('"panel-today"');
 
     // The capability handed alongside agrees with the bundle: the employee stub answers `whoAmI`
     // but has no admin `listEmployees` to call, and the admin stub does. `appUi` re-opens the frame
