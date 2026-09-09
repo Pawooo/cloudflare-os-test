@@ -29,6 +29,14 @@
         .matches
         ? "dark"
         : "light";
+      // The same first-byte guess the theme above makes, for the same reason: `lang="en"` in the
+      // markup would be a claim about a document that has not decided its language yet, and this
+      // page's first render waits on `whoAmI()` for the choice saved against the account.
+      // `LanguageProvider` owns the attribute from then on and overwrites this — including when the
+      // saved choice disagrees with the browser — so this is only about the frames before React.
+      document.documentElement.lang = (navigator.language || "").toLowerCase().startsWith("ja")
+        ? "ja"
+        : "en";
     </script>
   </head>
   <body>

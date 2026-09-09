@@ -1,9 +1,9 @@
 import React, { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it } from "vitest";
-import type { PunchRow, UiLanguage } from "../src/types";
+import type { PunchRow } from "../src/types";
 import { PunchSource } from "./PunchSource";
-import { LanguageProvider, en, ja } from "./i18n";
+import { en, ja } from "./i18n";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -24,17 +24,12 @@ describe("PunchSource", () => {
     root = undefined;
   });
 
-  /**
-   * One explicit language per render, 日本語 by default. `PunchSource` reads the language off the
-   * provider (`useT()`) rather than taking a prop, so that the admin drill-down and 今日 both get
-   * their own screen's language without either call site passing anything.
-   */
-  async function render(element: React.ReactNode, language: UiLanguage = "ja"): Promise<void> {
+  async function render(element: React.ReactNode): Promise<void> {
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
     await act(async () => {
-      root!.render(<LanguageProvider initial={language}>{element}</LanguageProvider>);
+      root!.render(element);
     });
   }
 
@@ -70,10 +65,18 @@ describe("PunchSource", () => {
   // The same punch on an English screen says it in English — the provenance line follows the
   // screen's language like every other word on it, and neither language leaks into the other.
   it("renders the same punch in English on an English screen", async () => {
-    await render(<PunchSource punch={punch({ source: "gadget" })} />, "en");
+    await render(<PunchSource punch={punch({ source: "gadget" })} t={en} />);
 
     expect(container!.textContent).toContain(en.punchSource.gadget);
     expect(container!.textContent).not.toContain(ja.punchSource.gadget);
+  });
+
+  // The default is what keeps the admin day drill-down readable until that screen has a provider
+  // of its own to ask: 日本語, and out of the dictionary rather than out of literals in the module.
+  it("falls back to 日本語 for a call site that passes no dictionary", async () => {
+    await render(<PunchSource punch={punch({ source: "gadget" })} />);
+
+    expect(container!.textContent).toBe(ja.punchSource.gadget);
   });
 
   it("builds the amendment sentence out of the dictionary, in the screen's language", async () => {

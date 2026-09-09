@@ -1,4 +1,5 @@
 import type { PunchRow } from "../src/types";
+import { ja, type Messages } from "./i18n";
 
 /**
  * How a punch got into the record, in words an HR reader can act on — never the raw value stored
@@ -24,28 +25,32 @@ import type { PunchRow } from "../src/types";
  *
  * An unrecognised `source` falls through to the raw string rather than blanking or throwing: a
  * worker-side source addition must surface visibly on this screen, not disappear from it.
+ *
+ * `t` is passed rather than read from the context, because this half is a pure function a test can
+ * call with either dictionary; the component below is what reaches for the screen's language.
  */
 export function describePunchSource(
   punch: Pick<PunchRow, "source" | "amended_by" | "amend_reason">,
+  t: Messages,
   resolveApprover?: (id: number) => string,
 ): string {
   switch (punch.source) {
     case "gadget":
-      return "本人打刻";
+      return t.punchSource.gadget;
     case "amendment": {
       const approver =
         punch.amended_by === null
-          ? "不明"
+          ? t.punchSource.unknownApprover
           : resolveApprover
             ? resolveApprover(punch.amended_by)
             : `#${punch.amended_by}`;
-      const reason = punch.amend_reason ?? "理由未記載";
-      return `修正 (承認: ${approver}, 理由: ${reason})`;
+      const reason = punch.amend_reason ?? t.punchSource.noReason;
+      return t.punchSource.amendment(approver, reason);
     }
     case "admin":
-      return "管理者による記録 (admin)";
+      return t.punchSource.admin;
     case "import":
-      return "取り込み (import)";
+      return t.punchSource.import;
     default:
       return punch.source;
   }
@@ -54,15 +59,27 @@ export function describePunchSource(
 /**
  * Drop-in replacement for `{punch.source}` — same wrapper, human wording. Pure and display-only:
  * no capability, no control, nothing for the sandbox rules to say anything about.
+ *
+ * `t` IS A PROP AND NOT `useT()`, and the default is transitional. This component renders on both
+ * screens, and only the employee screen has a `<LanguageProvider>` above it so far: `useT()` throws
+ * outside one by design, so reaching for the context here would turn the admin day drill-down into
+ * a crashed panel until the admin screen is migrated. The default keeps that panel exactly as it
+ * reads today — 日本語, out of the dictionary rather than out of literals in this file — and the
+ * admin migration passes its own `t` and deletes the default, at which point the prop is required
+ * and nothing can silently pick a language again.
  */
 export function PunchSource(
-  { punch, resolveApprover }: {
+  { punch, t = ja, resolveApprover }: {
     punch: Pick<PunchRow, "source" | "amended_by" | "amend_reason">;
+    /** The screen's language. Omitted only by a screen that has no provider above it yet. */
+    t?: Messages;
     /** Turn an approver's employee id into a name; omitted where no roster is at hand (`#id` shows). */
     resolveApprover?: (id: number) => string;
   },
 ) {
   return (
-    <span className="ml-2 text-kumo-inactive">{describePunchSource(punch, resolveApprover)}</span>
+    <span className="ml-2 text-kumo-inactive">
+      {describePunchSource(punch, t, resolveApprover)}
+    </span>
   );
 }

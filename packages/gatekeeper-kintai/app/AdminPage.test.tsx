@@ -5,6 +5,7 @@ import type {
   AnomalousDay, MonthlyReport, MonthlyTotalRow, PendingItem, PunchRow, RosterEntry,
 } from "../src/types";
 import AdminPage, { type KintaiAdminClient } from "./AdminPage";
+import { ja } from "./i18n";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -880,7 +881,10 @@ describe("AdminPage", () => {
         expect(detail.textContent).toContain("in");
         expect(detail.textContent).toContain("09:00");
         expect(detail.textContent).toContain("18:30");
-        expect(detail.textContent).toContain("admin");
+        // The provenance line comes out of the shared dictionary now (`PunchSource`), and this
+        // screen has no provider of its own yet, so it reads 日本語 exactly as it did before —
+        // minus the "(admin)" the dictionary dropped. Asserted through the key, not the wording.
+        expect(detail.textContent).toContain(ja.punchSource.admin);
         expect(detail.textContent).toContain("8h 30m");
       });
 

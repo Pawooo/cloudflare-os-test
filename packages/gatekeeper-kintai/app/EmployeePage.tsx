@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type {
-  EmployeeMonth, EmployeeMonthDay, KintaiEmployeeClient, PunchKind, PunchRow, SubmissionState,
+  EmployeeMonth, EmployeeMonthDay, KintaiEmployeeClient, PunchKind, PunchRow,
 } from "../src/types";
 import { jstClockTime, jstWorkDate } from "../src/work-date";
 import { describeFailure } from "./errors";
+import { useT } from "./i18n";
+import { LanguageToggle } from "./i18n/LanguageToggle";
 import { PunchSource } from "./PunchSource";
 
 /**
@@ -19,15 +21,28 @@ type Tab = "today" | "month";
  * A tab bar and two panels, both mounted from the first render and hidden rather than unmounted
  * (matching `AdminPage`), so switching tabs never remounts a panel or drops the read it holds. 今日
  * is live (this task); 今月 is still a placeholder (Task 6).
+ *
+ * ONE LANGUAGE, and the page does not choose it: `employee-main.tsx` resolves it from the account's
+ * saved choice and the browser's own preference, and every word below comes off `useT()`. The
+ * toggle that changes it sits in the header — the only control here that is not about attendance,
+ * and the only one whose effect is the whole screen at once.
  */
 export default function EmployeePage({ api }: { api: KintaiEmployeeClient }) {
   const [tab, setTab] = useState<Tab>("today");
+  const t = useT();
 
   return (
     <main className="mx-auto flex min-h-full w-full max-w-4xl flex-col gap-8 px-5 py-10 sm:px-8 sm:py-12">
-      <header>
-        <h1 className="text-2xl font-semibold tracking-tight text-kumo-default">Kintai</h1>
-        <p className="mt-1 text-sm text-kumo-subtle">Your attendance and overtime.</p>
+      {/* Title left, the language toggle hard right — a row, so the control keeps the trailing edge
+          whatever the subtitle's length in either language. */}
+      <header className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight text-kumo-default">
+            {t.header.appName}
+          </h1>
+          <p className="mt-1 text-sm text-kumo-subtle">{t.header.employeeSubtitle}</p>
+        </div>
+        <LanguageToggle api={api} />
       </header>
 
       <TabBar tab={tab} onSelect={setTab} />
@@ -43,22 +58,26 @@ export default function EmployeePage({ api }: { api: KintaiEmployeeClient }) {
   );
 }
 
-const TABS: { id: Tab; label: string }[] = [
-  { id: "today", label: "今日" },
-  { id: "month", label: "今月" },
-];
-
 /**
  * The two panels' tab bar.
  *
  * Buttons, not links and not a `<select>`, for the same reason `AdminPage`'s `TabBar` uses them:
  * nothing here navigates or submits, so the host sandbox's missing `allow-forms` is no concern, and
  * `type="button"` keeps the control inert if it is ever moved inside a `<form>`.
+ *
+ * The tab list is built per render off `t` rather than held in a module const: a const would have
+ * frozen one language's words at import time, before any provider existed to ask.
  */
 function TabBar({ tab, onSelect }: { tab: Tab; onSelect: (tab: Tab) => void }) {
+  const t = useT();
+  const tabs: { id: Tab; label: string }[] = [
+    { id: "today", label: t.tabs.today },
+    { id: "month", label: t.tabs.month },
+  ];
+
   return (
     <div role="tablist" className="flex gap-2 border-b border-kumo-line pb-px">
-      {TABS.map(({ id, label }) => {
+      {tabs.map(({ id, label }) => {
         const active = tab === id;
         return (
           <button
@@ -82,32 +101,14 @@ function TabBar({ tab, onSelect }: { tab: Tab; onSelect: (tab: Tab) => void }) {
   );
 }
 
-/** How each punch kind reads on a button an employee presses. */
-const PUNCH_LABELS: Record<PunchKind, string> = {
-  in: "出勤",
-  out: "退勤",
-  break_start: "休憩開始",
-  break_end: "休憩終了",
-};
-
-/**
- * How each anomaly flag reads to a human on the employee's own day.
- *
- * The keys are the strings `dayAnomalies` pushes, and an unknown one falls through to the flag
- * itself rather than to nothing — a flag added on the worker side must surface as an ugly line
- * rather than as a day that looks clean. This is a deliberate parallel to `OverviewTab`'s own
- * `ANOMALY_LABELS`: the flags are plain wire strings both screens translate, and the two maps say
- * the same thing about the same flag. A shared module is the eventual home; keeping a second small
- * copy here is scoped to this task rather than reaching into the admin tab to extract one.
+/*
+ * WHERE THE LABEL MAPS WENT. `PUNCH_LABELS`, `ANOMALY_LABELS` and `OVERTIME_STATE_LABELS` were
+ * module consts here; they are now `t.labels.punchKinds`, `t.labels.anomalies` and
+ * `t.labels.overtimeStates` in `app/i18n/messages.ts`, one map per wire enumeration across both
+ * screens instead of one copy per screen. `t.labels.anomalies` is `Record<string, string>` in both
+ * dictionaries and every call site below keeps its `?? flag` fall-through, so an anomaly flag added
+ * on the worker side still surfaces as an ugly line rather than as a day that looks clean.
  */
-const ANOMALY_LABELS: Record<string, string> = {
-  unpaired_in: "退勤打刻なし",
-  unpaired_break: "休憩終了の打刻なし",
-  orphan_out: "出勤打刻のない退勤",
-  duplicate_in: "出勤打刻の重複",
-  negative_gross: "休憩が労働時間を超過",
-  long_span: "14時間以上の勤務",
-};
 
 /**
  * The legal next punches, read off the day's current punches the SAME way the store's `pairSpans`
@@ -152,10 +153,20 @@ type DayRead = Awaited<ReturnType<KintaiEmployeeClient["getDay"]>>;
  * the punches below it are the day the read was taken for.
  */
 function TodayPanel({ api }: { api: KintaiEmployeeClient }) {
+  const t = useT();
   const [today] = useState(() => jstWorkDate(Date.now()));
   const [reloadToken, setReloadToken] = useState(0);
   const reload = useCallback(() => setReloadToken((count) => count + 1), []);
-  const [state, setState] = useState<{ day?: DayRead; error?: string }>({});
+  /*
+   * The FAILURE is held, not the sentence it is described by.
+   *
+   * `describeFailure` needs `t`, and putting `t` inside this read effect would have made the
+   * language a dependency of the read: a toggle would re-run the RPC, or — worse, with the
+   * dependency omitted — leave the message frozen in the language it was written in. Keeping the
+   * caught value and describing it at render time means a switch retranslates an error already on
+   * screen, and the read effect stays about reading.
+   */
+  const [state, setState] = useState<{ day?: DayRead; failure?: { caught: unknown } }>({});
 
   const live = useRef(true);
   const readId = useRef(0);
@@ -171,18 +182,20 @@ function TodayPanel({ api }: { api: KintaiEmployeeClient }) {
         const day = await api.getDay(today);
         if (live.current && id === readId.current) setState({ day });
       } catch (caught) {
-        if (live.current && id === readId.current) {
-          setState({ error: describeFailure(caught, "今日の打刻を読み込めませんでした。") });
-        }
+        if (live.current && id === readId.current) setState({ failure: { caught } });
       }
     })();
   }, [api, today, reloadToken]);
 
-  if (state.error !== undefined) {
-    return <p className="text-sm text-kumo-danger" role="alert">{state.error}</p>;
+  if (state.failure !== undefined) {
+    return (
+      <p className="text-sm text-kumo-danger" role="alert">
+        {describeFailure(state.failure.caught, t.errors.fallbacks.readToday)}
+      </p>
+    );
   }
   if (state.day === undefined) {
-    return <p className="text-sm text-kumo-subtle">読み込み中…</p>;
+    return <p className="text-sm text-kumo-subtle">{t.common.loading}</p>;
   }
 
   const { punches, anomalies } = state.day;
@@ -192,10 +205,10 @@ function TodayPanel({ api }: { api: KintaiEmployeeClient }) {
       <ShiftControl api={api} punches={punches} reload={reload} live={live} />
 
       <section>
-        <h2 className="text-sm font-medium text-kumo-default">今日の打刻</h2>
+        <h2 className="text-sm font-medium text-kumo-default">{t.today.heading}</h2>
         {punches.length === 0 ? (
           <p className="mt-2 text-sm text-kumo-subtle" data-testid="today-empty">
-            今日はまだ打刻がありません
+            {t.today.emptyDay}
           </p>
         ) : (
           <ul className="mt-2 flex flex-col gap-0.5">
@@ -205,13 +218,13 @@ function TodayPanel({ api }: { api: KintaiEmployeeClient }) {
                 className="font-mono text-xs text-kumo-default"
                 data-testid="punch"
               >
-                {jstClockTime(punch.occurred_at)} {PUNCH_LABELS[punch.kind] ?? punch.kind}
+                {jstClockTime(punch.occurred_at)} {t.labels.punchKinds[punch.kind] ?? punch.kind}
                 {/* No `resolveApprover`: `amended_by` is the APPROVER — a manager, not the viewing
                     employee — and this screen has no roster to name one against. `whoAmI` carries
                     the viewer's own id but no display name, and an employee never approves their
                     own amendment, so even a self-match would not apply. `#id` is the honest label
                     here; the prop stays a no-op fallback. */}
-                <PunchSource punch={punch} />
+                <PunchSource punch={punch} t={t} />
               </li>
             ))}
           </ul>
@@ -221,7 +234,7 @@ function TodayPanel({ api }: { api: KintaiEmployeeClient }) {
       {anomalies.length > 0 && (
         <section data-testid="today-anomalies">
           <p className="text-xs text-kumo-danger" data-testid="today-flags">
-            {anomalies.map((flag) => ANOMALY_LABELS[flag] ?? flag).join(" · ")}
+            {anomalies.map((flag) => t.labels.anomalies[flag] ?? flag).join(" · ")}
           </p>
           {anomalies.includes("unpaired_in") && (
             <MissingOutForm api={api} workDate={today} reload={reload} live={live} />
@@ -245,6 +258,7 @@ function ShiftControl(
     live: React.RefObject<boolean>;
   },
 ) {
+  const t = useT();
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
   const kinds = nextPunchKind(punches);
@@ -256,7 +270,7 @@ function ShiftControl(
       await api.punch(kind);
       if (live.current) reload();
     } catch (caught) {
-      if (live.current) setError(describeFailure(caught, "打刻できませんでした。"));
+      if (live.current) setError(describeFailure(caught, t.errors.fallbacks.punch));
     } finally {
       if (live.current) setBusy(false);
     }
@@ -283,7 +297,7 @@ function ShiftControl(
                 : "press rounded-lg border border-kumo-line bg-kumo-control px-4 py-2 text-sm font-medium text-kumo-default hover:bg-kumo-tint disabled:opacity-60"}
               onClick={() => void doPunch(kind)}
             >
-              {PUNCH_LABELS[kind]}
+              {t.labels.punchKinds[kind]}
             </button>
           );
         })}
@@ -315,6 +329,7 @@ function MissingOutForm(
     live: React.RefObject<boolean>;
   },
 ) {
+  const t = useT();
   const [time, setTime] = useState("");
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
@@ -334,11 +349,13 @@ function MissingOutForm(
       const occurredAt = Date.parse(`${workDate}T${time}:00+09:00`);
       await api.requestMissingPunch(workDate, "out", occurredAt, reason);
       if (live.current) {
-        setNotice({ ok: "申請しました・承認待ち" });
+        setNotice({ ok: t.today.missingOut.filed });
         reload();
       }
     } catch (caught) {
-      if (live.current) setNotice({ error: describeFailure(caught, "申請できませんでした。") });
+      if (live.current) {
+        setNotice({ error: describeFailure(caught, t.errors.fallbacks.fileRequest) });
+      }
     } finally {
       if (live.current) setBusy(false);
     }
@@ -346,7 +363,7 @@ function MissingOutForm(
 
   return (
     <div className="mt-3 rounded-lg bg-kumo-tint px-3 py-3">
-      <p className="text-xs text-kumo-subtle">退勤の打刻漏れを申請します。</p>
+      <p className="text-xs text-kumo-subtle">{t.today.missingOut.intro}</p>
       {/* Each field is a column — caption ABOVE its input, `htmlFor` pointing at it — and the row
           aligns on the bottom edge so the two inputs and the button sit on one line whatever the
           caption lengths. The earlier inline captions with an `ml-2` input inside them put the
@@ -354,7 +371,7 @@ function MissingOutForm(
       <div className="mt-2 flex flex-wrap items-end gap-3">
         <div className="flex flex-col gap-1">
           <label htmlFor={timeId} className="text-xs font-medium text-kumo-default">
-            実際の退勤時刻
+            {t.today.missingOut.timeLabel}
           </label>
           <input
             id={timeId}
@@ -368,13 +385,13 @@ function MissingOutForm(
         </div>
         <div className="flex min-w-48 flex-1 flex-col gap-1">
           <label htmlFor={reasonId} className="text-xs font-medium text-kumo-default">
-            理由
+            {t.today.missingOut.reasonLabel}
           </label>
           <input
             id={reasonId}
             type="text"
             data-testid="correction-reason"
-            placeholder="例: 退勤時に打刻を忘れました"
+            placeholder={t.today.missingOut.reasonPlaceholder}
             value={reason}
             onChange={(event) => setReason(event.target.value)}
             className="w-full rounded border border-kumo-line bg-kumo-control px-2 py-1.5 text-sm text-kumo-default placeholder:text-kumo-inactive"
@@ -387,13 +404,13 @@ function MissingOutForm(
           className="press rounded-lg border border-kumo-line bg-kumo-control px-3 py-1.5 text-sm font-medium text-kumo-default hover:bg-kumo-tint disabled:opacity-60"
           onClick={() => void file()}
         >
-          退勤の打刻漏れを申請
+          {t.today.missingOut.submit}
         </button>
       </div>
       {/* A `type="time"` input ignores `placeholder` in most browsers, so the time field's guidance
           is visible text it is described by, not a placeholder that never shows. */}
       <p id={hintId} data-testid="correction-time-hint" className="mt-1.5 text-[11px] text-kumo-subtle">
-        実際に職場を離れた時刻を入力してください（例 18:30）。理由は承認する人が読みます。
+        {t.today.missingOut.hint}
       </p>
       {notice?.ok !== undefined && (
         <p className="mt-2 text-xs text-kumo-success" data-testid="correction-notice">
@@ -409,35 +426,19 @@ function MissingOutForm(
   );
 }
 
-/**
- * How each overtime state reads to the employee whose request it is.
+/*
+ * `OVERTIME_STATE_LABELS` is now `t.labels.overtimeStates` — the same five `SubmissionState` keys,
+ * in both languages, and the call site keeps its fall-through so a state added on the worker side
+ * surfaces as an ugly word rather than as a request that looks stateless. Every one of them names
+ * a CLAIM, which is why the panel carries `t.month.claimsNote` beside them.
  *
- * The keys are `SubmissionState`; an unknown one falls through to the raw state rather than to
- * nothing, on the same principle as `ANOMALY_LABELS` above — a state added on the worker side must
- * surface as an ugly word, never as a request that looks stateless. Every one of these is a CLAIM,
- * which is why the panel carries a standing line saying so; the label names where in approval the
- * claim currently sits, not what will be paid.
+ * `formatHoursMinutes` is now `t.labels.durations.full` — always both units (`8h 15m`,
+ * `8時間15分`), the convention 月次 uses, because both columns here are numbers a reader runs their
+ * eye down and `8h` beside `8h 15m` makes the column ragged. It moved into the dictionary because
+ * the two languages are not one format with the units swapped, and neither language's version is
+ * arithmetic this screen performs: `workedMinutes` is decided in `store/punches.ts` and the
+ * overtime figure is the request's own.
  */
-const OVERTIME_STATE_LABELS: Record<SubmissionState, string> = {
-  draft: "下書き",
-  pending: "承認待ち",
-  approved: "承認済み",
-  rejected: "却下",
-  withdrawn: "取り下げ",
-};
-
-/**
- * `8h 15m`, and always both units — the 月次 convention (`formatWorkedHours`), not `OverviewTab`'s
- * `formatDuration` which drops the empty half. Both the worked column and the overtime column are
- * numbers a reader runs their eye down, and `8h` beside `8h 15m` makes the column ragged.
- *
- * Arithmetic on a number that arrived already computed — `workedMinutes` in `store/punches.ts` is
- * the only place worked time is decided, and the overtime minutes are the request's own figure.
- * Nothing here recomputes anything.
- */
-function formatHoursMinutes(minutes: number): string {
-  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
-}
 
 /**
  * `period` moved by `delta` months, carrying across a year boundary.
@@ -471,9 +472,12 @@ function shiftMonth(period: string, delta: number): string {
  * on the 1st, which would silently turn the next button on for a month that has not started.
  */
 function MonthPanel({ api }: { api: KintaiEmployeeClient }) {
+  const t = useT();
   const [currentMonth] = useState(() => jstWorkDate(Date.now()).slice(0, 7));
   const [period, setPeriod] = useState(currentMonth);
-  const [state, setState] = useState<{ month?: EmployeeMonth; error?: string }>({});
+  // The caught failure, not the sentence — the same reason `TodayPanel` holds one: `t` must not
+  // become a dependency of the read.
+  const [state, setState] = useState<{ month?: EmployeeMonth; failure?: { caught: unknown } }>({});
   // Bumped when a correction is filed from a flagged row, so the month re-reads and the fixed day's
   // flag clears — the same reload-token pattern 今日 uses, and the reason the read effect below
   // lists it as a dependency.
@@ -498,9 +502,7 @@ function MonthPanel({ api }: { api: KintaiEmployeeClient }) {
         const someMonth = await api.myMonth(period);
         if (live.current && id === readId.current) setState({ month: someMonth });
       } catch (caught) {
-        if (live.current && id === readId.current) {
-          setState({ error: describeFailure(caught, "今月の勤怠を読み込めませんでした。") });
-        }
+        if (live.current && id === readId.current) setState({ failure: { caught } });
       }
     })();
   }, [api, period, reloadToken]);
@@ -511,7 +513,7 @@ function MonthPanel({ api }: { api: KintaiEmployeeClient }) {
         <button
           type="button"
           data-action="prev-month"
-          aria-label="前の月"
+          aria-label={t.common.prevMonth}
           className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-sm font-medium text-kumo-default hover:bg-kumo-tint"
           onClick={() => setPeriod((current) => shiftMonth(current, -1))}
         >
@@ -528,7 +530,7 @@ function MonthPanel({ api }: { api: KintaiEmployeeClient }) {
         <button
           type="button"
           data-action="next-month"
-          aria-label="次の月"
+          aria-label={t.common.nextMonth}
           /* Disabled AT the current month, not after it — there is no month past this one to read
              yet. Going backwards has no bound. The same rule 月次's next button follows. */
           disabled={period >= currentMonth}
@@ -543,7 +545,7 @@ function MonthPanel({ api }: { api: KintaiEmployeeClient }) {
           A pending number in a column headed 残業 reads as money owed unless something says
           otherwise, and this is that something. Pinned in a test so it cannot soften. */}
       <p data-testid="claims-note" className="text-xs text-kumo-subtle">
-        残業時間は承認待ちの申請であり、承認されるまで支給額ではありません — overtime shown here is a claim awaiting approval, not a payout.
+        {t.month.claimsNote}
       </p>
 
       <MonthTable state={state} api={api} reload={reload} live={live} />
@@ -554,17 +556,23 @@ function MonthPanel({ api }: { api: KintaiEmployeeClient }) {
 /** One row per day the employee has punches in the month. Table, not cards. */
 function MonthTable(
   { state, api, reload, live }: {
-    state: { month?: EmployeeMonth; error?: string };
+    state: { month?: EmployeeMonth; failure?: { caught: unknown } };
     api: KintaiEmployeeClient;
     reload: () => void;
     live: React.RefObject<boolean>;
   },
 ) {
-  if (state.error !== undefined) {
-    return <p className="text-sm text-kumo-danger" role="alert">{state.error}</p>;
+  const t = useT();
+
+  if (state.failure !== undefined) {
+    return (
+      <p className="text-sm text-kumo-danger" role="alert">
+        {describeFailure(state.failure.caught, t.errors.fallbacks.readMyMonth)}
+      </p>
+    );
   }
   if (state.month === undefined) {
-    return <p className="text-sm text-kumo-subtle">読み込み中…</p>;
+    return <p className="text-sm text-kumo-subtle">{t.common.loading}</p>;
   }
 
   const { period, days } = state.month;
@@ -576,7 +584,7 @@ function MonthTable(
         className="rounded-lg border border-dashed border-kumo-line px-4 py-6 text-center text-sm text-kumo-subtle"
         data-testid="month-empty"
       >
-        {period} には打刻がありません。
+        {t.month.empty(period)}
       </p>
     );
   }
@@ -588,10 +596,14 @@ function MonthTable(
       <table className="w-full border-collapse text-sm">
         <thead>
           <tr className="border-b border-kumo-line text-left text-xs text-kumo-subtle">
-            <th scope="col" className="py-2 pr-4 font-medium">日付</th>
-            <th scope="col" className="py-2 pr-4 text-right font-medium">労働時間</th>
-            <th scope="col" className="py-2 pr-4 text-right font-medium">残業</th>
-            <th scope="col" className="py-2 font-medium">要確認</th>
+            <th scope="col" className="py-2 pr-4 font-medium">{t.month.columns.date}</th>
+            <th scope="col" className="py-2 pr-4 text-right font-medium">
+              {t.month.columns.workedHours}
+            </th>
+            <th scope="col" className="py-2 pr-4 text-right font-medium">
+              {t.month.columns.overtime}
+            </th>
+            <th scope="col" className="py-2 font-medium">{t.month.columns.needsALook}</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-kumo-line">
@@ -612,6 +624,7 @@ function MonthDayRow(
     live: React.RefObject<boolean>;
   },
 ) {
+  const t = useT();
   const [open, setOpen] = useState(false);
   // A forgotten clock-out is the one flag a worker can fix themselves from here — it needs a 退勤
   // time. Other flags (an unclosed 休憩, say) are not resolvable by adding an `out`, so the row
@@ -623,22 +636,22 @@ function MonthDayRow(
       <tr data-month-day={day.workDate}>
         <td className="py-2 pr-4 font-mono text-kumo-default">{day.workDate}</td>
         <td className="py-2 pr-4 text-right font-mono text-kumo-default" data-testid="worked">
-          {formatHoursMinutes(day.workedMinutes)}
+          {t.labels.durations.full(day.workedMinutes)}
         </td>
         {/* A day with no request renders an EMPTY cell — never a zero, which in a 残業 column reads
             as a claim of no minutes owed rather than as the absence of a claim. */}
         <td className="py-2 pr-4 text-right font-mono text-kumo-default" data-testid="overtime">
           {day.overtime !== null && (
             <span>
-              {formatHoursMinutes(day.overtime.minutes)}
+              {t.labels.durations.full(day.overtime.minutes)}
               {" · "}
               <span className="text-kumo-subtle">
-                {OVERTIME_STATE_LABELS[day.overtime.state] ?? day.overtime.state}
+                {t.labels.overtimeStates[day.overtime.state] ?? day.overtime.state}
               </span>
             </span>
           )}
         </td>
-        {/* A marker only where the day is flagged, in plain language — the same `ANOMALY_LABELS`
+        {/* A marker only where the day is flagged, in plain language — the same `t.labels.anomalies`
             translation 今日 uses, never the raw wire flag. No cell content at all on a clean day.
             Where the flag is a forgotten clock-out, the marker is a button that expands the same
             correction form 今日 uses, keyed to THIS day — the gap you need to fix is rarely today's. */}
@@ -653,12 +666,12 @@ function MonthDayRow(
                 onClick={() => setOpen((was) => !was)}
               >
                 <span data-testid="day-anomalies">
-                  {day.anomalies.map((flag) => ANOMALY_LABELS[flag] ?? flag).join(" · ")}
+                  {day.anomalies.map((flag) => t.labels.anomalies[flag] ?? flag).join(" · ")}
                 </span>
               </button>
             ) : (
               <span data-testid="day-anomalies">
-                {day.anomalies.map((flag) => ANOMALY_LABELS[flag] ?? flag).join(" · ")}
+                {day.anomalies.map((flag) => t.labels.anomalies[flag] ?? flag).join(" · ")}
               </span>
             )
           )}
