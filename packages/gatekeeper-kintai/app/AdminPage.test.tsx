@@ -79,6 +79,15 @@ function adminApi(overrides: Partial<KintaiAdminClient> = {}, roster: RosterEntr
 }
 
 /**
+ * Any Japanese character: hiragana, katakana, 漢字, and the halfwidth katakana a paste can carry.
+ *
+ * Used by the one English whole-screen render to sweep the rendered markup. Deliberately a
+ * character class rather than a list of the strings this screen happens to say: the point is that
+ * an English reader is shown NO Japanese, which a list of known sentences cannot promise.
+ */
+const JAPANESE = /[぀-ゟ゠-ヿ㐀-䶿一-鿿ｦ-ﾟ]/;
+
+/**
  * The one moment every 要調査 assertion is judged against.
  *
  * `Date.now` is stubbed rather than the timers faked: the only thing this screen reads a clock
@@ -520,12 +529,25 @@ describe("AdminPage", () => {
       });
 
     /**
-     * The whole shell and the roster in English when that is the account's language.
+     * THE WHOLE SCREEN in English when that is the account's language — every panel, not a
+     * sampling of them.
      *
-     * NOT asserted here: "nothing of the other language anywhere in the container". 要対応 and
-     * `errors.ts` are Task 5's, so `OverviewTab` still renders its own Japanese literals into this
-     * same page — an unscoped negative would be red for a reason that is not this task's. What IS
-     * asserted negatively is every string this task owns on the shell and the Roster tab.
+     * This test used to be scoped to the shell and the Roster tab, because 要対応 and `errors.ts`
+     * still held Japanese literals of their own and an unscoped negative would have been red for
+     * a reason that was not that task's. Every admin file is on the dictionary now, so the
+     * negative is the whole container: no Japanese character anywhere in the rendered markup. That
+     * is the assertion that actually proves "one language per screen" — a sampled negative only
+     * proves the samples.
+     *
+     * THE ONE EXEMPTION IS THE LANGUAGE TOGGLE, whose subtree is removed before the scan rather
+     * than tolerated inside it. It renders the OTHER language's own name, and a language's name is
+     * written the way its own readers write it in both dictionaries (`labels.languageNames`) — so
+     * "日本語" on this English screen is the control working, and a reader hunting for their
+     * language finds the word they would look for. Removing exactly that subtree keeps the scan a
+     * blanket one everywhere else.
+     *
+     * `outerHTML` and not `textContent`: a placeholder, an `aria-label` and a `title` are words a
+     * reader is given too, and they are attributes. There are no comments in the DOM to strip.
      */
     it("renders the shell and the roster in English when the account language is en", async () => {
       const api = adminApi({
@@ -545,8 +567,21 @@ describe("AdminPage", () => {
       // And the toggle now offers 日本語, saying so in English.
       expect(field('[data-testid="language-toggle"]').getAttribute("aria-label"))
         .toBe(en.header.language.switchTo(en.labels.languageNames.ja));
-      expect(container!.textContent).not.toContain(ja.tabs.roster);
-      expect(container!.textContent).not.toContain(ja.roster.summary(2, 0));
+      // 要対応 and 月次 are mounted from the first render too, so their empty states are in this
+      // markup and are covered by the sweep below. Two of them named, so a sweep that passed
+      // because a panel rendered nothing at all would still be red.
+      expect(within(overview('[data-testid="pending-section"]'), '[data-testid="pending-empty"]'))
+        .toBe(en.pending.empty);
+      expect(within(overview('[data-testid="blockers-section"]'), '[data-testid="blockers-empty"]'))
+        .toBe(en.blockers.allReady);
+
+      // The sweep: nothing of the other language anywhere in the rendered page, the toggle's own
+      // subtree excepted (see this test's comment).
+      const swept = container!.cloneNode(true) as HTMLElement;
+      swept.querySelector('[data-testid="language-toggle"]')!.remove();
+      expect(swept.outerHTML).not.toMatch(JAPANESE);
+      // …and the sweep can see 日本語 when there is 日本語 to see.
+      expect(container!.outerHTML).toMatch(JAPANESE);
     });
   });
 
@@ -576,9 +611,11 @@ describe("AdminPage", () => {
         const request = pendingRow(71);
         expect(request.textContent).toContain("Tanaka");
         expect(request.textContent).toContain("E-1001");
-        expect(within(request, '[data-testid="filed-by"]')).toContain("Suzuki");
-        expect(within(request, '[data-testid="asks"]')).toContain("2h 30m");
-        expect(within(request, '[data-testid="asks"]')).toContain("2026-09-01");
+        expect(within(request, '[data-testid="filed-by"]')).toBe(ja.pending.filedBy("Suzuki"));
+        expect(within(request, '[data-testid="asks"]'))
+          .toBe(ja.pending.askOvertime(150, "2026-09-01"));
+        // The duration is the dictionary's arithmetic, not "2h 30m" written twice.
+        expect(within(request, '[data-testid="asks"]')).toContain(ja.labels.durations.short(150));
       });
 
       // `created_by` is nullable and a null records that NO filer was captured. Reporting it as
@@ -590,7 +627,7 @@ describe("AdminPage", () => {
         }, [TANAKA, SUZUKI]);
         await render(<AdminPage api={api} />);
 
-        expect(within(pendingRow(71), '[data-testid="filed-by"]')).toContain("not recorded");
+        expect(within(pendingRow(71), '[data-testid="filed-by"]')).toBe(ja.pending.filerUnknown);
       });
 
       // The same comparison `describeCorrectionApproval` puts in front of the approver, in the
@@ -604,10 +641,14 @@ describe("AdminPage", () => {
         await render(<AdminPage api={api} />);
 
         const asks = within(pendingRow(72), '[data-testid="asks"]');
-        expect(asks).toContain("in 09:00 → 08:30");
+        expect(asks).toBe(ja.pending.askAmendment(
+          "2026-09-02", ja.pending.amendmentMoved("in", "09:00", "08:30"),
+        ));
         expect(asks).toContain("2026-09-02");
-        expect(asks).not.toContain("0h");
-        expect(asks).not.toContain("minutes");
+        // Nothing of the overtime shape: neither a duration nor the word this language uses for
+        // overtime, which is what a row rendered through `askOvertime` would have said.
+        expect(asks).not.toContain(ja.labels.durations.short(0));
+        expect(asks).not.toContain("残業");
         // And no closed-month marker: that month is open, and a marker on every row is noise.
         expect(overviewMaybe('[data-submission="72"] [data-testid="closed-period"]')).toBeNull();
       });
@@ -629,8 +670,9 @@ describe("AdminPage", () => {
         }, [TANAKA, SUZUKI]);
         await render(<AdminPage api={api} />);
 
-        expect(within(pendingRow(72), '[data-testid="asks"]'))
-          .toContain("out added at 18:00 (none recorded)");
+        expect(within(pendingRow(72), '[data-testid="asks"]')).toBe(ja.pending.askAmendment(
+          "2026-09-02", ja.pending.amendmentAdded("out", "18:00"),
+        ));
       });
 
       // Applying an approved correction is the only write allowed into a closed month, and a
@@ -651,8 +693,8 @@ describe("AdminPage", () => {
         await render(<AdminPage api={api} />);
 
         const closed = within(pendingRow(72), '[data-testid="closed-period"]');
+        expect(closed).toBe(ja.pending.closedPeriod("2026-08"));
         expect(closed).toContain("2026-08");
-        expect(closed).toContain("closed");
       });
 
       it("names who can decide each request", async () => {
@@ -664,12 +706,43 @@ describe("AdminPage", () => {
         await render(<AdminPage api={api} />);
 
         const deciders = within(pendingRow(71), '[data-testid="deciders"]');
+        expect(deciders).toBe(ja.pending.decidedByOthers(["Suzuki", "Kato"]));
         expect(deciders).toContain("Suzuki");
         expect(deciders).toContain("Kato");
         // WHO can decide was never the whole answer — an administrator reading this row asked "how
         // do I pass it through?". A row that is not theirs says where the decision happens.
-        expect(deciders).toContain("pending approvals");
+        expect(ja.pending.decidedByOthers(["Suzuki"])).toContain("承認待ち");
         expect(overviewMaybe('[data-submission="71"] [data-testid="stranded"]')).toBeNull();
+      });
+
+      /**
+       * The same row on an English screen, and the reason there is an English counterpart at all.
+       *
+       * This is the longest sentence 要対応 renders and the one that names people, so it is where a
+       * dictionary that fell back to the other language would be most visible. It also exercises
+       * `en` on this panel: every other assertion in this describe reads `ja`, and a dictionary
+       * only one language's tests ever touch is a dictionary half-checked.
+       */
+      it("names who can decide a request in English on an English screen", async () => {
+        const api = adminApi({
+          whoAmI: vi.fn<KintaiAdminClient["whoAmI"]>(async () => ({
+            accountId: "acct-admin", linked: true, employeeId: 9, language: "en",
+          })),
+          listPendingOverview: vi.fn(async () => [waiting({
+            eligibleActorIds: [SUZUKI.id, 4], eligibleActorNames: ["Suzuki", "Kato"],
+          })]),
+        }, [TANAKA, SUZUKI]);
+        await render(<AdminPage api={api} />, "en");
+
+        const deciders = within(pendingRow(71), '[data-testid="deciders"]');
+        expect(deciders).toBe(en.pending.decidedByOthers(["Suzuki", "Kato"]));
+        expect(deciders).toContain("pending approvals");
+        // And the rest of the row's English, including the ask and the age bucket.
+        expect(within(pendingRow(71), '[data-testid="asks"]'))
+          .toBe(en.pending.askOvertime(150, "2026-09-01"));
+        expect(within(pendingRow(71), '[data-testid="waiting"]'))
+          .toBe(en.labels.ages.waiting(3 * DAY));
+        expect(pendingRow(71).textContent).not.toContain(ja.labels.ages.waiting(3 * DAY));
       });
 
       // The viewer's own employee id is 9 (see `adminApi`). A row is "mine" when the org chart
@@ -699,7 +772,8 @@ describe("AdminPage", () => {
           expect(button, action).not.toBeNull();
           expect(button!.type).toBe("button");
         }
-        expect(within(pendingRow(72), '[data-testid="deciders"]')).toContain("Yours to decide");
+        expect(within(pendingRow(72), '[data-testid="deciders"]'))
+          .toBe(ja.pending.yours(["Me", "Suzuki"]));
         expect(pendingRow(72).querySelector("form")).toBeNull();
       });
 
@@ -717,8 +791,10 @@ describe("AdminPage", () => {
         await click('[data-submission="72"] [data-action="decide-approve"]');
         expect(decideSubmission).not.toHaveBeenCalled();
         const confirm = within(pendingRow(72), '[data-testid="decision-confirm"]');
-        expect(confirm).toContain("2h 30m of overtime on 2026-09-01");
-        expect(confirm).toContain("承認");
+        expect(confirm).toContain(
+          ja.pending.confirmDetail("Tanaka", ja.pending.askOvertime(150, "2026-09-01")),
+        );
+        expect(confirm).toContain(ja.labels.decisions.approve);
 
         await click('[data-submission="72"] [data-action="confirm-decision"]');
         // The marker the row was read with travels with the decision, so the store can refuse a
@@ -743,6 +819,14 @@ describe("AdminPage", () => {
         const confirmButton = () =>
           pendingRow(72).querySelector<HTMLButtonElement>('[data-action="confirm-decision"]')!;
         expect(confirmButton().disabled).toBe(true);
+        // The words around the field, all of them the dictionary's: what the comment is for, an
+        // example of one, and the two verbs on the buttons either side.
+        expect(within(pendingRow(72), "label")).toBe(ja.pending.commentLabel);
+        expect(pendingRow(72)
+          .querySelector<HTMLInputElement>('[data-testid="decision-comment"]')!.placeholder)
+          .toBe(ja.pending.commentPlaceholderReject);
+        expect(confirmButton().textContent).toBe(ja.pending.confirmAction("reject"));
+        expect(within(pendingRow(72), '[data-action="cancel-decision"]')).toBe(ja.common.cancel);
         await type('[data-submission="72"] [data-testid="decision-comment"]', "現場の記録と一致しません");
         expect(confirmButton().disabled).toBe(false);
         await click('[data-submission="72"] [data-action="confirm-decision"]');
@@ -763,9 +847,8 @@ describe("AdminPage", () => {
 
         await click('[data-submission="72"] [data-action="decide-approve"]');
         await click('[data-submission="72"] [data-action="confirm-decision"]');
-        const notice = within(pendingRow(72), '[data-testid="decision-notice"]');
-        expect(notice).toContain("承認");
-        expect(notice).toContain("次");
+        expect(within(pendingRow(72), '[data-testid="decision-notice"]'))
+          .toBe(ja.pending.movedOn("approve"));
       });
 
       it("shows the underlying message when a failure is not one of Kintai's coded refusals", async () => {
@@ -783,7 +866,8 @@ describe("AdminPage", () => {
 
         await click('[data-submission="72"] [data-action="decide-approve"]');
         await click('[data-submission="72"] [data-action="confirm-decision"]');
-        expect(within(pendingRow(72), '[data-testid="decision-error"]')).toContain("決定できませんでした");
+        expect(within(pendingRow(72), '[data-testid="decision-error"]'))
+          .toBe(ja.errors.fallbacks.decide);
         expect(within(pendingRow(72), '[data-testid="decision-error-detail"]'))
           .toContain("does not implement");
       });
@@ -804,7 +888,8 @@ describe("AdminPage", () => {
         await click('[data-submission="72"] [data-action="decide-approve"]');
         await click('[data-submission="72"] [data-action="confirm-decision"]');
         const error = within(pendingRow(72), '[data-testid="decision-error"]');
-        expect(error.toLowerCase()).toContain("reload");
+        expect(error).toBe(ja.errors.byCode.KINTAI_STALE_DECISION);
+        expect(ja.errors.byCode.KINTAI_STALE_DECISION).toContain("読み込み直して");
         expect(pendingRow(72).querySelector('[data-testid="decision-error-detail"]')).toBeNull();
         // The row's marker is what went stale, so the queue is re-read: the next click carries a
         // fresh one instead of being refused for ever.
@@ -824,9 +909,40 @@ describe("AdminPage", () => {
 
         await click('[data-submission="72"] [data-action="decide-approve"]');
         await click('[data-submission="72"] [data-action="confirm-decision"]');
+        // English on a Japanese screen, and deliberately: an unmapped server DETAIL is not in the
+        // dictionary (see `errors` in `messages.ts`), so it reaches the reader as the server wrote
+        // it rather than as a translation nobody has written.
         expect(within(pendingRow(72), '[data-testid="decision-error"]'))
-          .toContain("You are not an approver for this submission.");
+          .toBe("You are not an approver for this submission.");
         expect(overviewMaybe('[data-submission="72"]')).not.toBeNull();
+      });
+
+      /**
+       * A coded refusal on an English screen — the second half of the dictionary's error path.
+       *
+       * `describeFailure` chooses the sentence out of `t.errors.byCode`, so a screen in English has
+       * to say it in English. This is the assertion that would catch `errors.ts` reaching for one
+       * dictionary rather than the caller's.
+       */
+      it("says a refused decision in English on an English screen", async () => {
+        const api = adminApi({
+          whoAmI: vi.fn<KintaiAdminClient["whoAmI"]>(async () => ({
+            accountId: "acct-admin", linked: true, employeeId: 9, language: "en",
+          })),
+          listPendingOverview: vi.fn(async () => [
+            waiting({ id: 72, eligibleActorIds: [9], eligibleActorNames: ["Me"] }),
+          ]),
+          decideSubmission: vi.fn(async () => {
+            throw new Error("KINTAI_STALE_DECISION: this submission has changed since it was read.");
+          }),
+        });
+        await render(<AdminPage api={api} />, "en");
+
+        await click('[data-submission="72"] [data-action="decide-approve"]');
+        await click('[data-submission="72"] [data-action="confirm-decision"]');
+        expect(within(pendingRow(72), '[data-testid="decision-error"]'))
+          .toBe(en.errors.byCode.KINTAI_STALE_DECISION);
+        expect(pendingRow(72).textContent).not.toContain(ja.errors.byCode.KINTAI_STALE_DECISION);
       });
 
       /**
@@ -846,10 +962,13 @@ describe("AdminPage", () => {
         await render(<AdminPage api={api} />);
 
         const stranded = overview('[data-submission="71"] [data-testid="stranded"]');
-        expect(stranded.textContent).toContain("Nobody can decide this");
-        // The fix, in words HR can act on, and naming the employee rather than an id.
+        expect(stranded.textContent).toBe(ja.pending.stranded("Tanaka"));
+        // The fix, in words HR can act on, and naming the employee rather than an id. Asserted on
+        // the dictionary entry as well as on the screen, so a reword that dropped the repair it
+        // names is red rather than silently vaguer.
         expect(stranded.textContent).toContain("Tanaka");
-        expect(stranded.textContent).toContain("designated approver");
+        expect(ja.pending.stranded("Tanaka")).toContain("指定承認者");
+        expect(en.pending.stranded("Tanaka")).toContain("designated approver");
         expect(stranded.textContent).not.toMatch(/employee \d/);
         // Loud: an alert, not a quiet subtitle, and never an empty decider cell instead.
         expect(stranded.getAttribute("role")).toBe("alert");
@@ -868,9 +987,12 @@ describe("AdminPage", () => {
         }, [TANAKA, SUZUKI]);
         await render(<AdminPage api={api} />);
 
-        expect(within(pendingRow(71), '[data-testid="waiting"]')).toBe("3日");
-        expect(within(pendingRow(72), '[data-testid="waiting"]')).toBe("5時間");
-        expect(within(pendingRow(73), '[data-testid="waiting"]')).toBe("1時間未満");
+        expect(within(pendingRow(71), '[data-testid="waiting"]'))
+          .toBe(ja.labels.ages.waiting(3 * DAY + 4 * HOUR));
+        expect(within(pendingRow(72), '[data-testid="waiting"]'))
+          .toBe(ja.labels.ages.waiting(5 * HOUR + 40 * 60 * 1000));
+        expect(within(pendingRow(73), '[data-testid="waiting"]'))
+          .toBe(ja.labels.ages.waiting(12 * 60 * 1000));
       });
 
       // A blank dashboard must read as good news rather than as a screen that failed to load.
@@ -878,7 +1000,7 @@ describe("AdminPage", () => {
         await render(<AdminPage api={adminApi({}, [TANAKA, SUZUKI])} />);
 
         expect(within(overview('[data-testid="pending-section"]'), '[data-testid="pending-empty"]'))
-          .toContain("承認待ちはありません");
+          .toBe(ja.pending.empty);
       });
 
       // One section failing must not take out the other two: an administrator who cannot read
@@ -890,7 +1012,8 @@ describe("AdminPage", () => {
         }, [TANAKA, SUZUKI]);
         await render(<AdminPage api={api} />);
 
-        expect(overview('[data-testid="pending-error"]').textContent).toContain("承認待ち");
+        expect(overview('[data-testid="pending-error"]').textContent)
+          .toBe(ja.errors.fallbacks.readPending);
         expect(overviewMaybe('[data-day="1:2026-09-02"]')).not.toBeNull();
         expect(container!.querySelector('[data-testid="error"]')).toBeNull();
       });
@@ -917,10 +1040,10 @@ describe("AdminPage", () => {
         expect(overviewAll('[data-anomaly-employee="1"] [data-day]')).toHaveLength(2);
         // The flags, as sentences rather than as column names.
         expect(within(overview('[data-day="1:2026-09-01"]'), '[data-testid="flags"]'))
-          .toContain("退勤打刻なし");
+          .toBe(ja.labels.anomalies.unpaired_in);
         const both = within(overview('[data-day="1:2026-09-02"]'), '[data-testid="flags"]');
-        expect(both).toContain("出勤打刻のない退勤");
-        expect(both).toContain("14時間以上の勤務");
+        expect(both).toContain(ja.labels.anomalies.orphan_out);
+        expect(both).toContain(ja.labels.anomalies.long_span);
       });
 
       // Lazily: one `getEmployeeDay` per row expanded, and none for a queue nobody opened. The
@@ -953,11 +1076,10 @@ describe("AdminPage", () => {
         expect(detail.textContent).toContain("in");
         expect(detail.textContent).toContain("09:00");
         expect(detail.textContent).toContain("18:30");
-        // The provenance line comes out of the shared dictionary now (`PunchSource`), and this
-        // screen has no provider of its own yet, so it reads 日本語 exactly as it did before —
-        // minus the "(admin)" the dictionary dropped. Asserted through the key, not the wording.
+        // The provenance line comes out of the shared dictionary (`PunchSource`), and this screen
+        // now passes its own `t` rather than leaning on a default. Asserted through the key.
         expect(detail.textContent).toContain(ja.punchSource.admin);
-        expect(detail.textContent).toContain("8h 30m");
+        expect(within(detail, '[data-testid="credited"]')).toBe(ja.anomalies.credited(510));
       });
 
       it("does not read the same day twice, and closes again on a second press", async () => {
@@ -1001,7 +1123,7 @@ describe("AdminPage", () => {
 
         await click(button);
         expect(overview('[data-day="1:2026-09-02"] [data-testid="day-detail"]').textContent)
-          .toContain("Couldn’t read that day’s punches.");
+          .toContain(ja.errors.fallbacks.readDay);
 
         // Fold it away and open it again — the only control the row has, and now the retry.
         await click(button);
@@ -1010,7 +1132,7 @@ describe("AdminPage", () => {
         expect(api.getEmployeeDay).toHaveBeenCalledTimes(2);
         const detail = overview('[data-day="1:2026-09-02"] [data-testid="day-detail"]');
         expect(detail.textContent).toContain("09:00");
-        expect(detail.textContent).not.toContain("Couldn’t");
+        expect(detail.textContent).not.toContain(ja.errors.fallbacks.readDay);
       });
 
       // Reading a day is not deciding anything. The only writes this screen offers are the
@@ -1031,7 +1153,7 @@ describe("AdminPage", () => {
         await render(<AdminPage api={adminApi({}, [TANAKA, SUZUKI])} />);
 
         expect(within(overview('[data-testid="anomalies-section"]'), '[data-testid="anomalies-empty"]'))
-          .toContain("フラグの立った勤務日はありません");
+          .toBe(ja.anomalies.empty);
       });
     });
 
@@ -1074,14 +1196,14 @@ describe("AdminPage", () => {
         await render(<AdminPage api={adminApi({}, [TANAKA, SUZUKI])} />);
 
         expect(within(overview('[data-testid="blockers-section"]'), '[data-testid="blockers-empty"]'))
-          .toContain("全員 Kintai を使える状態です");
+          .toBe(ja.blockers.allReady);
       });
 
       it("says there is nobody yet rather than claiming everyone is ready", async () => {
         await render(<AdminPage api={adminApi({}, [])} />);
 
         expect(within(overview('[data-testid="blockers-section"]'), '[data-testid="blockers-empty"]'))
-          .toContain("従業員がまだ登録されていません");
+          .toBe(ja.blockers.emptyRoster);
       });
     });
 
@@ -1553,7 +1675,8 @@ describe("AdminPage", () => {
 
       // The alarm, before the repair. Without this the test could pass on a screen that never
       // rendered the row at all.
-      expect(within(pendingRow(71), '[data-testid="stranded"]')).toContain("Nobody can decide this");
+      expect(within(pendingRow(71), '[data-testid="stranded"]'))
+        .toBe(ja.pending.stranded(STRANDED.display_name));
 
       // The repair, from the button the alarm's own tab offers, exactly as an administrator
       // reaches it: the row's fix opens the Roster form with that employee already chosen.
@@ -1615,8 +1738,8 @@ describe("AdminPage", () => {
         expect(monthlyText('[data-testid="monthly-locked"]')).toContain("締め済み");
         // …and so does the row that is one approval away from writing into it.
         const marker = within(pendingRow(72), '[data-testid="closed-period"]');
+        expect(marker).toBe(ja.pending.closedPeriod("2026-09"));
         expect(marker).toContain("2026-09");
-        expect(marker).toContain("closed");
       });
   });
 

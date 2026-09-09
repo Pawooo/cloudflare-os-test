@@ -12,6 +12,11 @@ import { en, ja } from "./i18n";
  * (`OverviewTab`) and the employee 今日 tab (Task 5). HR reads this; nobody reading it should ever
  * see the platform's internal vocabulary for how a punch was recorded — `punch.source` verbatim,
  * as `OverviewTab.tsx:473` used to render it.
+ *
+ * `t` IS REQUIRED, so every render below names its language. There used to be a test here pinning
+ * a transitional `ja` default — it existed so that removing the default would be a visible,
+ * deliberate act rather than a silent behaviour change, and this is that removal: both call sites
+ * now sit under a `<LanguageProvider>` and pass the screen's own dictionary.
  */
 describe("PunchSource", () => {
   let container: HTMLElement | undefined;
@@ -56,7 +61,7 @@ describe("PunchSource", () => {
   }
 
   it("renders 本人打刻 for a self-recorded punch, not the raw word gadget", async () => {
-    await render(<PunchSource punch={punch({ source: "gadget" })} />);
+    await render(<PunchSource punch={punch({ source: "gadget" })} t={ja} />);
 
     expect(container!.textContent).toContain(ja.punchSource.gadget);
     expect(container!.textContent).not.toContain("gadget");
@@ -71,16 +76,8 @@ describe("PunchSource", () => {
     expect(container!.textContent).not.toContain(ja.punchSource.gadget);
   });
 
-  // The default is what keeps the admin day drill-down readable until that screen has a provider
-  // of its own to ask: 日本語, and out of the dictionary rather than out of literals in the module.
-  it("falls back to 日本語 for a call site that passes no dictionary", async () => {
-    await render(<PunchSource punch={punch({ source: "gadget" })} />);
-
-    expect(container!.textContent).toBe(ja.punchSource.gadget);
-  });
-
   it("builds the amendment sentence out of the dictionary, in the screen's language", async () => {
-    await render(<PunchSource punch={punch({
+    await render(<PunchSource t={ja} punch={punch({
       source: "amendment", amended_by: null, amend_reason: null,
     })} />);
 
@@ -92,7 +89,7 @@ describe("PunchSource", () => {
   });
 
   it("renders an amendment's approver and stated reason, not the bare word amendment", async () => {
-    await render(<PunchSource punch={punch({
+    await render(<PunchSource t={ja} punch={punch({
       source: "amendment", amended_by: 7, amend_reason: "forgot to clock out",
     })} />);
 
@@ -108,6 +105,7 @@ describe("PunchSource", () => {
   it("renders the approver's NAME when a resolver is given, not the bare #id", async () => {
     await render(<PunchSource
       punch={punch({ source: "amendment", amended_by: 7, amend_reason: "forgot to clock out" })}
+      t={ja}
       resolveApprover={(id) => (id === 7 ? "山田 花子" : `#${id}`)}
     />);
 
@@ -118,7 +116,7 @@ describe("PunchSource", () => {
   // No resolver — the admin drill-down passes none, and this is the honest fallback: the id, never
   // a blank. The whole point of keeping the prop optional.
   it("falls back to #id for an amendment when no resolver is given", async () => {
-    await render(<PunchSource punch={punch({
+    await render(<PunchSource t={ja} punch={punch({
       source: "amendment", amended_by: 7, amend_reason: "forgot to clock out",
     })} />);
 
@@ -126,21 +124,23 @@ describe("PunchSource", () => {
   });
 
   it("renders a neutral label for an admin-entered punch", async () => {
-    await render(<PunchSource punch={punch({ source: "admin" })} />);
+    await render(<PunchSource punch={punch({ source: "admin" })} t={ja} />);
 
     expect(container!.textContent).not.toBe("admin");
     expect(container!.textContent!.trim().length).toBeGreaterThan(0);
   });
 
   it("renders a neutral label for an imported punch", async () => {
-    await render(<PunchSource punch={punch({ source: "import" })} />);
+    await render(<PunchSource punch={punch({ source: "import" })} t={ja} />);
 
     expect(container!.textContent).not.toBe("import");
     expect(container!.textContent!.trim().length).toBeGreaterThan(0);
   });
 
   it("falls through to the raw string for a source it does not recognise, never blank", async () => {
-    await render(<PunchSource punch={punch({ source: "future_source" as PunchRow["source"] })} />);
+    await render(
+      <PunchSource punch={punch({ source: "future_source" as PunchRow["source"] })} t={ja} />,
+    );
 
     expect(container!.textContent).toContain("future_source");
   });
