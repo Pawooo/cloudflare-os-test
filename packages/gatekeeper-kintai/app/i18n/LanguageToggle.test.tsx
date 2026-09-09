@@ -71,6 +71,22 @@ describe("LanguageToggle", () => {
     expect(toggle().getAttribute("aria-label")).toBe(ja.header.language.switchTo("English"));
   });
 
+  /*
+   * `<html lang>` ON THE FIRST PAINT, not only after a press.
+   *
+   * Both `index.html` files ship `lang="en"` as a static placeholder — a static value is wrong for
+   * one of the two languages whichever is picked, and the entry does not know which until
+   * `whoAmI()` and `navigator.language` have been resolved. The provider's effect, keyed on the
+   * language, overwrites it on mount, so a Japanese first open never declares itself English to a
+   * screen reader. This is the mount half of that promise; the toggle tests below cover the switch.
+   */
+  it("declares the document language on mount, before any press", async () => {
+    document.documentElement.lang = "en"; // the placeholder both entry pages ship with
+    await render(<LanguageToggle api={toggleApi()} />, "ja");
+
+    expect(document.documentElement.lang).toBe("ja");
+  });
+
   it("switches the screen, sets the document language, and saves the choice", async () => {
     const api = toggleApi();
     await render(
