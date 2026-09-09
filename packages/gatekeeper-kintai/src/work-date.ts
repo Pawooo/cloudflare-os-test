@@ -97,11 +97,15 @@ export const LONG_SPAN_MS = 14 * 60 * 60 * 1000;
  */
 export const WORK_DATE_POLICIES: readonly WorkDatePolicy[] = ["calendar", "shift_start"];
 
-/** How each policy reads to a human, for the HR form and for nothing else. */
-export const WORK_DATE_POLICY_LABELS: Record<WorkDatePolicy, string> = {
-  calendar: "Calendar date (office staff)",
-  shift_start: "Shift start date (night shifts)",
-};
+/*
+ * `WORK_DATE_POLICY_LABELS` used to sit here, and does not any more.
+ *
+ * It was English-only and its one reader was the admin form's dropdown, so a Japanese
+ * administrator was choosing a policy from an English list. The words now live in the dictionary
+ * as `labels.workDatePolicies`, in both languages, beside every other word either screen says —
+ * which is also where the "add a third policy" note above expects them: this module keeps the
+ * runtime enumeration, and none of the copy.
+ */
 
 /**
  * The instant a JST work date begins.

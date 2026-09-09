@@ -1,4 +1,5 @@
 import type { RosterEntry } from "../src/types";
+import { useT, type Messages } from "./i18n";
 
 /**
  * One employee's row, and the verdict on whether they can use Kintai at all.
@@ -13,6 +14,11 @@ import type { RosterEntry } from "../src/types";
  * Nothing else moved with it. The forms, the reveal plumbing and the roster section itself are
  * still `AdminPage`'s, and the callbacks below are how it keeps them: this component decides which
  * repairs a row needs and nothing about where they happen.
+ *
+ * `useT()` rather than a `t` prop, deliberately: two call sites render this row and a prop would
+ * have to be threaded through `RowFixes`'s neighbours in both of them, which is the drift the
+ * shared module exists to prevent. Both call sites are inside the dashboard's provider (see
+ * `main.tsx`), so there is no tree this component can be reached from that has no language.
  */
 export function RosterRow({
   employee, names, canSetManager, onLink, onSetManager, onSetApprover, onExempt, onSetPolicy,
@@ -26,6 +32,7 @@ export function RosterRow({
   onExempt: () => void;
   onSetPolicy: () => void;
 }) {
+  const t = useT();
   const ready = isReady(employee);
   return (
     <li className="flex flex-wrap items-center gap-x-4 gap-y-2 py-3" data-employee={employee.id}>
@@ -40,7 +47,7 @@ export function RosterRow({
             somewhere other than the day they happened on. */}
         {employee.work_date_policy === "shift_start" && (
           <p className="truncate text-xs text-kumo-subtle" data-testid="work-date-policy">
-            夜勤 · punches filed against the shift’s start date
+            {t.roster.row.nightShift}
           </p>
         )}
         {/* Here, and only here, for the same reason: a 労働基準法41条 determination is one of the
@@ -51,7 +58,7 @@ export function RosterRow({
             row beside this one was written to fix. */}
         {employee.exempt && (
           <p className="truncate text-xs text-kumo-subtle" data-testid="exempt">
-            管理監督者 · overtime bears no premium
+            {t.roster.row.exempt}
           </p>
         )}
       </div>
@@ -59,13 +66,13 @@ export function RosterRow({
       <div className="min-w-56 flex-1">
         {ready ? (
           <p className="text-xs text-kumo-subtle" data-testid="status">
-            Ready · {approverReason(employee, names)}
+            {t.roster.row.ready(approverReason(employee, names, t))}
           </p>
         ) : (
           <ul className="flex flex-col gap-1" data-testid="status">
             {!employee.linked && (
               <li className="text-xs text-kumo-danger" data-issue="unlinked">
-                No account code linked — they cannot sign in as themselves.
+                {t.roster.row.notLinked}
               </li>
             )}
             {!employee.approverReachable && (
@@ -73,11 +80,7 @@ export function RosterRow({
                 {/* Not "overtime". A punch correction needs approval too, and naming only
                     overtime is what made an exempt officer look finished: they file no overtime,
                     so the warning read as inapplicable to them. */}
-                {employee.exempt
-                  ? "Nobody can approve for them — 管理監督者 exempts their overtime, but a punch" +
-                    " correction still needs a person. Give them a manager or a designated approver."
-                  : "Nobody can approve for them — anything they file will be refused. Give them a" +
-                    " manager, or a designated approver if they report to nobody."}
+                {employee.exempt ? t.roster.row.noApproverExempt : t.roster.row.noApprover}
               </li>
             )}
           </ul>
@@ -92,7 +95,7 @@ export function RosterRow({
             className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-xs font-medium text-kumo-default hover:bg-kumo-tint"
             onClick={onLink}
           >
-            Link code
+            {t.roster.row.linkCode}
           </button>
         )}
         {!employee.approverReachable && canSetManager && (
@@ -102,7 +105,7 @@ export function RosterRow({
             className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-xs font-medium text-kumo-default hover:bg-kumo-tint"
             onClick={onSetManager}
           >
-            Set manager
+            {t.roster.row.setManager}
           </button>
         )}
         {/* The other honest way to complete this row, and the only one for somebody at the top of
@@ -116,7 +119,7 @@ export function RosterRow({
             className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-xs font-medium text-kumo-default hover:bg-kumo-tint"
             onClick={onSetApprover}
           >
-            Set approver
+            {t.roster.row.setApprover}
           </button>
         )}
         {/* Offered on every row, and NOT as a repair — which is what it used to look like, sitting
@@ -131,7 +134,7 @@ export function RosterRow({
           className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-xs font-medium text-kumo-default hover:bg-kumo-tint"
           onClick={onExempt}
         >
-          管理監督者
+          {t.roster.row.exemptAction}
         </button>
         {/* Always offered, unlike the two above: an employee on the wrong work-date policy is not
             a broken row — the roster cannot tell, because both answers are legitimate — so there
@@ -143,7 +146,7 @@ export function RosterRow({
           className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-xs font-medium text-kumo-default hover:bg-kumo-tint"
           onClick={onSetPolicy}
         >
-          Work dates
+          {t.roster.row.workDates}
         </button>
       </div>
     </li>
@@ -156,9 +159,11 @@ export function RosterRow({
  * Display only, and never a second opinion: it is only ever called for a row the server already
  * said is reachable, and it explains that verdict rather than reaching one.
  */
-function approverReason(employee: RosterEntry, names: Map<number, string>): string {
+function approverReason(
+  employee: RosterEntry, names: Map<number, string>, t: Messages,
+): string {
   if (employee.managerIds.length > 0) {
-    return `reports to ${employee.managerIds.map((id) => label(names, id)).join(", ")}`;
+    return t.roster.row.reportsTo(employee.managerIds.map((id) => label(names, id)).join(", "));
   }
   // No 管理監督者 arm, and it is not an omission. This function mirrors `hasReachableApprover`,
   // which stopped counting an exemption: it exempts overtime from a premium and authorises nobody
@@ -167,11 +172,21 @@ function approverReason(employee: RosterEntry, names: Map<number, string>): stri
   // The exemption is still on the row, as a neutral badge in the identity column beside 夜勤;
   // what it no longer does is answer this question.
   if (employee.designated_approver_id !== null) {
-    return `approver ${label(names, employee.designated_approver_id)}`;
+    return t.roster.row.approvedBy(label(names, employee.designated_approver_id));
   }
-  return "approvable";
+  return t.roster.row.approvable;
 }
 
+/**
+ * The name behind a manager or approver id — a NAME LOOKUP, and left out of the dictionary on
+ * instruction.
+ *
+ * `common.employeeFallback(id)` exists and `AdminPage`'s `nameOf` reads it; this one deliberately
+ * does not. The fallback fires only when a row names somebody the `names` map does not carry,
+ * which the roster read cannot produce (every id here comes from a row in the same read), so the
+ * two are not the same call in practice. Flagged in the task report as the one string on this
+ * screen that is not the dictionary's.
+ */
 function label(names: Map<number, string>, id: number): string {
   return names.get(id) ?? `employee ${id}`;
 }

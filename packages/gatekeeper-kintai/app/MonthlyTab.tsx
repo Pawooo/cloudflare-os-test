@@ -3,6 +3,7 @@ import type { MonthlyReport, MonthlyTotalRow } from "../src/types";
 import { jstWorkDate } from "../src/work-date";
 import type { KintaiAdminClient } from "./AdminPage";
 import { describeFailure } from "./errors";
+import { useT } from "./i18n";
 
 /**
  * 月次: one month's hours per employee, and the one write that closes it.
@@ -15,8 +16,12 @@ import { describeFailure } from "./errors";
  *
  * NOTHING HERE RECOMPUTES ANYTHING. Every number on the screen arrives from `monthlyReport`, which
  * walks the punches through the same `workedMinutes` and `dayAnomalies` the employee's own day view
- * uses. This module formats and it links; it owns no arithmetic over attendance, and there is no
- * stored total anywhere for it to disagree with.
+ * uses. This module links, and it no longer even formats: the hours column reads
+ * `t.labels.durations.full`, because `162h 30m` and `162時間30分` are one column each language
+ * fills its own way, and a local formatter would have made that choice for both.
+ *
+ * ONE LANGUAGE, and this panel does not choose it — `main.tsx` resolves it and every word below
+ * comes off `useT()`.
  */
 export function MonthlyTab({
   api, onShowOverview, onLockAttempted,
@@ -52,10 +57,19 @@ export function MonthlyTab({
    */
   const [currentMonth] = useState(() => jstWorkDate(Date.now()).slice(0, 7));
   const [period, setPeriod] = useState(currentMonth);
-  const [report, setReport] = useState<{ data?: MonthlyReport; error?: string }>({});
+  /*
+   * A read holds its FAILURE, never the sentence describing it.
+   *
+   * Putting `t` inside `readMonth` would make the language a dependency of the read — a toggle
+   * re-running `monthlyReport`, or, with the dependency omitted, an error frozen in the language
+   * it was written in. Described at render time instead, so a switch retranslates a message
+   * already on screen and the read stays about reading. Wrapped rather than a bare `unknown` so a
+   * thrown `undefined` is still a failure.
+   */
+  const [report, setReport] = useState<{ data?: MonthlyReport; failure?: { caught: unknown } }>({});
   const [armed, setArmed] = useState(false);
   const [closing, setClosing] = useState(false);
-  const [closeError, setCloseError] = useState<string>();
+  const [closeFailure, setCloseFailure] = useState<{ caught: unknown }>();
 
   const live = useRef(true);
   // Armed in the effect body, not only by `useRef`: the ref survives a mount → unmount → remount
@@ -94,9 +108,7 @@ export function MonthlyTab({
       const data = await api.monthlyReport(target);
       if (live.current && id === readId.current) setReport({ data });
     } catch (caught) {
-      if (live.current && id === readId.current) {
-        setReport({ error: describeFailure(caught, "Couldn’t read that month.") });
-      }
+      if (live.current && id === readId.current) setReport({ failure: { caught } });
     }
   }, [api]);
 
@@ -123,7 +135,7 @@ export function MonthlyTab({
    */
   useEffect(() => {
     setArmed(false);
-    setCloseError(undefined);
+    setCloseFailure(undefined);
   }, [period]);
 
   const data = report.data;
@@ -144,13 +156,11 @@ export function MonthlyTab({
     // than against `period`, which is a closure variable from the render that armed the button.
     const target = period;
     setClosing(true);
-    setCloseError(undefined);
+    setCloseFailure(undefined);
     try {
       await api.lockPeriod(target);
     } catch (caught) {
-      if (live.current) {
-        setCloseError(describeFailure(caught, "Couldn’t close that month."));
-      }
+      if (live.current) setCloseFailure({ caught });
     } finally {
       if (live.current) {
         setArmed(false);
@@ -199,6 +209,7 @@ export function MonthlyTab({
   };
 
   const headingId = useId();
+  const t = useT();
   return (
     <section className="flex flex-col gap-6" aria-labelledby={headingId}>
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -206,7 +217,7 @@ export function MonthlyTab({
           <button
             type="button"
             data-action="prev-month"
-            aria-label="Previous month"
+            aria-label={t.common.prevMonth}
             className="press rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-sm font-medium text-kumo-default hover:bg-kumo-tint"
             onClick={() => goToMonth(shiftMonth(period, -1))}
           >
@@ -225,7 +236,7 @@ export function MonthlyTab({
           <button
             type="button"
             data-action="next-month"
-            aria-label="Next month"
+            aria-label={t.common.nextMonth}
             /* Disabled AT the current month, not after it. `lockPeriod` refuses a month that has
                not started, and a next button that reached October would offer a reader an empty
                month and a close control that could only fail. Going backwards has no bound. */
@@ -251,8 +262,7 @@ export function MonthlyTab({
                 relying on that is the case where they briefly would not: a badge that took its
                 month from the picker once claimed 締め済み over an open month's report. A lock is
                 the one claim on this screen that must come from the same read as the verdict. */}
-            締め済み · {data.period} is closed. Ordinary edits are refused; an approved correction
-            is still applied, so these totals can still change.
+            {t.monthly.closedBadge(data.period)}
           </p>
         )}
 
@@ -263,7 +273,7 @@ export function MonthlyTab({
             className="press rounded-lg border border-kumo-line bg-kumo-control px-3 py-1.5 text-sm font-medium text-kumo-default hover:bg-kumo-tint"
             onClick={() => setArmed(true)}
           >
-            この月を締める
+            {t.monthly.closeMonth}
           </button>
         )}
       </div>
@@ -280,9 +290,9 @@ export function MonthlyTab({
       {/* Beside the control that failed, like every notice on this page. A close that was refused
           is not a reason to blank the month's numbers — and after a refused close those numbers
           have just been re-read, which is the most useful thing on the screen. */}
-      {closeError !== undefined && (
+      {closeFailure !== undefined && (
         <p className="text-sm text-kumo-danger" data-testid="close-error" role="alert">
-          {closeError}
+          {describeFailure(closeFailure.caught, t.errors.fallbacks.closeMonth)}
         </p>
       )}
 
@@ -322,25 +332,24 @@ function CloseConfirmation({
   onClose: () => Promise<void>;
   onCancel: () => void;
 }) {
+  const t = useT();
   return (
     <div
       data-testid="close-confirm"
       role="group"
-      aria-label={`Close ${period}`}
+      aria-label={t.monthly.confirm.ariaLabel(period)}
       className="flex flex-col gap-3 rounded-lg border border-kumo-line bg-kumo-tint px-4 py-3"
     >
       <p className="text-sm font-medium text-kumo-default">
-        {period} を締めますか？
+        {t.monthly.confirm.heading(period)}
       </p>
       <ul className="flex flex-col gap-1 text-xs text-kumo-subtle">
-        <li>通常の打刻や修正は拒否されます — ordinary edits into this month stop here.</li>
-        <li>
-          承認された修正申請は引き続き反映されます — approval is the one way in that stays open.
-        </li>
-        <li>だから合計はまだ動きます — closing a month does not freeze these numbers.</li>
+        <li>{t.monthly.confirm.ordinaryEdits}</li>
+        <li>{t.monthly.confirm.approvedCorrections}</li>
+        <li>{t.monthly.confirm.totalsMove}</li>
       </ul>
       <p className="text-xs font-medium text-kumo-danger">
-        締めを解除する方法はありません — this cannot be undone.
+        {t.monthly.confirm.irreversible}
       </p>
       <div className="flex flex-wrap items-center gap-2">
         <button
@@ -350,7 +359,7 @@ function CloseConfirmation({
           className="press rounded-lg bg-kumo-brand px-3 py-1.5 text-sm font-medium text-white hover:bg-kumo-brand-hover disabled:cursor-not-allowed disabled:opacity-60"
           onClick={() => void onClose()}
         >
-          {busy ? "締めています…" : `${period} を締める`}
+          {busy ? t.monthly.closing : t.monthly.confirm.close(period)}
         </button>
         <button
           type="button"
@@ -359,7 +368,7 @@ function CloseConfirmation({
           className="press rounded-lg border border-kumo-line bg-kumo-control px-3 py-1.5 text-sm font-medium text-kumo-default hover:bg-kumo-tint disabled:cursor-not-allowed disabled:opacity-60"
           onClick={onCancel}
         >
-          やめる
+          {t.common.cancel}
         </button>
       </div>
     </div>
@@ -370,12 +379,13 @@ function CloseConfirmation({
 function MonthTable({
   report, linkAnomalies, onShowOverview, onRetry,
 }: {
-  report: { data?: MonthlyReport; error?: string };
+  report: { data?: MonthlyReport; failure?: { caught: unknown } };
   linkAnomalies: boolean;
   onShowOverview: () => void;
   onRetry: () => void;
 }) {
-  if (report.error !== undefined) {
+  const t = useT();
+  if (report.failure !== undefined) {
     /*
      * Not a dead end, which is the whole reason the button is here.
      *
@@ -386,7 +396,7 @@ function MonthTable({
     return (
       <div className="flex flex-col items-start gap-3">
         <p className="text-sm text-kumo-danger" data-testid="monthly-error" role="alert">
-          {report.error}
+          {describeFailure(report.failure.caught, t.errors.fallbacks.readMonth)}
         </p>
         <button
           type="button"
@@ -394,14 +404,14 @@ function MonthTable({
           className="text-sm font-medium text-kumo-link hover:text-kumo-brand-hover"
           onClick={onRetry}
         >
-          Try again
+          {t.common.tryAgain}
         </button>
       </div>
     );
   }
 
   if (report.data === undefined) {
-    return <p className="text-sm text-kumo-subtle">Reading the month…</p>;
+    return <p className="text-sm text-kumo-subtle">{t.monthly.reading}</p>;
   }
 
   const { period, rows } = report.data;
@@ -416,7 +426,7 @@ function MonthTable({
         className="rounded-lg border border-dashed border-kumo-line px-4 py-6 text-center text-sm text-kumo-subtle"
         data-testid="monthly-empty"
       >
-        {period} には打刻がありません — nobody clocked in this month, so there is nothing to total.
+        {t.monthly.empty(period)}
       </p>
     );
   }
@@ -439,10 +449,18 @@ function MonthTable({
         <table className="w-full border-collapse text-sm">
           <thead>
             <tr className="border-b border-kumo-line text-left text-xs text-kumo-subtle">
-              <th scope="col" className="py-2 pr-4 font-medium">従業員</th>
-              <th scope="col" className="py-2 pr-4 text-right font-medium">出勤日数</th>
-              <th scope="col" className="py-2 pr-4 text-right font-medium">労働時間</th>
-              <th scope="col" className="py-2 text-right font-medium">要確認</th>
+              <th scope="col" className="py-2 pr-4 font-medium">
+                {t.monthly.columns.employee}
+              </th>
+              <th scope="col" className="py-2 pr-4 text-right font-medium">
+                {t.monthly.columns.daysWorked}
+              </th>
+              <th scope="col" className="py-2 pr-4 text-right font-medium">
+                {t.monthly.columns.workedHours}
+              </th>
+              <th scope="col" className="py-2 text-right font-medium">
+                {t.monthly.columns.needsALook}
+              </th>
             </tr>
           </thead>
           <tbody className="divide-y divide-kumo-line">
@@ -468,6 +486,7 @@ function MonthRow({
   linkAnomalies: boolean;
   onShowOverview: () => void;
 }) {
+  const t = useT();
   return (
     <tr data-monthly-employee={row.employeeId}>
       <td className="py-2 pr-4">
@@ -478,7 +497,7 @@ function MonthRow({
         {row.daysWorked}
       </td>
       <td className="py-2 pr-4 text-right font-mono text-kumo-default" data-testid="hours">
-        {formatWorkedHours(row.workedMinutes)}
+        {t.labels.durations.full(row.workedMinutes)}
       </td>
       <td className="py-2 text-right font-mono" data-testid="anomalies">
         <AnomalyCount row={row} linkAnomalies={linkAnomalies} onShowOverview={onShowOverview} />
@@ -503,36 +522,20 @@ function AnomalyCount({
   linkAnomalies: boolean;
   onShowOverview: () => void;
 }): ReactNode {
+  const t = useT();
   if (row.anomalousDays === 0) return <span className="text-kumo-inactive">0</span>;
   if (!linkAnomalies) return <span className="text-kumo-danger">{row.anomalousDays}</span>;
   return (
     <button
       type="button"
       data-action="show-anomalies"
-      aria-label={
-        `${row.anomalousDays} days need a look for ${row.displayName} — open 要対応`
-      }
+      aria-label={t.monthly.anomalyLink(row.anomalousDays, row.displayName)}
       className="press font-medium text-kumo-link underline hover:text-kumo-brand-hover"
       onClick={onShowOverview}
     >
       {row.anomalousDays}
     </button>
   );
-}
-
-/**
- * `162h 30m`, and always both units.
- *
- * Deliberately NOT `formatDuration` in `OverviewTab.tsx`, which drops the empty half — `3h`, `45m`
- * — because that one labels a single request in a sentence and this one fills a column a reader
- * runs their eye down. `162h` beside `162h 30m` makes the column ragged at exactly the place
- * somebody is comparing two people's months.
- *
- * It is arithmetic on a number that arrived already computed. Nothing here decides what counts as
- * worked time; `workedMinutes` in `store/punches.ts` is the only place that is decided.
- */
-function formatWorkedHours(minutes: number): string {
-  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
 /**

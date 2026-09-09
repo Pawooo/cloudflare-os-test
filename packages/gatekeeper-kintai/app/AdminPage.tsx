@@ -19,8 +19,10 @@ import type {
   AnomalousDay, EmployeeDay, EmployeeId, KintaiIdentity, MonthlyReport, NewEmployee, PendingItem,
   RosterEntry, UiLanguage, WorkDatePolicy,
 } from "../src/types";
-import { WORK_DATE_POLICIES, WORK_DATE_POLICY_LABELS } from "../src/work-date";
+import { WORK_DATE_POLICIES } from "../src/work-date";
 import { describeFailure } from "./errors";
+import { useT, type Messages } from "./i18n";
+import { LanguageToggle } from "./i18n/LanguageToggle";
 import { MonthlyTab } from "./MonthlyTab";
 import { OverviewTab } from "./OverviewTab";
 import { isReady, RosterRow } from "./RosterRow";
@@ -95,14 +97,43 @@ export type RowFixes = {
   onSetPolicy: (employee: RosterEntry) => void;
 };
 
+/**
+ * Which fallback sentence a failure gets when there is nothing else to go on.
+ *
+ * A KEY rather than a string, because a failure is stored and rendered at two different moments:
+ * see `Notice` below.
+ */
+type FallbackKey = keyof Messages["errors"]["fallbacks"];
+
+/**
+ * A read that failed, held as the FAILURE rather than as the sentence describing it.
+ *
+ * `load` is a `useCallback` over `[api]`, and `t` has no business in its dependency list: a
+ * language in there would make a toggle re-run `whoAmI` and `listEmployees`, and a language
+ * omitted from it would freeze the message in whichever language it was written in. So the read
+ * stores what it caught and which action it was, and the render describes it — a switch
+ * retranslates an error already on screen. Wrapped rather than a bare `unknown` so that a thrown
+ * `undefined` is still a failure.
+ */
+type Failure = { caught: unknown; fallback: FallbackKey };
+
 type View =
   | { status: "loading" }
-  | { status: "failed"; message: string }
+  | { status: "failed"; failure: Failure }
   | { status: "admin"; identity: KintaiIdentity; roster: RosterEntry[] };
 
 /** Which form a message or a spinner belongs to. Failures must land beside what failed. */
 type FormKey = "create" | "link" | "report" | "approver" | "exempt" | "policy";
-type Notice = { kind: "ok" | "error"; text: string };
+
+/**
+ * What a form says after it has written, held so that it can be said in either language.
+ *
+ * The success arm carries a FUNCTION of the dictionary rather than a finished sentence, for the
+ * reason `Failure` carries what was caught: a notice that outlived a language switch would
+ * otherwise sit in the header's new language saying its piece in the old one. `FormCard` calls it
+ * with its own `useT()` at render time.
+ */
+type Notice = { kind: "ok"; say: (t: Messages) => string } | ({ kind: "error" } & Failure);
 
 /**
  * The admin dashboard's three panels. 要対応 ("needs attention") is the default: it is the queue
@@ -126,8 +157,15 @@ type Tab = "overview" | "monthly" | "roster";
  *
  * So `load` has two answers: a roster, or a failure shown as one. Any error from either read is
  * a failure — there is no error that means "not an administrator" any more.
+ *
+ * ONE LANGUAGE, and this component does not choose it: `main.tsx` resolves it from the account's
+ * saved choice and the browser's own preference and hands it to `LanguageProvider`, and every word
+ * below — this file's, `RosterRow`'s and `MonthlyTab`'s — comes off `useT()`. The toggle that
+ * changes it sits in the header, the only control here that is not about attendance and the only
+ * one whose effect is the whole screen at once.
  */
 export default function AdminPage({ api }: { api: KintaiAdminClient }) {
+  const t = useT();
   const [view, setView] = useState<View>({ status: "loading" });
   const [tab, setTab] = useState<Tab>("overview");
   const [pending, setPending] = useState<FormKey>();
@@ -216,10 +254,7 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
     } catch (caught) {
       await rosterCall;
       if (live.current) {
-        setView({
-          status: "failed",
-          message: describeFailure(caught, "Couldn’t read your Kintai account."),
-        });
+        setView({ status: "failed", failure: { caught, fallback: "readAccount" } });
       }
       return;
     }
@@ -228,10 +263,7 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
     if ("roster" in result) {
       setView({ status: "admin", identity, roster: result.roster });
     } else {
-      setView({
-        status: "failed",
-        message: describeFailure(result.error, "Couldn’t load the roster."),
-      });
+      setView({ status: "failed", failure: { caught: result.error, fallback: "readRoster" } });
     }
   }, [api]);
 
@@ -244,10 +276,13 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
    *
    * The reload is not a nicety: `linkAccount` and `setReportingLine` both change whether other
    * employees are usable, and the roster is the only place this screen tells the truth about that.
-   * `action` returns the sentence to show on success, so the confirmation can name what happened.
+   * `action` returns a function OF THE DICTIONARY that builds the sentence to show on success, so
+   * the confirmation can name what happened and still follow a language switch afterwards.
    */
   const submit = useCallback(
-    async (key: FormKey, fallback: string, action: () => Promise<string>): Promise<boolean> => {
+    async (
+      key: FormKey, fallback: FallbackKey, action: () => Promise<(t: Messages) => string>,
+    ): Promise<boolean> => {
       setPending(key);
       setNotices((current) => ({ ...current, [key]: undefined }));
       try {
@@ -257,13 +292,13 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
           // Every repair here changes the org chart, and 要対応's queue answers "who can decide
           // this" by probing that chart. See `queueToken`.
           invalidateQueue();
-          setNotices((current) => ({ ...current, [key]: { kind: "ok", text: done } }));
+          setNotices((current) => ({ ...current, [key]: { kind: "ok", say: done } }));
         }
         return true;
       } catch (caught) {
         if (live.current) {
           setNotices((current) => ({
-            ...current, [key]: { kind: "error", text: describeFailure(caught, fallback) },
+            ...current, [key]: { kind: "error", caught, fallback },
           }));
         }
         return false;
@@ -321,29 +356,37 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
 
   return (
     <main className="mx-auto flex min-h-full w-full max-w-4xl flex-col gap-8 px-5 py-10 sm:px-8 sm:py-12">
-      <header>
-        <h1 className="text-2xl font-semibold tracking-tight text-kumo-default">Kintai</h1>
-        <p className="mt-1 text-sm text-kumo-subtle">
-          {view.status === "admin"
-            ? "Employee records, account codes and reporting lines."
-            : "Attendance and overtime."}
-        </p>
+      {/* Title and subtitle left, the language toggle hard right — a row, so the control keeps the
+          trailing edge whatever the subtitle's length in either language. Same shape as the
+          employee gadget's header, because it is the same control doing the same thing. */}
+      <header className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight text-kumo-default">
+            {t.header.appName}
+          </h1>
+          <p className="mt-1 text-sm text-kumo-subtle">
+            {view.status === "admin" ? t.header.adminSubtitle : t.header.subtitle}
+          </p>
+        </div>
+        <LanguageToggle api={api} />
       </header>
 
       {view.status === "loading" && (
-        <p className="text-sm text-kumo-subtle">Loading your account…</p>
+        <p className="text-sm text-kumo-subtle">{t.header.loadingAccount}</p>
       )}
 
       {view.status === "failed" && (
         <div className="flex flex-col items-start gap-3">
-          <p className="text-sm text-kumo-danger" data-testid="error">{view.message}</p>
+          <p className="text-sm text-kumo-danger" data-testid="error">
+            {describeFailure(view.failure.caught, t.errors.fallbacks[view.failure.fallback])}
+          </p>
           <button
             type="button"
             data-action="retry"
             className="text-sm font-medium text-kumo-link hover:text-kumo-brand-hover"
             onClick={() => void load()}
           >
-            Try again
+            {t.common.tryAgain}
           </button>
         </div>
       )}
@@ -398,9 +441,10 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
                 busy={pending === "link"}
                 notice={notices.link}
                 onSubmit={(accountId, employeeId) =>
-                  submit("link", "Couldn’t link that account code.", async () => {
+                  submit("link", "linkAccount", async () => {
                     await api.linkAccount(accountId, employeeId);
-                    return `Linked ${nameOf(view.roster, employeeId)} to that account code.`;
+                    return (t) =>
+                      t.roster.forms.link.done(nameOf(view.roster, employeeId, t));
                   })}
               />
               <ReportingLineForm
@@ -411,10 +455,11 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
                 busy={pending === "report"}
                 notice={notices.report}
                 onSubmit={(employeeId, managerId) =>
-                  submit("report", "Couldn’t set that reporting line.", async () => {
+                  submit("report", "setReportingLine", async () => {
                     await api.setReportingLine(employeeId, managerId);
-                    return `${nameOf(view.roster, employeeId)} now reports to ` +
-                      `${nameOf(view.roster, managerId)}.`;
+                    return (t) => t.roster.forms.reportingLine.done(
+                      nameOf(view.roster, employeeId, t), nameOf(view.roster, managerId, t),
+                    );
                   })}
               />
               <DesignatedApproverForm
@@ -425,10 +470,11 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
                 busy={pending === "approver"}
                 notice={notices.approver}
                 onSubmit={(employeeId, approverId) =>
-                  submit("approver", "Couldn’t set that designated approver.", async () => {
+                  submit("approver", "setApprover", async () => {
                     await api.setDesignatedApprover(employeeId, approverId);
-                    return `${nameOf(view.roster, approverId)} can now approve for ` +
-                      `${nameOf(view.roster, employeeId)}.`;
+                    return (t) => t.roster.forms.approver.done(
+                      nameOf(view.roster, approverId, t), nameOf(view.roster, employeeId, t),
+                    );
                   })}
               />
               <ExemptionForm
@@ -439,9 +485,10 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
                 busy={pending === "exempt"}
                 notice={notices.exempt}
                 onSubmit={(employeeId) =>
-                  submit("exempt", "Couldn’t record that exemption.", async () => {
+                  submit("exempt", "grantExemption", async () => {
                     await api.grantExemption(employeeId);
-                    return `${nameOf(view.roster, employeeId)} is recorded as 管理監督者 from now.`;
+                    return (t) =>
+                      t.roster.forms.exemption.done(nameOf(view.roster, employeeId, t));
                   })}
               />
               <WorkDatePolicyForm
@@ -452,11 +499,10 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
                 busy={pending === "policy"}
                 notice={notices.policy}
                 onSubmit={(employeeId, policy) =>
-                  submit("policy", "Couldn’t change that work-date policy.", async () => {
+                  submit("policy", "setWorkDatePolicy", async () => {
                     await api.setWorkDatePolicy(employeeId, policy);
-                    return `${nameOf(view.roster, employeeId)}: new punches will be filed ` +
-                      `${policy === "shift_start" ? "against the date their shift started" : "against the date they happen on"}.` +
-                      " Punches already recorded are unchanged.";
+                    return (t) =>
+                      t.roster.forms.workDate.done(nameOf(view.roster, employeeId, t), policy);
                   })}
               />
               <CreateEmployeeForm
@@ -464,10 +510,9 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
                 busy={pending === "create"}
                 notice={notices.create}
                 onSubmit={(input) =>
-                  submit("create", "Couldn’t create that employee.", async () => {
+                  submit("create", "createEmployee", async () => {
                     await api.createEmployee(input);
-                    return `Added ${input.displayName}. They still need an account code` +
-                      " and someone who can approve for them.";
+                    return (t) => t.roster.forms.create.done(input.displayName);
                   })}
               />
             </div>
@@ -478,12 +523,6 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
   );
 }
 
-const TABS: { id: Tab; label: string }[] = [
-  { id: "overview", label: "要対応" },
-  { id: "monthly", label: "月次" },
-  { id: "roster", label: "Roster" },
-];
-
 /**
  * The three panels, all mounted at once — see `hidden` on each panel above.
  *
@@ -491,11 +530,21 @@ const TABS: { id: Tab; label: string }[] = [
  * sandbox concern the way `FormCard`'s fields have one — a native `<button>` already answers
  * Enter and Space without any extra handling, and `type="button"` only keeps it inert if it is
  * ever moved inside a `<form>`.
+ *
+ * The tab list is built per render off `t` rather than held in a module const: a const would have
+ * frozen one language's words at import time, before any provider existed to ask.
  */
 function TabBar({ tab, onSelect }: { tab: Tab; onSelect: (tab: Tab) => void }) {
+  const t = useT();
+  const tabs: { id: Tab; label: string }[] = [
+    { id: "overview", label: t.tabs.overview },
+    { id: "monthly", label: t.tabs.monthly },
+    { id: "roster", label: t.tabs.roster },
+  ];
+
   return (
     <div role="tablist" className="flex gap-2 border-b border-kumo-line pb-px">
-      {TABS.map(({ id, label }) => {
+      {tabs.map(({ id, label }) => {
         const active = tab === id;
         return (
           <button
@@ -547,6 +596,7 @@ function reveal(node: HTMLElement | null, formAction: string): void {
  * off the employee gadget, not here.)
  */
 function AccountCard({ identity }: { identity: KintaiIdentity }) {
+  const t = useT();
   const [copied, setCopied] = useState<"copied" | "select" | undefined>();
   const codeRef = useRef<HTMLParagraphElement>(null);
 
@@ -578,7 +628,7 @@ function AccountCard({ identity }: { identity: KintaiIdentity }) {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <h2 id="account-heading" className="text-xs font-medium text-kumo-subtle">
-            Your account code
+            {t.header.account.heading}
           </h2>
           <p
             ref={codeRef}
@@ -594,12 +644,12 @@ function AccountCard({ identity }: { identity: KintaiIdentity }) {
           className="press shrink-0 rounded-lg border border-kumo-line bg-kumo-control px-3 py-1.5 text-sm font-medium text-kumo-default hover:bg-kumo-tint"
           onClick={() => void copy()}
         >
-          {copied === "copied" ? "Copied" : "Copy"}
+          {copied === "copied" ? t.header.account.copied : t.header.account.copy}
         </button>
       </div>
       {copied === "select" && (
         <p className="text-xs text-kumo-subtle" data-testid="copy-fallback">
-          Selected the code — press ⌘C or Ctrl+C to copy it.
+          {t.header.account.selected}
         </p>
       )}
       <p className="text-sm text-kumo-default" data-testid="linked">
@@ -608,12 +658,12 @@ function AccountCard({ identity }: { identity: KintaiIdentity }) {
             {/* The id, not a name: `whoAmI` answers from `account_links` alone — the roster that
                 holds display names is a separate read. The number is still what HR asks for when
                 someone needs help. */}
-            You’re set up — this account is employee record{" "}
-            <span data-testid="employee-id">{identity.employeeId}</span>.
+            {t.header.account.linkedPrefix}
+            <span data-testid="employee-id">{identity.employeeId}</span>
+            {t.header.account.linkedSuffix}
           </>
         ) : (
-          "Not linked to an employee record yet, so your changes are recorded without a name" +
-          " against them. Link this code to your own record below."
+          t.header.account.notLinked
         )}
       </p>
     </section>
@@ -639,24 +689,24 @@ function Roster({
   canSetManager: boolean;
   fixes: RowFixes;
 }) {
+  const t = useT();
   const names = new Map(roster.map((row) => [row.id, row.display_name]));
   const incomplete = roster.filter((row) => !isReady(row)).length;
 
   return (
     <section aria-labelledby="roster-heading">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <h2 id="roster-heading" className="text-sm font-semibold text-kumo-default">Roster</h2>
+        <h2 id="roster-heading" className="text-sm font-semibold text-kumo-default">
+          {t.roster.heading}
+        </h2>
         <p className="text-xs text-kumo-subtle" data-testid="roster-summary">
-          {roster.length === 0
-            ? "Nobody yet"
-            : `${roster.length} ${roster.length === 1 ? "employee" : "employees"}` +
-              (incomplete > 0 ? ` · ${incomplete} not ready to use Kintai` : " · all ready")}
+          {t.roster.summary(roster.length, incomplete)}
         </p>
       </div>
 
       {roster.length === 0 ? (
         <p className="mt-3 rounded-lg border border-dashed border-kumo-line px-4 py-8 text-center text-sm text-kumo-subtle">
-          No employee records yet. Add the first one below.
+          {t.roster.empty}
         </p>
       ) : (
         <ul className="mt-3 divide-y divide-kumo-line border-y border-kumo-line">
@@ -679,8 +729,8 @@ function Roster({
   );
 }
 
-function nameOf(roster: RosterEntry[], id: EmployeeId): string {
-  return roster.find((row) => row.id === id)?.display_name ?? `employee ${id}`;
+function nameOf(roster: RosterEntry[], id: EmployeeId, t: Messages): string {
+  return roster.find((row) => row.id === id)?.display_name ?? t.common.employeeFallback(id);
 }
 
 /** The core onboarding action: point an account code the employee read out at their record. */
@@ -695,26 +745,27 @@ function LinkAccountForm({
   notice?: Notice;
   onSubmit: (accountId: string, employeeId: EmployeeId) => Promise<boolean>;
 }) {
+  const t = useT();
   const [accountId, setAccountId] = useState("");
   const id = useId();
 
   return (
     <FormCard
-      title="Link an account code"
-      hint="The employee reads this off their own Kintai page and gives it to you — there is no way to look one up. Linking replaces whatever code they had before, which is how an email change is handled."
+      title={t.roster.forms.link.title}
+      hint={t.roster.forms.link.hint}
       disabled={roster.length === 0}
-      disabledHint="Add an employee record first."
+      disabledHint={t.roster.forms.needAnEmployee}
       busy={busy}
       notice={notice}
       action="link-account"
-      submitLabel="Link account"
+      submitLabel={t.roster.forms.link.submit}
       onSubmit={async () => {
         if (!await onSubmit(accountId.trim(), Number(employeeId))) return;
         setAccountId("");
         onEmployeeId("");
       }}
     >
-      <Field label="Account code" htmlFor={`${id}-code`}>
+      <Field label={t.roster.forms.link.code} htmlFor={`${id}-code`}>
         <input
           id={`${id}-code`}
           ref={codeRef}
@@ -724,12 +775,12 @@ function LinkAccountForm({
           maxLength={200}
           spellCheck={false}
           autoComplete="off"
-          placeholder="00000000-0000-0000-0000-000000000000"
+          placeholder={t.roster.forms.link.codePlaceholder}
           className="h-9 w-full rounded-lg border border-kumo-line bg-kumo-control px-3 font-mono text-sm text-kumo-default outline-none placeholder:text-kumo-inactive focus:ring-2 focus:ring-kumo-ring"
           onChange={(event) => setAccountId(event.currentTarget.value)}
         />
       </Field>
-      <Field label="Employee" htmlFor={`${id}-employee`}>
+      <Field label={t.roster.forms.employee} htmlFor={`${id}-employee`}>
         <EmployeeSelect
           id={`${id}-employee`}
           name="employeeId"
@@ -754,26 +805,27 @@ function ReportingLineForm({
   notice?: Notice;
   onSubmit: (employeeId: EmployeeId, managerId: EmployeeId) => Promise<boolean>;
 }) {
+  const t = useT();
   const [managerId, setManagerId] = useState("");
   const id = useId();
 
   return (
     <FormCard
-      title="Set a reporting line"
-      hint="A reporting line is what lets the manager approve this employee’s overtime. It opens now and stays open; nobody can approve their own submissions."
+      title={t.roster.forms.reportingLine.title}
+      hint={t.roster.forms.reportingLine.hint}
       disabled={roster.length < 2}
-      disabledHint="Two employee records are needed before anyone can report to anyone."
+      disabledHint={t.roster.forms.reportingLine.disabledHint}
       busy={busy}
       notice={notice}
       action="set-reporting-line"
-      submitLabel="Set reporting line"
+      submitLabel={t.roster.forms.reportingLine.submit}
       onSubmit={async () => {
         if (!await onSubmit(Number(employeeId), Number(managerId))) return;
         onEmployeeId("");
         setManagerId("");
       }}
     >
-      <Field label="Employee" htmlFor={`${id}-employee`}>
+      <Field label={t.roster.forms.employee} htmlFor={`${id}-employee`}>
         <EmployeeSelect
           id={`${id}-employee`}
           name="employeeId"
@@ -782,7 +834,7 @@ function ReportingLineForm({
           onChange={onEmployeeId}
         />
       </Field>
-      <Field label="Reports to" htmlFor={`${id}-manager`}>
+      <Field label={t.roster.forms.reportingLine.manager} htmlFor={`${id}-manager`}>
         <EmployeeSelect
           id={`${id}-manager`}
           name="managerId"
@@ -820,26 +872,27 @@ function DesignatedApproverForm({
   notice?: Notice;
   onSubmit: (employeeId: EmployeeId, approverId: EmployeeId) => Promise<boolean>;
 }) {
+  const t = useT();
   const [approverId, setApproverId] = useState("");
   const id = useId();
 
   return (
     <FormCard
-      title="Set a designated approver"
-      hint="For an employee at the top of the organisation, who reports to nobody: it names the one person who may approve what they file — overtime, and corrections to their punches. Use a reporting line instead wherever one honestly exists. Nobody may approve their own submissions, so an employee cannot be their own approver."
+      title={t.roster.forms.approver.title}
+      hint={t.roster.forms.approver.hint}
       disabled={roster.length < 2}
-      disabledHint="Two employee records are needed before anyone can approve for anyone."
+      disabledHint={t.roster.forms.approver.disabledHint}
       busy={busy}
       notice={notice}
       action="set-designated-approver"
-      submitLabel="Set approver"
+      submitLabel={t.roster.forms.approver.submit}
       onSubmit={async () => {
         if (!await onSubmit(Number(employeeId), Number(approverId))) return;
         onEmployeeId("");
         setApproverId("");
       }}
     >
-      <Field label="Employee" htmlFor={`${id}-employee`}>
+      <Field label={t.roster.forms.employee} htmlFor={`${id}-employee`}>
         <EmployeeSelect
           id={`${id}-employee`}
           name="employeeId"
@@ -848,7 +901,7 @@ function DesignatedApproverForm({
           onChange={onEmployeeId}
         />
       </Field>
-      <Field label="Approved by" htmlFor={`${id}-approver`}>
+      <Field label={t.roster.forms.approver.approvedBy} htmlFor={`${id}-approver`}>
         <EmployeeSelect
           id={`${id}-approver`}
           name="approverId"
@@ -883,23 +936,24 @@ function ExemptionForm({
   notice?: Notice;
   onSubmit: (employeeId: EmployeeId) => Promise<boolean>;
 }) {
+  const t = useT();
   const id = useId();
 
   return (
     <FormCard
-      title="Record a 管理監督者 exemption"
-      hint="For a manager or officer whose authority and treatment make them 管理監督者 under 労働基準法 §41: it marks them exempt from overtime premiums, so they file no overtime requests. It does NOT give them an approver — their punches still need correcting sometimes, and a correction needs a person, so they still need a manager or a designated approver. Recorded from now and open-ended — there is no way to end it here yet, so use it only where the determination has actually been made."
+      title={t.roster.forms.exemption.title}
+      hint={t.roster.forms.exemption.hint}
       disabled={roster.length === 0}
-      disabledHint="Add an employee record first."
+      disabledHint={t.roster.forms.needAnEmployee}
       busy={busy}
       notice={notice}
       action="grant-exemption"
-      submitLabel="Record exemption"
+      submitLabel={t.roster.forms.exemption.submit}
       onSubmit={async () => {
         if (await onSubmit(Number(employeeId))) onEmployeeId("");
       }}
     >
-      <Field label="Employee" htmlFor={`${id}-employee`}>
+      <Field label={t.roster.forms.employee} htmlFor={`${id}-employee`}>
         <EmployeeSelect
           id={`${id}-employee`}
           name="employeeId"
@@ -923,7 +977,9 @@ function ExemptionForm({
  * what will happen to punches from now on rather than claiming a repair.
  *
  * The dropdown is filled from `WORK_DATE_POLICIES`, the same list the worker's own types are built
- * from, so the form cannot offer a value the server would refuse.
+ * from, so the form cannot offer a value the server would refuse — and the WORDS for each value
+ * come from `t.labels.workDatePolicies`, not from `src/work-date.ts`, which had them in English
+ * only: a Japanese administrator was choosing a policy from an English dropdown.
  *
  * The hint warns about the mid-shift case because nothing else does and nothing refuses it.
  * Switching a night worker off `shift_start` while they are clocked in strands that one
@@ -949,6 +1005,7 @@ function WorkDatePolicyForm({
   // and a dropdown holding its own independent value would then sit on `calendar` while showing a
   // night worker's name — one press and their policy is silently reverted. Changing the selected
   // employee retires the override automatically, because it no longer matches.
+  const t = useT();
   const [choice, setChoice] = useState<{ employeeId: string; policy: WorkDatePolicy }>();
   const id = useId();
 
@@ -959,19 +1016,19 @@ function WorkDatePolicyForm({
 
   return (
     <FormCard
-      title="Set which day punches are filed against"
-      hint="Office staff finish before midnight, so the calendar date is right for them and it is the default. A night shift crossing midnight has to be filed against the date it started, or it splits across two days and both get flagged. This applies to punches made from now on — it does not move anything already recorded, so set it when you onboard someone who works nights. Do not change it while the employee is clocked in: their current shift is stranded half on each day and both halves get flagged, and only an administrative correction can tidy that up. Wait until they have clocked out."
+      title={t.roster.forms.workDate.title}
+      hint={t.roster.forms.workDate.hint}
       disabled={roster.length === 0}
-      disabledHint="Add an employee record first."
+      disabledHint={t.roster.forms.needAnEmployee}
       busy={busy}
       notice={notice}
       action="set-work-date-policy"
-      submitLabel="Set policy"
+      submitLabel={t.roster.forms.workDate.submit}
       onSubmit={async () => {
         if (await onSubmit(Number(employeeId), policy)) onEmployeeId("");
       }}
     >
-      <Field label="Employee" htmlFor={`${id}-employee`}>
+      <Field label={t.roster.forms.employee} htmlFor={`${id}-employee`}>
         <EmployeeSelect
           id={`${id}-employee`}
           name="employeeId"
@@ -982,9 +1039,9 @@ function WorkDatePolicyForm({
         />
       </Field>
       <Field
-        label="Work date"
+        label={t.roster.forms.workDate.label}
         htmlFor={`${id}-policy`}
-        note={current ? `Currently ${WORK_DATE_POLICY_LABELS[current]}.` : undefined}
+        note={current ? t.roster.forms.workDate.current(current) : undefined}
       >
         <select
           id={`${id}-policy`}
@@ -996,7 +1053,7 @@ function WorkDatePolicyForm({
             setChoice({ employeeId, policy: event.currentTarget.value as WorkDatePolicy })}
         >
           {WORK_DATE_POLICIES.map((value) => (
-            <option key={value} value={value}>{WORK_DATE_POLICY_LABELS[value]}</option>
+            <option key={value} value={value}>{t.labels.workDatePolicies[value]}</option>
           ))}
         </select>
       </Field>
@@ -1017,6 +1074,7 @@ function CreateEmployeeForm({
     employeeNumber: "", displayName: "", department: "", employmentType: "",
     joinedOn: "", designatedApproverId: "",
   };
+  const t = useT();
   const [form, setForm] = useState(empty);
   const id = useId();
   const set = (key: keyof typeof empty) => (value: string) =>
@@ -1024,12 +1082,12 @@ function CreateEmployeeForm({
 
   return (
     <FormCard
-      title="Add an employee"
-      hint="Creates the record only. They still need an account code linked, and somebody who can approve for them, before they can use Kintai."
+      title={t.roster.forms.create.title}
+      hint={t.roster.forms.create.hint}
       busy={busy}
       notice={notice}
       action="create-employee"
-      submitLabel="Add employee"
+      submitLabel={t.roster.forms.create.submit}
       onSubmit={async () => {
         const ok = await onSubmit({
           employeeNumber: form.employeeNumber.trim(),
@@ -1044,43 +1102,46 @@ function CreateEmployeeForm({
         if (ok) setForm(empty);
       }}
     >
-      <Field label="Employee number" htmlFor={`${id}-number`}>
+      <Field label={t.roster.forms.create.number} htmlFor={`${id}-number`}>
         <TextInput
           id={`${id}-number`} name="employeeNumber" required maxLength={64}
-          value={form.employeeNumber} onChange={set("employeeNumber")} placeholder="E-1001"
+          value={form.employeeNumber} onChange={set("employeeNumber")}
+          placeholder={t.roster.forms.create.numberPlaceholder}
         />
       </Field>
-      <Field label="Name" htmlFor={`${id}-name`}>
+      <Field label={t.roster.forms.create.name} htmlFor={`${id}-name`}>
         <TextInput
           id={`${id}-name`} name="displayName" required maxLength={200}
-          value={form.displayName} onChange={set("displayName")} placeholder="田中 太郎"
+          value={form.displayName} onChange={set("displayName")}
+          placeholder={t.roster.forms.create.namePlaceholder}
         />
       </Field>
-      <Field label="Joining date" htmlFor={`${id}-joined`}>
+      <Field label={t.roster.forms.create.joinedOn} htmlFor={`${id}-joined`}>
         <TextInput
           id={`${id}-joined`} name="joinedOn" required type="date" maxLength={10}
           value={form.joinedOn} onChange={set("joinedOn")}
         />
       </Field>
-      <Field label="Department" htmlFor={`${id}-department`} optional>
+      <Field label={t.roster.forms.create.department} htmlFor={`${id}-department`} optional>
         <TextInput
           id={`${id}-department`} name="department" maxLength={120}
           value={form.department} onChange={set("department")}
         />
       </Field>
-      <Field label="Employment type" htmlFor={`${id}-type`} optional>
+      <Field label={t.roster.forms.create.employmentType} htmlFor={`${id}-type`} optional>
         <TextInput
           id={`${id}-type`} name="employmentType" maxLength={64}
-          value={form.employmentType} onChange={set("employmentType")} placeholder="正社員"
+          value={form.employmentType} onChange={set("employmentType")}
+          placeholder={t.roster.forms.create.employmentTypePlaceholder}
         />
       </Field>
       <Field
-        label="Designated approver"
+        label={t.roster.forms.create.approver}
         htmlFor={`${id}-approver`}
         optional
         // The escape hatch for someone at the top of the org chart, who has no manager and would
         // otherwise be permanently unable to have anything approved.
-        note="For an employee who reports to nobody."
+        note={t.roster.forms.create.approverNote}
       >
         <EmployeeSelect
           id={`${id}-approver`}
@@ -1088,7 +1149,7 @@ function CreateEmployeeForm({
           roster={roster}
           value={form.designatedApproverId}
           onChange={set("designatedApproverId")}
-          placeholder="Nobody"
+          placeholder={t.roster.forms.create.approverNone}
         />
       </Field>
     </FormCard>
@@ -1133,6 +1194,7 @@ function FormCard({
   onSubmit: () => Promise<void>;
   children: ReactNode;
 }) {
+  const t = useT();
   return (
     <details
       className="group rounded-lg border border-kumo-line bg-kumo-elevated"
@@ -1141,7 +1203,9 @@ function FormCard({
     >
       <summary className="flex items-center justify-between px-4 py-3 text-sm font-medium text-kumo-default">
         {title}
-        <span className="text-xs font-normal text-kumo-inactive group-open:hidden">Show</span>
+        <span className="text-xs font-normal text-kumo-inactive group-open:hidden">
+          {t.common.show}
+        </span>
       </summary>
       <form
         className="flex flex-col gap-4 border-t border-kumo-line px-4 py-4"
@@ -1174,7 +1238,7 @@ function FormCard({
                 className="press inline-flex h-9 items-center rounded-lg bg-kumo-brand px-3.5 text-sm font-medium text-white hover:bg-kumo-brand-hover disabled:opacity-50"
                 onClick={() => void onSubmit()}
               >
-                {busy ? "Saving…" : submitLabel}
+                {busy ? t.common.saving : submitLabel}
               </button>
               {notice && (
                 <p
@@ -1182,7 +1246,11 @@ function FormCard({
                   role={notice.kind === "error" ? "alert" : "status"}
                   className={`text-xs ${notice.kind === "error" ? "text-kumo-danger" : "text-kumo-subtle"}`}
                 >
-                  {notice.text}
+                  {/* Described HERE and not where it was stored, so a notice already on screen
+                      follows a language switch. See `Notice`. */}
+                  {notice.kind === "ok"
+                    ? notice.say(t)
+                    : describeFailure(notice.caught, t.errors.fallbacks[notice.fallback])}
                 </p>
               )}
             </div>
@@ -1202,11 +1270,14 @@ function Field({
   note?: string;
   children: ReactNode;
 }) {
+  const t = useT();
   return (
     <div className="flex flex-col gap-1.5">
       <label htmlFor={htmlFor} className="text-xs font-medium text-kumo-subtle">
         {label}
-        {optional && <span className="ml-1 font-normal text-kumo-inactive">optional</span>}
+        {optional && (
+          <span className="ml-1 font-normal text-kumo-inactive">{t.common.optional}</span>
+        )}
       </label>
       {children}
       {note && <p className="text-xs text-kumo-inactive">{note}</p>}
@@ -1261,6 +1332,7 @@ function EmployeeSelect({
   placeholder?: string;
   selectRef?: React.RefObject<HTMLSelectElement | null>;
 }) {
+  const t = useT();
   return (
     <select
       id={id}
@@ -1271,7 +1343,7 @@ function EmployeeSelect({
       className="h-9 w-full rounded-lg border border-kumo-line bg-kumo-control px-2 text-sm text-kumo-default outline-none focus:ring-2 focus:ring-kumo-ring"
       onChange={(event) => onChange(event.currentTarget.value)}
     >
-      <option value="">{placeholder ?? "Choose an employee…"}</option>
+      <option value="">{placeholder ?? t.roster.forms.chooseEmployee}</option>
       {roster.map((employee) => (
         <option key={employee.id} value={employee.id}>
           {employee.display_name} · {employee.employee_number}

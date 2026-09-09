@@ -27,6 +27,10 @@ installErrorReporting();
  *
  * It follows a toggle too: a switch rerenders this, so a crash after a switch speaks the language
  * the reader chose rather than the one the page opened in.
+ *
+ * `main.tsx` has the same four lines. Not shared, deliberately: a module holding it would have to
+ * be imported by both entries to save four lines that say nothing either entry does not already
+ * say, and the two entry points otherwise share nothing at all.
  */
 function TranslatedBoundary({ children }: { children: ReactNode }) {
   const t = useT();
