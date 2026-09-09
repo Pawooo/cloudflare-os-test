@@ -101,13 +101,13 @@ export type KintaiIdentity = {
    * conflating "never chosen" with "chose English" would make that decision impossible to tell
    * from a real one.
    *
-   * OPTIONAL ON THE TYPE, never on the wire: `identify()` always sets this key, `null` included,
-   * on every `whoAmI()` response — the RPC surface pin in `admin-api.test.ts` checks for the key
-   * by name. The `?` exists only so the older `whoAmI` mocks in `app/AdminPage.test.tsx` and
-   * `app/EmployeePage.test.tsx` keep compiling without this task editing `app/`; the screens that
-   * consume `language` are later work (see the i18n design doc) and will read it explicitly.
+   * REQUIRED, matching the wire: `identify()` always sets this key, `null` included, on every
+   * `whoAmI()` response — the RPC surface pin in `admin-api.test.ts` checks for the key by name.
+   * It was briefly optional so the pre-i18n `whoAmI` mocks kept compiling while the wire was being
+   * laid; both screens now read it to choose which dictionary to render (`resolveLanguage` in
+   * `app/i18n`), and a mock that omits it would be a mock of an identity the server cannot send.
    */
-  language?: UiLanguage | null;
+  language: UiLanguage | null;
 };
 
 /**
@@ -506,9 +506,14 @@ export type KintaiEmployeeClient = {
   listMySubmissions(): Promise<SubmissionRow[]>;
   withdrawSubmission(submissionId: number): Promise<void>;
   resubmit(submissionId: number): Promise<void>;
-  // `setLanguage` is NOT here yet, deliberately: this type is the app-facing mirror of
-  // `EmployeeKintaiApi`'s callable surface, and this task's brief scopes app/ changes to the tasks
-  // that build the dictionary and wire up the toggle -- see the i18n design doc. The method exists
-  // on the real capability (`EmployeeKintaiApi.setLanguage`, `kintai.ts`) starting this task; it
-  // joins this mirror when a screen first calls it.
+  /**
+   * Save the caller's own UI language. Identity comes from the capability, so there is nothing to
+   * name but themselves.
+   *
+   * The header's `LanguageToggle` is the only caller: it switches the screen first and calls this
+   * second, so a rejection here costs the reader their saved preference and not the switch they
+   * just made. `@validateRpc()` on `EmployeeKintaiApi.setLanguage` refuses anything but the two
+   * `UI_LANGUAGES` literals before the store is asked.
+   */
+  setLanguage(language: UiLanguage): Promise<void>;
 };

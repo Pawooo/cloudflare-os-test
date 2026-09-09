@@ -17,7 +17,7 @@ import type {
   SubmissionState,
   ApprovalAction,
   AnomalousDay, EmployeeDay, EmployeeId, KintaiIdentity, MonthlyReport, NewEmployee, PendingItem,
-  RosterEntry, WorkDatePolicy,
+  RosterEntry, UiLanguage, WorkDatePolicy,
 } from "../src/types";
 import { WORK_DATE_POLICIES, WORK_DATE_POLICY_LABELS } from "../src/work-date";
 import { describeFailure } from "./errors";
@@ -69,6 +69,15 @@ export type KintaiAdminClient = {
   decideSubmission(
     submissionId: number, action: ApprovalAction, afterEventId: number, comment?: string,
   ): Promise<SubmissionState>;
+  /**
+   * Save the caller's own UI language. Identity comes from the capability, as everywhere here.
+   *
+   * The header's `LanguageToggle` is the only caller, and it switches the screen BEFORE calling
+   * this: a rejection costs the reader the saved preference, never the switch they just made. The
+   * employee mirror carries the same method (`KintaiEmployeeClient` in `src/types.ts`), because
+   * the toggle sits in the header of both pages.
+   */
+  setLanguage(language: UiLanguage): Promise<void>;
 };
 
 /**

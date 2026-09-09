@@ -63,7 +63,7 @@ function employeeMonth(period: string, days: EmployeeMonthDay[]): EmployeeMonth 
 function employeeApi(overrides: Partial<KintaiEmployeeClient> = {}): KintaiEmployeeClient {
   return {
     whoAmI: vi.fn<KintaiEmployeeClient["whoAmI"]>(async () => ({
-      accountId: "acct-emp", linked: true, employeeId: 7,
+      accountId: "acct-emp", linked: true, employeeId: 7, language: "ja",
     })),
     getDay: vi.fn<KintaiEmployeeClient["getDay"]>(async () => ({
       punches: [], allocations: [], anomalies: [], locked: false,
@@ -78,6 +78,7 @@ function employeeApi(overrides: Partial<KintaiEmployeeClient> = {}): KintaiEmplo
     listMySubmissions: vi.fn<KintaiEmployeeClient["listMySubmissions"]>(async () => []),
     withdrawSubmission: vi.fn<KintaiEmployeeClient["withdrawSubmission"]>(async () => {}),
     resubmit: vi.fn<KintaiEmployeeClient["resubmit"]>(async () => {}),
+    setLanguage: vi.fn<KintaiEmployeeClient["setLanguage"]>(async () => {}),
     ...overrides,
   };
 }

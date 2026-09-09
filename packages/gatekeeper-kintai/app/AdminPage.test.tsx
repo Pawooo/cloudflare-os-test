@@ -49,7 +49,7 @@ const SUZUKI = person({
 function adminApi(overrides: Partial<KintaiAdminClient> = {}, roster: RosterEntry[] = [TANAKA]) {
   return {
     whoAmI: vi.fn<KintaiAdminClient["whoAmI"]>(async () => ({
-      accountId: "acct-admin", linked: true, employeeId: 9,
+      accountId: "acct-admin", linked: true, employeeId: 9, language: "ja",
     })),
     listEmployees: vi.fn<KintaiAdminClient["listEmployees"]>(async () => roster),
     createEmployee: vi.fn<KintaiAdminClient["createEmployee"]>(async () => 42),
@@ -72,6 +72,7 @@ function adminApi(overrides: Partial<KintaiAdminClient> = {}, roster: RosterEntr
     })),
     lockPeriod: vi.fn<KintaiAdminClient["lockPeriod"]>(async () => {}),
     decideSubmission: vi.fn<KintaiAdminClient["decideSubmission"]>(async () => "approved"),
+    setLanguage: vi.fn<KintaiAdminClient["setLanguage"]>(async () => {}),
     ...overrides,
   };
 }
@@ -182,7 +183,7 @@ describe("AdminPage", () => {
     it("shows the code and says to link it when the administrator is unlinked", async () => {
       const api = adminApi({
         whoAmI: vi.fn<KintaiAdminClient["whoAmI"]>(async () => ({
-          accountId: "acct-1234", linked: false, employeeId: null,
+          accountId: "acct-1234", linked: false, employeeId: null, language: "ja",
         })),
       });
       await render(<AdminPage api={api} />);
