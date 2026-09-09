@@ -10,17 +10,17 @@ import { ja } from "./i18n";
  * The crash screen, and specifically WHOSE WORDS IT SAYS.
  *
  * `ErrorBoundary` is a class component, so it cannot call `useT()` — a hook is the only way into
- * the language context. The two words come in as an optional `labels` prop instead, passed by a
- * wrapper that reads `useT()` on the provider's side of the boundary (see `employee-main.tsx`).
+ * the language context. The two words come in as a REQUIRED `labels` prop instead, passed by a
+ * wrapper that reads `useT()` on the provider's side of the boundary — `TranslatedBoundary`, which
+ * both entries now have (`main.tsx` and `employee-main.tsx`).
  *
- * THE DEFAULT IS TRANSITIONAL, AND THAT IS WHY THE FIRST TEST EXISTS. `main.tsx` (the admin entry)
- * still mounts this boundary with no provider above it, and a fallback screen that threw looking
- * for a language context would replace a caught render error with an uncaught one — the one failure
- * mode a boundary must not have. So the default stands until the admin screen is migrated, at which
- * point the prop should become required and the default should go. The English strings are
- * duplicated here on purpose rather than imported: an assertion that read `DEFAULT_LABELS` would
- * agree with whatever the default happened to say, where these pin the wording and make both
- * REMOVING and REWORDING the default a visible, deliberate change to this file.
+ * THE ENGLISH DEFAULT IS GONE, AND A TEST WENT WITH IT. `DEFAULT_LABELS` existed for exactly as
+ * long as the admin entry mounted this boundary with no provider above it: a fallback screen that
+ * threw looking for a language context would have replaced a caught render error with an uncaught
+ * one, the one failure mode a boundary must not have. Both entries resolve a language before they
+ * render now, so there is no call site left with nothing to pass — and the removal was visible
+ * because a test had pinned the default's exact wording, which is the whole reason that test was
+ * written. There is no default to fall back to, so there is nothing left for a third test to say.
  */
 describe("ErrorBoundary", () => {
   let container: HTMLDivElement | undefined;
@@ -45,22 +45,6 @@ describe("ErrorBoundary", () => {
     throw new Error("kintai test: a render that fails");
   }
 
-  it("says so in English when no labels are given, and offers an inert reload", async () => {
-    await render(
-      <ErrorBoundary>
-        <Boom />
-      </ErrorBoundary>,
-    );
-
-    expect(container!.textContent).toContain("Something went wrong");
-    const reload = container!.querySelector("button")!;
-    expect(reload.textContent).toBe("Reload");
-    // `type="button"`, like every control in this app: the host's iframe carries
-    // `sandbox="allow-scripts allow-modals"` with no `allow-forms`, so a `type="submit"` here would
-    // be silently inert. Not pressed — `location.reload()` is not a thing to do to a test runner.
-    expect(reload.getAttribute("type")).toBe("button");
-  });
-
   it("says so in the language it is given when labels are passed", async () => {
     await render(
       <ErrorBoundary labels={{ crashed: ja.common.crashed, reload: ja.common.reload }}>
@@ -69,15 +53,22 @@ describe("ErrorBoundary", () => {
     );
 
     expect(container!.textContent).toContain(ja.common.crashed);
-    expect(container!.querySelector("button")!.textContent).toBe(ja.common.reload);
-    // The default is not showing through anywhere: one language per screen, the crash screen too.
+    const reload = container!.querySelector("button")!;
+    expect(reload.textContent).toBe(ja.common.reload);
+    // Nothing of the other language shows through: one language per screen, the crash screen too.
+    // These two literals are what `DEFAULT_LABELS` used to say, kept here as the negative so its
+    // reintroduction would be red rather than silent.
     expect(container!.textContent).not.toContain("Something went wrong");
     expect(container!.textContent).not.toContain("Reload");
+    // `type="button"`, like every control in this app: the host's iframe carries
+    // `sandbox="allow-scripts allow-modals"` with no `allow-forms`, so a `type="submit"` here would
+    // be silently inert. Not pressed — `location.reload()` is not a thing to do to a test runner.
+    expect(reload.getAttribute("type")).toBe("button");
   });
 
   it("renders its children untouched while nothing has failed", async () => {
     await render(
-      <ErrorBoundary>
+      <ErrorBoundary labels={{ crashed: ja.common.crashed, reload: ja.common.reload }}>
         <p data-testid="child">still fine</p>
       </ErrorBoundary>,
     );

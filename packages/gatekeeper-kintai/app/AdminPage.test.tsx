@@ -2,10 +2,10 @@ import React, { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
-  AnomalousDay, MonthlyReport, MonthlyTotalRow, PendingItem, PunchRow, RosterEntry,
+  AnomalousDay, MonthlyReport, MonthlyTotalRow, PendingItem, PunchRow, RosterEntry, UiLanguage,
 } from "../src/types";
 import AdminPage, { type KintaiAdminClient } from "./AdminPage";
-import { ja } from "./i18n";
+import { LanguageProvider, en, ja } from "./i18n";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -190,7 +190,7 @@ describe("AdminPage", () => {
       await render(<AdminPage api={api} />);
 
       expect(text('[data-testid="account-id"]')).toBe("acct-1234");
-      expect(text('[data-testid="linked"]')).toContain("Link this code to your own record");
+      expect(text('[data-testid="linked"]')).toBe(ja.header.account.notLinked);
       expect(container!.querySelector('[data-testid="employee-id"]')).toBeNull();
     });
 
@@ -199,6 +199,10 @@ describe("AdminPage", () => {
 
       expect(text('[data-testid="account-id"]')).toBe("acct-admin");
       expect(text('[data-testid="employee-id"]')).toBe("9");
+      // The id keeps its own element, which HR reads out and this pins — so the sentence around it
+      // is two dictionary entries rather than one function that would have had to swallow the span.
+      expect(text('[data-testid="linked"]'))
+        .toBe(`${ja.header.account.linkedPrefix}9${ja.header.account.linkedSuffix}`);
     });
   });
 
@@ -211,7 +215,7 @@ describe("AdminPage", () => {
       });
       await render(<AdminPage api={api} />);
 
-      expect(text('[data-testid="error"]')).toBe("Couldn’t read your Kintai account.");
+      expect(text('[data-testid="error"]')).toBe(ja.errors.fallbacks.readAccount);
       expect(container!.querySelector('[data-testid="account-id"]')).toBeNull();
     });
 
@@ -226,7 +230,7 @@ describe("AdminPage", () => {
       });
       await render(<AdminPage api={api} />);
 
-      expect(text('[data-testid="error"]')).toBe("Couldn’t load the roster.");
+      expect(text('[data-testid="error"]')).toBe(ja.errors.fallbacks.readRoster);
     });
 
     it("retries the whole load from the failure state", async () => {
@@ -251,7 +255,7 @@ describe("AdminPage", () => {
     it("lists everyone with their number and department", async () => {
       await render(<AdminPage api={adminApi({}, [TANAKA, SUZUKI, STRANDED])} />);
 
-      expect(text('[data-testid="roster-summary"]')).toBe("3 employees · 1 not ready to use Kintai");
+      expect(text('[data-testid="roster-summary"]')).toBe(ja.roster.summary(3, 1));
       expect(row(1).textContent).toContain("Tanaka");
       expect(row(1).textContent).toContain("E-1001");
       expect(row(1).textContent).toContain("Sales");
@@ -268,8 +272,10 @@ describe("AdminPage", () => {
       expect(stranded.querySelector('[data-issue="unlinked"]')).toBeNull();
       // Not "overtime": a punch correction needs approval too, and saying only overtime is what
       // let an exempt officer look finished.
-      expect(stranded.textContent).toContain("anything they file will be refused");
-      expect(stranded.textContent).not.toContain("Ready");
+      expect(stranded.querySelector('[data-issue="no-approver"]')!.textContent)
+        .toBe(ja.roster.row.noApprover);
+      // `利用可能` is the first word of `roster.row.ready`, and a not-ready row must never say it.
+      expect(stranded.textContent).not.toContain("利用可能");
       // And the row offers both fixes, next to the problem.
       expect(stranded.querySelector('[data-action="manager-for-this"]')).not.toBeNull();
       expect(stranded.querySelector('[data-action="approver-for-this"]')).not.toBeNull();
@@ -290,10 +296,12 @@ describe("AdminPage", () => {
       await render(<AdminPage api={adminApi({}, [TANAKA, officer])} />);
 
       const issue = row(11).querySelector('[data-issue="no-approver"]')!;
-      expect(issue.textContent).toContain("管理監督者 exempts their overtime");
-      expect(issue.textContent).toContain("a punch correction still needs a person");
-      expect(issue.textContent).toContain("designated approver");
-      expect(row(11).textContent).not.toContain("Ready");
+      // All three clauses — that the exemption covers overtime, that a correction still needs a
+      // person, and what would fix it — are one dictionary entry now, asserted whole so none of
+      // them can be dropped and leave the other two misleading.
+      expect(issue.textContent).toBe(ja.roster.row.noApproverExempt);
+      expect(ja.roster.row.noApproverExempt).toContain("指定承認者");
+      expect(row(11).textContent).not.toContain("利用可能");
       expect(row(11).querySelector('[data-action="approver-for-this"]')).not.toBeNull();
       // And the determination itself is still on the row, in the identity column, where it does
       // not depend on the row being broken to be visible.
@@ -313,17 +321,19 @@ describe("AdminPage", () => {
     it("calls an employee ready only when they are linked and approvable", async () => {
       await render(<AdminPage api={adminApi({}, [TANAKA, SUZUKI, STRANDED])} />);
 
-      expect(row(TANAKA.id).textContent).toContain("Ready · reports to Suzuki");
+      expect(row(TANAKA.id).textContent)
+        .toContain(ja.roster.row.ready(ja.roster.row.reportsTo("Suzuki")));
       // Ready on the designated approver, never on the exemption: 管理監督者 is not a reason
       // anybody can approve, so it must not be offered as one.
-      expect(row(SUZUKI.id).textContent).toContain("Ready · approver Tanaka");
+      expect(row(SUZUKI.id).textContent)
+        .toContain(ja.roster.row.ready(ja.roster.row.approvedBy("Tanaka")));
       expect(text(`[data-employee="${SUZUKI.id}"] [data-testid="status"]`))
         .not.toContain("管理監督者");
       // It IS on her row, though — on the identity line, beside the 夜勤 marker's place. The
       // assertion above is scoped to the readiness column for exactly that reason: the two say
       // different things, and only one of them is a verdict.
       expect(row(SUZUKI.id).querySelector('[data-testid="exempt"]')).not.toBeNull();
-      expect(row(STRANDED.id).textContent).not.toContain("Ready");
+      expect(row(STRANDED.id).textContent).not.toContain("利用可能");
     });
 
     it("names the designated approver when that is what makes them approvable", async () => {
@@ -333,7 +343,8 @@ describe("AdminPage", () => {
       });
       await render(<AdminPage api={adminApi({}, [TANAKA, rooted])} />);
 
-      expect(row(8).textContent).toContain("Ready · approver Tanaka");
+      expect(row(8).textContent)
+        .toContain(ja.roster.row.ready(ja.roster.row.approvedBy("Tanaka")));
     });
 
     // A reporting line needs somebody to report TO. With one employee the form correctly refuses
@@ -348,7 +359,7 @@ describe("AdminPage", () => {
 
         expect(row(9).querySelector('[data-action="manager-for-this"]')).toBeNull();
         expect(container!.textContent)
-          .toContain("Two employee records are needed before anyone can report to anyone.");
+          .toContain(ja.roster.forms.reportingLine.disabledHint);
         // Nor 'Set approver': a designated approver is another employee, and there is exactly one
         // record on the roster. Both fixes genuinely need a second person, and a button that
         // scrolled to a form with nothing in its dropdown is the silent no-op this page keeps
@@ -384,7 +395,8 @@ describe("AdminPage", () => {
         expect(row(12).querySelector('[data-testid="exempt"]')!.textContent)
           .toContain("管理監督者");
         // Ready, and readable as such: the badge explains the person, not the verdict.
-        expect(text('[data-employee="12"] [data-testid="status"]')).toBe("Ready · approver Tanaka");
+        expect(text('[data-employee="12"] [data-testid="status"]'))
+          .toBe(ja.roster.row.ready(ja.roster.row.approvedBy("Tanaka")));
         // A badge on every row would be noise: almost nobody is 管理監督者.
         expect(row(TANAKA.id).querySelector('[data-testid="exempt"]')).toBeNull();
       });
@@ -397,7 +409,7 @@ describe("AdminPage", () => {
       await render(<AdminPage api={adminApi({}, [TANAKA, crew])} />);
 
       expect(row(9).querySelector('[data-testid="work-date-policy"]')!.textContent)
-        .toContain("filed against the shift’s start date");
+        .toBe(ja.roster.row.nightShift);
       // A badge on every row would be noise: the default is what almost everybody is on.
       expect(row(TANAKA.id).querySelector('[data-testid="work-date-policy"]')).toBeNull();
     });
@@ -405,10 +417,10 @@ describe("AdminPage", () => {
     it("says so plainly when there is nobody on the roster at all", async () => {
       await render(<AdminPage api={adminApi({}, [])} />);
 
-      expect(text('[data-testid="roster-summary"]')).toBe("Nobody yet");
-      expect(container!.textContent).toContain("No employee records yet");
+      expect(text('[data-testid="roster-summary"]')).toBe(ja.roster.summary(0, 0));
+      expect(container!.textContent).toContain(ja.roster.empty);
       // Nothing to link an account to and nobody to report to, so those forms say why.
-      expect(container!.textContent).toContain("Add an employee record first.");
+      expect(container!.textContent).toContain(ja.roster.forms.needAnEmployee);
       expect(container!.querySelector('[data-action="create-employee"]')).not.toBeNull();
     });
   });
@@ -424,9 +436,9 @@ describe("AdminPage", () => {
         const overview = field<HTMLButtonElement>('[data-testid="tab-overview"]');
         const monthly = field<HTMLButtonElement>('[data-testid="tab-monthly"]');
         const roster = field<HTMLButtonElement>('[data-testid="tab-roster"]');
-        expect(overview.textContent).toBe("要対応");
-        expect(monthly.textContent).toBe("月次");
-        expect(roster.textContent).toBe("Roster");
+        expect(overview.textContent).toBe(ja.tabs.overview);
+        expect(monthly.textContent).toBe(ja.tabs.monthly);
+        expect(roster.textContent).toBe(ja.tabs.roster);
         expect(overview.getAttribute("aria-selected")).toBe("true");
         expect(monthly.getAttribute("aria-selected")).toBe("false");
         expect(roster.getAttribute("aria-selected")).toBe("false");
@@ -459,7 +471,7 @@ describe("AdminPage", () => {
         .toBe("true");
       expect(field<HTMLButtonElement>('[data-testid="tab-overview"]').getAttribute("aria-selected"))
         .toBe("false");
-      expect(text('[data-testid="roster-summary"]')).toBe("1 employee · all ready");
+      expect(text('[data-testid="roster-summary"]')).toBe(ja.roster.summary(1, 0));
     });
 
     // The whole reason `hidden` was chosen over remounting: a form flipped away from and back to
@@ -476,6 +488,66 @@ describe("AdminPage", () => {
 
         expect(field<HTMLInputElement>('[name="accountId"]').value).toBe("acct-survives");
       });
+  });
+
+  /**
+   * ONE LANGUAGE PER SCREEN, and the one control that changes which one.
+   *
+   * The dashboard does not resolve the language — `main.tsx` does, from the account's saved choice
+   * and the browser's own preference, and hands it to `LanguageProvider`. So these two tests are
+   * about what the screen DOES with the answer: it puts the switch where a reader can find it, and
+   * it says everything in the language it was given.
+   */
+  describe("the language the dashboard is read in", () => {
+    it("puts the language toggle in the header, right of the title, offering the other language",
+      async () => {
+        await render(<AdminPage api={adminApi({}, [TANAKA])} />);
+
+        const toggle = field<HTMLButtonElement>('[data-testid="language-toggle"]');
+        const header = field<HTMLElement>("header");
+        expect(header.contains(toggle)).toBe(true);
+        // Right-aligned means: it comes after the title in the header's own flex row. Asserted by
+        // document order rather than by a Tailwind class, which is styling and not structure.
+        const title = field<HTMLElement>("header h1");
+        expect(title.compareDocumentPosition(toggle) & Node.DOCUMENT_POSITION_FOLLOWING)
+          .toBeTruthy();
+        // Inert, like every control in this sandboxed frame.
+        expect(toggle.getAttribute("type")).toBe("button");
+        // The other language's own name, and the aria-label in the language being read now.
+        expect(toggle.textContent).toContain(ja.labels.languageNames.en);
+        expect(toggle.getAttribute("aria-label"))
+          .toBe(ja.header.language.switchTo(ja.labels.languageNames.en));
+      });
+
+    /**
+     * The whole shell and the roster in English when that is the account's language.
+     *
+     * NOT asserted here: "nothing of the other language anywhere in the container". 要対応 and
+     * `errors.ts` are Task 5's, so `OverviewTab` still renders its own Japanese literals into this
+     * same page — an unscoped negative would be red for a reason that is not this task's. What IS
+     * asserted negatively is every string this task owns on the shell and the Roster tab.
+     */
+    it("renders the shell and the roster in English when the account language is en", async () => {
+      const api = adminApi({
+        whoAmI: vi.fn<KintaiAdminClient["whoAmI"]>(async () => ({
+          accountId: "acct-admin", linked: true, employeeId: 9, language: "en",
+        })),
+      }, [TANAKA, SUZUKI]);
+      await render(<AdminPage api={api} />, "en");
+
+      expect(field('[data-testid="tab-overview"]').textContent).toBe(en.tabs.overview);
+      expect(field('[data-testid="tab-monthly"]').textContent).toBe(en.tabs.monthly);
+      expect(field('[data-testid="tab-roster"]').textContent).toBe(en.tabs.roster);
+      // One roster sentence, and the one that carries a number and a plural.
+      expect(text('[data-testid="roster-summary"]')).toBe(en.roster.summary(2, 0));
+      expect(row(TANAKA.id).textContent)
+        .toContain(en.roster.row.ready(en.roster.row.reportsTo("Suzuki")));
+      // And the toggle now offers 日本語, saying so in English.
+      expect(field('[data-testid="language-toggle"]').getAttribute("aria-label"))
+        .toBe(en.header.language.switchTo(en.labels.languageNames.ja));
+      expect(container!.textContent).not.toContain(ja.tabs.roster);
+      expect(container!.textContent).not.toContain(ja.roster.summary(2, 0));
+    });
   });
 
   /**
@@ -1134,14 +1206,18 @@ describe("AdminPage", () => {
         expect(tanaka.textContent).toContain("Tanaka");
         expect(tanaka.textContent).toContain("E-1001");
         expect(within(tanaka, '[data-testid="days"]')).toBe("20");
-        expect(within(tanaka, '[data-testid="hours"]')).toBe("162h 30m");
-        expect(within(monthlyRow(SUZUKI.id), '[data-testid="hours"]')).toBe("24h 0m");
+        // The column always carries both units, in the words of the language on screen: `162h 30m`
+        // in English, `162時間30分` in 日本語. A number and a unit, formatted by the dictionary.
+        expect(within(tanaka, '[data-testid="hours"]'))
+          .toBe(ja.labels.durations.full(162 * 60 + 30));
+        expect(within(monthlyRow(SUZUKI.id), '[data-testid="hours"]'))
+          .toBe(ja.labels.durations.full(24 * 60));
       });
 
       it("says a month has no punches rather than showing an empty table", async () => {
         await render(<AdminPage api={adminApi({}, [TANAKA])} />);
 
-        expect(monthlyText('[data-testid="monthly-empty"]')).toContain("打刻がありません");
+        expect(monthlyText('[data-testid="monthly-empty"]')).toBe(ja.monthly.empty("2026-09"));
       });
 
       // Beside what failed, and NOT a dead end: the only other control on this panel is the
@@ -1156,7 +1232,8 @@ describe("AdminPage", () => {
         }, [TANAKA]);
         await render(<AdminPage api={api} />);
 
-        expect(monthlyText('[data-testid="monthly-error"]')).toBe("Couldn’t read that month.");
+        expect(monthlyText('[data-testid="monthly-error"]'))
+          .toBe(ja.errors.fallbacks.readMonth);
 
         await click('[data-testid="panel-monthly"] [data-action="retry-month"]');
 
@@ -1224,7 +1301,8 @@ describe("AdminPage", () => {
         }, [TANAKA]);
         await render(<AdminPage api={api} />);
 
-        expect(monthlyText('[data-testid="monthly-locked"]')).toContain("締め済み");
+        expect(monthlyText('[data-testid="monthly-locked"]'))
+          .toBe(ja.monthly.closedBadge("2026-09"));
         expect(monthlyMaybe('[data-action="close-month"]')).toBeNull();
         expect(monthlyMaybe('[data-action="confirm-close-month"]')).toBeNull();
       });
@@ -1234,7 +1312,7 @@ describe("AdminPage", () => {
           const api = adminApi({ monthlyReport: vi.fn(async () => report()) }, [TANAKA]);
           await render(<AdminPage api={api} />);
 
-          expect(monthlyText('[data-action="close-month"]')).toBe("この月を締める");
+          expect(monthlyText('[data-action="close-month"]')).toBe(ja.monthly.closeMonth);
           expect(monthlyMaybe('[data-testid="close-confirm"]')).toBeNull();
 
           await click('[data-testid="panel-monthly"] [data-action="close-month"]');
@@ -1262,17 +1340,21 @@ describe("AdminPage", () => {
           await click('[data-testid="panel-monthly"] [data-action="close-month"]');
           const confirm = monthlyText('[data-testid="close-confirm"]');
 
+          // The pinned wording is the DICTIONARY's now, not this file's: the sentences moved to
+          // `monthly.confirm.*` and each one is asserted through its key, so a reword is one edit
+          // in one place and a DELETION is still red here.
           expect(confirm).toContain("2026-09");
-          expect(confirm).toContain(
-            "通常の打刻や修正は拒否されます — ordinary edits into this month stop here.",
-          );
-          expect(confirm).toContain(
-            "承認された修正申請は引き続き反映されます — approval is the one way in that stays open.",
-          );
-          expect(confirm).toContain(
-            "だから合計はまだ動きます — closing a month does not freeze these numbers.",
-          );
-          expect(confirm).toContain("締めを解除する方法はありません");
+          expect(confirm).toContain(ja.monthly.confirm.heading("2026-09"));
+          expect(confirm).toContain(ja.monthly.confirm.ordinaryEdits);
+          expect(confirm).toContain(ja.monthly.confirm.approvedCorrections);
+          expect(confirm).toContain(ja.monthly.confirm.totalsMove);
+          expect(confirm).toContain(ja.monthly.confirm.irreversible);
+          // The group names the month it is about, for a reader who arrives on it by keyboard.
+          expect(monthlyField('[data-testid="close-confirm"]').getAttribute("aria-label"))
+            .toBe(ja.monthly.confirm.ariaLabel("2026-09"));
+          expect(monthlyText('[data-action="confirm-close-month"]'))
+            .toBe(ja.monthly.confirm.close("2026-09"));
+          expect(monthlyText('[data-action="cancel-close-month"]')).toBe(ja.common.cancel);
         });
 
       it("puts the month back the way it was when the confirmation is dismissed", async () => {
@@ -1305,7 +1387,8 @@ describe("AdminPage", () => {
           // guard a double press would be two closes — the second of which is the refusal the
           // store raises for an already-closed month, shown to somebody who did nothing wrong.
           expect(api.lockPeriod).toHaveBeenCalledTimes(1);
-          expect(monthlyText('[data-testid="monthly-locked"]')).toContain("締め済み");
+          expect(monthlyText('[data-testid="monthly-locked"]'))
+            .toBe(ja.monthly.closedBadge("2026-09"));
           expect(monthlyMaybe('[data-action="close-month"]')).toBeNull();
           expect(monthlyMaybe('[data-testid="close-confirm"]')).toBeNull();
         });
@@ -1554,7 +1637,8 @@ describe("AdminPage", () => {
       });
       // Re-read afterwards, because creating a record changes what the roster must show.
       expect(api.listEmployees).toHaveBeenCalledTimes(2);
-      expect(text('[data-testid="create-employee-notice"]')).toContain("Added Yamada");
+      expect(text('[data-testid="create-employee-notice"]'))
+        .toBe(ja.roster.forms.create.done("Yamada"));
     });
 
     it("sends a designated approver when one was chosen", async () => {
@@ -1581,7 +1665,8 @@ describe("AdminPage", () => {
       await submit("link-account");
 
       expect(api.linkAccount).toHaveBeenCalledWith("acct-abc", 3);
-      expect(text('[data-testid="link-account-notice"]')).toBe("Linked Stranded to that account code.");
+      expect(text('[data-testid="link-account-notice"]'))
+        .toBe(ja.roster.forms.link.done("Stranded"));
       expect(api.listEmployees).toHaveBeenCalledTimes(2);
     });
 
@@ -1592,7 +1677,13 @@ describe("AdminPage", () => {
       const api = adminApi({}, [TANAKA]);
       await render(<AdminPage api={api} />);
 
+      // The hint the form renders is the dictionary's, and the mid-shift warning is a clause of
+      // it. Both halves asserted: that the screen shows this entry, and that this entry still
+      // carries the warning — a reword that dropped the clause would be red on the second line.
       expect(text('[data-form="set-work-date-policy"] p'))
+        .toBe(ja.roster.forms.workDate.hint);
+      expect(ja.roster.forms.workDate.hint).toContain("出勤中に変更しないでください");
+      expect(en.roster.forms.workDate.hint)
         .toContain("Do not change it while the employee is clocked in");
     });
 
@@ -1606,7 +1697,7 @@ describe("AdminPage", () => {
 
       expect(api.setReportingLine).toHaveBeenCalledWith(3, 1);
       expect(text('[data-testid="set-reporting-line-notice"]'))
-        .toBe("Stranded now reports to Tanaka.");
+        .toBe(ja.roster.forms.reportingLine.done("Stranded", "Tanaka"));
     });
 
     // The escape hatch for whoever sits at the top of the org chart. Until this form existed,
@@ -1622,7 +1713,7 @@ describe("AdminPage", () => {
 
       expect(api.setDesignatedApprover).toHaveBeenCalledWith(3, 1);
       expect(text('[data-testid="set-designated-approver-notice"]'))
-        .toBe("Tanaka can now approve for Stranded.");
+        .toBe(ja.roster.forms.approver.done("Tanaka", "Stranded"));
       // Re-read afterwards: this is one of the two things that make a row ready.
       expect(api.listEmployees).toHaveBeenCalledTimes(2);
     });
@@ -1669,7 +1760,7 @@ describe("AdminPage", () => {
 
       expect(api.grantExemption).toHaveBeenCalledWith(9);
       expect(text('[data-testid="grant-exemption-notice"]'))
-        .toBe("Officer is recorded as 管理監督者 from now.");
+        .toBe(ja.roster.forms.exemption.done("Officer"));
       // Re-read afterwards: an exemption is one of the three things that make a row ready.
       expect(api.listEmployees).toHaveBeenCalledTimes(2);
     });
@@ -1699,7 +1790,8 @@ describe("AdminPage", () => {
       });
       await render(<AdminPage api={adminApi({}, [TANAKA, officer])} />);
 
-      expect(row(9).textContent).toContain("Ready · approver Tanaka");
+      expect(row(9).textContent)
+        .toContain(ja.roster.row.ready(ja.roster.row.approvedBy("Tanaka")));
       expect(row(9).querySelector('[data-action="approver-for-this"]')).toBeNull();
       expect(row(9).querySelector('[data-action="manager-for-this"]')).toBeNull();
     });
@@ -1721,10 +1813,8 @@ describe("AdminPage", () => {
       expect(api.setWorkDatePolicy).toHaveBeenCalledWith(9, "shift_start");
       // The confirmation says what will happen NEXT and that nothing moved — this is the setting
       // people most need told is not retroactive.
-      expect(text('[data-testid="set-work-date-policy-notice"]')).toBe(
-        "Night Crew: new punches will be filed against the date their shift started." +
-        " Punches already recorded are unchanged.",
-      );
+      expect(text('[data-testid="set-work-date-policy-notice"]'))
+        .toBe(ja.roster.forms.workDate.done("Night Crew", "shift_start"));
       expect(api.listEmployees).toHaveBeenCalledTimes(2);
     });
 
@@ -1747,7 +1837,13 @@ describe("AdminPage", () => {
       // change cannot silently move a night worker back onto calendar dating.
       expect(field<HTMLSelectElement>('[data-form="set-work-date-policy"] [name="policy"]').value)
         .toBe("shift_start");
-      expect(container!.textContent).toContain("Currently Shift start date (night shifts)");
+      // The note under the dropdown, and the dropdown's own option, both out of the dictionary —
+      // `WORK_DATE_POLICY_LABELS` was English-only, so a Japanese administrator was choosing a
+      // policy from an English list.
+      expect(container!.textContent)
+        .toContain(ja.roster.forms.workDate.current("shift_start"));
+      expect(field<HTMLSelectElement>('[data-form="set-work-date-policy"] [name="policy"]')
+        .textContent).toContain(ja.labels.workDatePolicies.shift_start);
     });
 
     it("sets it back to calendar", async () => {
@@ -1762,10 +1858,8 @@ describe("AdminPage", () => {
       await submit("set-work-date-policy");
 
       expect(api.setWorkDatePolicy).toHaveBeenCalledWith(9, "calendar");
-      expect(text('[data-testid="set-work-date-policy-notice"]')).toBe(
-        "Night Crew: new punches will be filed against the date they happen on." +
-        " Punches already recorded are unchanged.",
-      );
+      expect(text('[data-testid="set-work-date-policy-notice"]'))
+        .toBe(ja.roster.forms.workDate.done("Night Crew", "calendar"));
     });
 
     it("clears the form after a success so the next entry starts empty", async () => {
@@ -1921,7 +2015,8 @@ describe("AdminPage", () => {
       await type('[name="displayName"]', "Whoever");
       await submit("create-employee");
 
-      expect(text('[data-testid="create-employee-notice"]')).toBe("Couldn’t create that employee.");
+      expect(text('[data-testid="create-employee-notice"]'))
+        .toBe(ja.errors.fallbacks.createEmployee);
     });
 
     // A failure belongs beside the thing that failed. Two forms must not share one message.
@@ -1959,12 +2054,18 @@ describe("AdminPage", () => {
 
   // ---- helpers -------------------------------------------------------------------------------
 
-  async function render(element: React.ReactNode): Promise<void> {
+  /**
+   * Every render here is in ONE explicit language, and 日本語 is the default because the fake
+   * `whoAmI` returns `language: "ja"` — the account language the real entry resolves and hands the
+   * provider. The page itself takes the answer rather than resolving it (see `main.tsx`), so a
+   * test names the language here, and the one English test passes `"en"`.
+   */
+  async function render(element: React.ReactNode, language: UiLanguage = "ja"): Promise<void> {
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
     await act(async () => {
-      root!.render(element);
+      root!.render(<LanguageProvider initial={language}>{element}</LanguageProvider>);
     });
   }
 
