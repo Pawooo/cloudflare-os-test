@@ -190,7 +190,7 @@ function TodayPanel({ api }: { api: KintaiEmployeeClient }) {
   if (state.failure !== undefined) {
     return (
       <p className="text-sm text-kumo-danger" role="alert">
-        {describeFailure(state.failure.caught, t.errors.fallbacks.readToday)}
+        {describeFailure(state.failure.caught, t.errors.fallbacks.readToday, t)}
       </p>
     );
   }
@@ -270,7 +270,7 @@ function ShiftControl(
       await api.punch(kind);
       if (live.current) reload();
     } catch (caught) {
-      if (live.current) setError(describeFailure(caught, t.errors.fallbacks.punch));
+      if (live.current) setError(describeFailure(caught, t.errors.fallbacks.punch, t));
     } finally {
       if (live.current) setBusy(false);
     }
@@ -354,7 +354,7 @@ function MissingOutForm(
       }
     } catch (caught) {
       if (live.current) {
-        setNotice({ error: describeFailure(caught, t.errors.fallbacks.fileRequest) });
+        setNotice({ error: describeFailure(caught, t.errors.fallbacks.fileRequest, t) });
       }
     } finally {
       if (live.current) setBusy(false);
@@ -567,7 +567,7 @@ function MonthTable(
   if (state.failure !== undefined) {
     return (
       <p className="text-sm text-kumo-danger" role="alert">
-        {describeFailure(state.failure.caught, t.errors.fallbacks.readMyMonth)}
+        {describeFailure(state.failure.caught, t.errors.fallbacks.readMyMonth, t)}
       </p>
     );
   }

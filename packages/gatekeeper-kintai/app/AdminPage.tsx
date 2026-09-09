@@ -378,7 +378,7 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
       {view.status === "failed" && (
         <div className="flex flex-col items-start gap-3">
           <p className="text-sm text-kumo-danger" data-testid="error">
-            {describeFailure(view.failure.caught, t.errors.fallbacks[view.failure.fallback])}
+            {describeFailure(view.failure.caught, t.errors.fallbacks[view.failure.fallback], t)}
           </p>
           <button
             type="button"
@@ -1250,7 +1250,7 @@ function FormCard({
                       follows a language switch. See `Notice`. */}
                   {notice.kind === "ok"
                     ? notice.say(t)
-                    : describeFailure(notice.caught, t.errors.fallbacks[notice.fallback])}
+                    : describeFailure(notice.caught, t.errors.fallbacks[notice.fallback], t)}
                 </p>
               )}
             </div>

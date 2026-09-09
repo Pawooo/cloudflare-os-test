@@ -2122,8 +2122,10 @@ describe("AdminPage", () => {
       await choose('[data-form="link-account"] [name="employeeId"]', "3");
       await submit("link-account");
 
+      // The rewrite is the dictionary's, so it arrives in the language this screen is being read
+      // in. The DETAIL behind the code is what stays English (see the failed-decision tests).
       expect(text('[data-testid="link-account-notice"]'))
-        .toBe("That employee record no longer exists. Reload the roster and try again.");
+        .toBe(ja.errors.byCode.KINTAI_NOT_FOUND);
     });
 
     it("falls back to naming the action when the failure carries no code", async () => {

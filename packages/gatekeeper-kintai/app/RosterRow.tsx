@@ -163,7 +163,7 @@ function approverReason(
   employee: RosterEntry, names: Map<number, string>, t: Messages,
 ): string {
   if (employee.managerIds.length > 0) {
-    return t.roster.row.reportsTo(employee.managerIds.map((id) => label(names, id)).join(", "));
+    return t.roster.row.reportsTo(employee.managerIds.map((id) => label(names, id, t)).join(", "));
   }
   // No 管理監督者 arm, and it is not an omission. This function mirrors `hasReachableApprover`,
   // which stopped counting an exemption: it exempts overtime from a premium and authorises nobody
@@ -172,23 +172,24 @@ function approverReason(
   // The exemption is still on the row, as a neutral badge in the identity column beside 夜勤;
   // what it no longer does is answer this question.
   if (employee.designated_approver_id !== null) {
-    return t.roster.row.approvedBy(label(names, employee.designated_approver_id));
+    return t.roster.row.approvedBy(label(names, employee.designated_approver_id, t));
   }
   return t.roster.row.approvable;
 }
 
 /**
- * The name behind a manager or approver id — a NAME LOOKUP, and left out of the dictionary on
- * instruction.
+ * The name behind a manager or approver id, or the number when no name is at hand.
  *
- * `common.employeeFallback(id)` exists and `AdminPage`'s `nameOf` reads it; this one deliberately
- * does not. The fallback fires only when a row names somebody the `names` map does not carry,
- * which the roster read cannot produce (every id here comes from a row in the same read), so the
- * two are not the same call in practice. Flagged in the task report as the one string on this
- * screen that is not the dictionary's.
+ * The fallback is `common.employeeFallback`, the same entry `AdminPage`'s `nameOf` reads — this
+ * used to be an English literal here, which made one screen's copy of one sentence the only
+ * untranslated string on the dashboard. It fires only when a row names somebody the `names` map
+ * does not carry, which the roster read cannot produce (every id here comes from a row in the same
+ * read), so it is unreachable in practice and was left behind for exactly that reason; being
+ * unreachable is not a reason for a screen to hold a second opinion about what a missing name
+ * reads like.
  */
-function label(names: Map<number, string>, id: number): string {
-  return names.get(id) ?? `employee ${id}`;
+function label(names: Map<number, string>, id: number, t: Messages): string {
+  return names.get(id) ?? t.common.employeeFallback(id);
 }
 
 /**

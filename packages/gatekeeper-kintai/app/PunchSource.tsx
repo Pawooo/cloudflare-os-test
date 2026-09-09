@@ -1,5 +1,5 @@
 import type { PunchRow } from "../src/types";
-import { ja, type Messages } from "./i18n";
+import type { Messages } from "./i18n";
 
 /**
  * How a punch got into the record, in words an HR reader can act on — never the raw value stored
@@ -60,19 +60,19 @@ export function describePunchSource(
  * Drop-in replacement for `{punch.source}` — same wrapper, human wording. Pure and display-only:
  * no capability, no control, nothing for the sandbox rules to say anything about.
  *
- * `t` IS A PROP AND NOT `useT()`, and the default is transitional. This component renders on both
- * screens, and only the employee screen has a `<LanguageProvider>` above it so far: `useT()` throws
- * outside one by design, so reaching for the context here would turn the admin day drill-down into
- * a crashed panel until the admin screen is migrated. The default keeps that panel exactly as it
- * reads today — 日本語, out of the dictionary rather than out of literals in this file — and the
- * admin migration passes its own `t` and deletes the default, at which point the prop is required
- * and nothing can silently pick a language again.
+ * `t` IS A PROP AND NOT `useT()`, and it is REQUIRED. A prop rather than the hook because this
+ * half of the module is a pure function a test calls with either dictionary, and the component is
+ * the thin wrapper around it; required because both screens now have a `<LanguageProvider>` above
+ * them and there is no call site left with nothing to pass. There used to be a transitional `ja`
+ * default here, for the weeks when the admin day drill-down had no provider to ask and `useT()`
+ * would have crashed the panel; a default outliving that is only a way for a screen to end up in
+ * the wrong language silently.
  */
 export function PunchSource(
-  { punch, t = ja, resolveApprover }: {
+  { punch, t, resolveApprover }: {
     punch: Pick<PunchRow, "source" | "amended_by" | "amend_reason">;
-    /** The screen's language. Omitted only by a screen that has no provider above it yet. */
-    t?: Messages;
+    /** The screen's language, from its own `useT()`. */
+    t: Messages;
     /** Turn an approver's employee id into a name; omitted where no roster is at hand (`#id` shows). */
     resolveApprover?: (id: number) => string;
   },

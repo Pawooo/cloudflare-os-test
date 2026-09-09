@@ -292,7 +292,7 @@ export function MonthlyTab({
           have just been re-read, which is the most useful thing on the screen. */}
       {closeFailure !== undefined && (
         <p className="text-sm text-kumo-danger" data-testid="close-error" role="alert">
-          {describeFailure(closeFailure.caught, t.errors.fallbacks.closeMonth)}
+          {describeFailure(closeFailure.caught, t.errors.fallbacks.closeMonth, t)}
         </p>
       )}
 
@@ -396,7 +396,7 @@ function MonthTable({
     return (
       <div className="flex flex-col items-start gap-3">
         <p className="text-sm text-kumo-danger" data-testid="monthly-error" role="alert">
-          {describeFailure(report.failure.caught, t.errors.fallbacks.readMonth)}
+          {describeFailure(report.failure.caught, t.errors.fallbacks.readMonth, t)}
         </p>
         <button
           type="button"

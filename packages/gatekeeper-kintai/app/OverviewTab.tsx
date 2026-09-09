@@ -8,6 +8,7 @@ import type { KintaiAdminClient, RowFixes } from "./AdminPage";
 import { PunchSource } from "./PunchSource";
 import { isReady, RosterRow } from "./RosterRow";
 import { describeFailure, failureDetail } from "./errors";
+import { useT, type Messages } from "./i18n";
 
 /**
  * 要対応: what needs a human right now, and who that human is.
@@ -94,10 +95,10 @@ export function OverviewTab({
  * A required argument rather than an optional one for exactly that reason — the next section added
  * here has to answer the question rather than inherit an answer.
  *
- * `read` and `fallback` stay OUT of the dependency list, for the reason they always did: `read`
- * closes over the `api` capability, which never changes for the life of the page, and re-running
- * on a new closure would re-read the whole company's queue every time an ancestor rerenders —
- * which `AdminPage` does on every keystroke in a roster form.
+ * `read` stays OUT of the dependency list, for the reason it always did: it closes over the `api`
+ * capability, which never changes for the life of the page, and re-running on a new closure would
+ * re-read the whole company's queue every time an ancestor rerenders — which `AdminPage` does on
+ * every keystroke in a roster form.
  *
  * The previous answer stays on screen while a re-read is in flight rather than being cleared to a
  * spinner: the re-read follows a write the reader just performed, and blanking the queue in front
@@ -113,9 +114,16 @@ export function OverviewTab({
  * `readId` is the same guard `MonthlyTab.readMonth` uses, and it earns its place here now that
  * there can be two reads in flight: the first to come back is not necessarily the newer one, and
  * an out-of-order landing would restore precisely the stale answer `reloadOn` exists to replace.
+ *
+ * IT HOLDS WHAT IT CAUGHT, NEVER THE SENTENCE, and takes no fallback: the section describes its
+ * own failure where it renders it, with a fallback chosen out of its own `t`. `t` inside this
+ * effect would have made the language a dependency of the READ — a toggle re-running the whole
+ * company's queue, or, with the dependency omitted, an error frozen in the language it was written
+ * in. The wrapper object rather than a bare `unknown` so that a thrown `undefined` is still a
+ * failure.
  */
-function useSectionRead<T>(read: () => Promise<T>, fallback: string, reloadOn: number) {
-  const [state, setState] = useState<{ data?: T; error?: string }>({});
+function useSectionRead<T>(read: () => Promise<T>, reloadOn: number) {
+  const [state, setState] = useState<{ data?: T; failure?: { caught: unknown } }>({});
   const live = useRef(true);
   const readId = useRef(0);
   useEffect(() => {
@@ -130,9 +138,7 @@ function useSectionRead<T>(read: () => Promise<T>, fallback: string, reloadOn: n
         const data = await read();
         if (live.current && id === readId.current) setState({ data });
       } catch (caught) {
-        if (live.current && id === readId.current) {
-          setState({ error: describeFailure(caught, fallback) });
-        }
+        if (live.current && id === readId.current) setState({ failure: { caught } });
       }
     })();
   }, [reloadOn]);
@@ -150,6 +156,7 @@ function PendingSection(
     onDecided: () => void;
   },
 ) {
+  const t = useT();
   const read = useCallback(() => api.listPendingOverview(), [api]);
   /*
    * The one read on this tab that the screen's own writes can invalidate, in two ways.
@@ -162,26 +169,24 @@ function PendingSection(
    * the system as of the instant of the read, which is exactly what a mount-once read cannot tell
    * the truth about once the reader starts writing.
    */
-  const { data, error } = useSectionRead(read, "Couldn’t read the 承認待ち queue.", queueToken);
+  const { data, failure } = useSectionRead(read, queueToken);
   const stranded = data?.filter((item) => item.eligibleActorNames.length === 0).length ?? 0;
 
   return (
     <Section
       testId="pending-section"
-      heading="承認待ち · waiting on a decision"
-      summary={data === undefined
-        ? undefined
-        : `${data.length} ${data.length === 1 ? "request" : "requests"}` +
-          (stranded > 0 ? ` · ${stranded} with nobody able to decide` : "")}
+      heading={t.pending.heading}
+      summary={data === undefined ? undefined : t.pending.summary(data.length, stranded)}
     >
-      {error !== undefined ? (
-        <SectionError testId="pending-error" message={error} />
+      {failure !== undefined ? (
+        <SectionError
+          testId="pending-error"
+          message={describeFailure(failure.caught, t.errors.fallbacks.readPending, t)}
+        />
       ) : data === undefined ? (
         <Loading />
       ) : data.length === 0 ? (
-        <Empty testId="pending-empty">
-          承認待ちはありません — nothing is waiting on anybody’s decision.
-        </Empty>
+        <Empty testId="pending-empty">{t.pending.empty}</Empty>
       ) : (
         <ul className="divide-y divide-kumo-line border-y border-kumo-line">
           {data.map((item) => (
@@ -204,6 +209,7 @@ function PendingRow(
     onDecided: () => void;
   },
 ) {
+  const t = useT();
   const closed = item.amendment?.lockedPeriod ?? null;
   const mine = viewerEmployeeId !== null && item.eligibleActorIds.includes(viewerEmployeeId);
   return (
@@ -215,23 +221,22 @@ function PendingRow(
         <p className="text-sm font-medium text-kumo-default">
           {item.employeeName} · {item.employeeNumber}
         </p>
-        <p className="text-xs text-kumo-subtle" data-testid="asks">{describeAsk(item)}</p>
+        <p className="text-xs text-kumo-subtle" data-testid="asks">{describeAsk(item, t)}</p>
         {/* Whose hand filed it, which is not always whose request it is — and a null here records
             that no filer was captured rather than that they filed it themselves. Conflating those
             would hide the commonest way a request stalls: whoever files one cannot decide it, so
             a request filed by its only possible approver is stranded by construction. */}
         <p className="text-xs text-kumo-inactive" data-testid="filed-by">
           {item.filedByName === null
-            ? "Who filed it was not recorded."
-            : `Filed by ${item.filedByName}.`}
+            ? t.pending.filerUnknown
+            : t.pending.filedBy(item.filedByName)}
         </p>
         {closed !== null && (
           <p className="text-xs text-kumo-danger" data-testid="closed-period">
             {/* Same fact `describeCorrectionApproval` states twice to the approver: applying an
                 approved correction is the only write allowed into a closed month, and a month is
                 closed precisely when somebody has already been paid on its totals. */}
-            締め済み {closed} — the period {closed} is closed. Approving this changes a month that
-            has already been closed off.
+            {t.pending.closedPeriod(closed)}
           </p>
         )}
       </div>
@@ -239,44 +244,30 @@ function PendingRow(
       <div className="min-w-56 flex-1">
         {item.eligibleActorNames.length === 0 ? (
           <p className="text-xs font-medium text-kumo-danger" data-testid="stranded" role="alert">
-            Nobody can decide this — it will wait for ever. Give {item.employeeName} a manager or a
-            designated approver on the Roster tab, or look at who filed it: whoever files a request
-            can never be the one who decides it.
+            {t.pending.stranded(item.employeeName)}
           </p>
         ) : mine ? (
           <>
             <p className="text-xs font-medium text-kumo-default" data-testid="deciders">
-              Yours to decide
-              {item.eligibleActorNames.length > 1
-                ? ` — you are one of: ${item.eligibleActorNames.join(", ")}`
-                : ""}
+              {t.pending.yours(item.eligibleActorNames)}
             </p>
             <DecisionControls item={item} api={api} onDecided={onDecided} />
           </>
         ) : (
           <p className="text-xs text-kumo-subtle" data-testid="deciders">
-            Can be decided by {item.eligibleActorNames.join(", ")} — not by you, and not here: one
-            of them decides it from their own dashboard, or by asking their assistant for their
-            pending approvals.
+            {t.pending.decidedByOthers(item.eligibleActorNames)}
           </p>
         )}
       </div>
 
-      {/* A bucket, not a clock. An age that ticked would rerender the whole queue every second to
-          report a precision nobody can act on, and "3日" is the entire decision this column
-          informs: chase it, or leave it. */}
+      {/* A bucket, not a clock — see `labels.ages.waiting`, which holds both the arithmetic and
+          the argument for it. */}
       <p className="shrink-0 text-xs text-kumo-subtle" data-testid="waiting">
-        {formatAge(item.waitingMs)}
+        {t.labels.ages.waiting(item.waitingMs)}
       </p>
     </li>
   );
 }
-
-const DECISION_LABELS: Record<ApprovalAction, string> = {
-  approve: "承認",
-  return: "差し戻し",
-  reject: "却下",
-};
 
 /**
  * The three decisions, two-step and inline — the same shape as 月次's month close, and for the same
@@ -294,14 +285,19 @@ const DECISION_LABELS: Record<ApprovalAction, string> = {
 function DecisionControls(
   { item, api, onDecided }: { item: PendingItem; api: KintaiAdminClient; onDecided: () => void },
 ) {
+  const t = useT();
   const [armed, setArmed] = useState<ApprovalAction | null>(null);
   const [comment, setComment] = useState("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<{ message: string; detail?: string }>();
+  // What was CAUGHT, not the sentence describing it: the write holds the failure and the render
+  // below turns it into words, so a language switch retranslates a refusal already on screen
+  // rather than leaving it in the language it was refused in. Same shape as `useSectionRead`.
+  const [failure, setFailure] = useState<{ caught: unknown }>();
   // Set when a decision landed but the request is still pending — the route advanced to another
   // step — so the row that re-renders says what happened. A terminal decision needs no notice: the
-  // re-read removes the row, and its absence is the feedback.
-  const [notice, setNotice] = useState<string>();
+  // re-read removes the row, and its absence is the feedback. The ACTION is stored rather than the
+  // finished sentence, for the reason `failure` is.
+  const [movedOn, setMovedOn] = useState<ApprovalAction>();
   const commentId = useId();
   const live = useRef(true);
   useEffect(() => {
@@ -314,19 +310,19 @@ function DecisionControls(
 
   const arm = (action: ApprovalAction) => {
     setArmed(action);
-    setError(undefined);
+    setFailure(undefined);
   };
   const cancel = () => {
     setArmed(null);
     setComment("");
-    setError(undefined);
+    setFailure(undefined);
   };
   const decide = async () => {
     if (armed === null || !ready) return;
     const decision = armed;
     setBusy(true);
-    setError(undefined);
-    setNotice(undefined);
+    setFailure(undefined);
+    setMovedOn(undefined);
     try {
       const trimmed = comment.trim();
       // `afterEventId` is the marker this row was read with: the store refuses the decision if the
@@ -338,20 +334,12 @@ function DecisionControls(
         setArmed(null);
         setComment("");
         setBusy(false);
-        if (state === "pending") {
-          setNotice(`${DECISION_LABELS[decision]}を記録しました。次の承認者の決定待ちです — this request moved to its next step and is waiting on somebody else.`);
-        }
+        if (state === "pending") setMovedOn(decision);
       }
       onDecided();
     } catch (caught) {
       if (live.current) {
-        // A coded refusal reads as its own sentence. Anything else gets the fallback AND its raw
-        // text underneath: the first live failure of this control showed the fallback alone, and
-        // the cause was only in the server log.
-        setError({
-          message: describeFailure(caught, "決定できませんでした。"),
-          detail: failureDetail(caught),
-        });
+        setFailure({ caught });
         setBusy(false);
       }
       // A stale marker is a fact about THIS row's read, so refresh the read: without this every
@@ -364,8 +352,10 @@ function DecisionControls(
 
   return (
     <div className="mt-2" data-testid="decision-controls">
-      {notice !== undefined && (
-        <p className="mb-2 text-xs text-kumo-success" data-testid="decision-notice">{notice}</p>
+      {movedOn !== undefined && (
+        <p className="mb-2 text-xs text-kumo-success" data-testid="decision-notice">
+          {t.pending.movedOn(movedOn)}
+        </p>
       )}
       {armed === null ? (
         <div className="flex flex-wrap gap-2">
@@ -379,28 +369,28 @@ function DecisionControls(
                 : "press rounded-lg border border-kumo-line bg-kumo-control px-3 py-1.5 text-xs font-medium text-kumo-default hover:bg-kumo-tint"}
               onClick={() => arm(action)}
             >
-              {DECISION_LABELS[action]}
+              {t.labels.decisions[action]}
             </button>
           ))}
         </div>
       ) : (
         <div className="rounded-lg bg-kumo-tint px-3 py-3" data-testid="decision-confirm">
           <p className="text-xs text-kumo-default">
-            <span className="font-medium">{DECISION_LABELS[armed]}</span>
-            {` — ${item.employeeName}: ${describeAsk(item)}`}
+            <span className="font-medium">{t.labels.decisions[armed]}</span>
+            {t.pending.confirmDetail(item.employeeName, describeAsk(item, t))}
           </p>
           {needsComment && (
             <div className="mt-2 flex flex-col gap-1">
               <label htmlFor={commentId} className="text-xs font-medium text-kumo-default">
-                理由（本人に表示されます）
+                {t.pending.commentLabel}
               </label>
               <input
                 id={commentId}
                 type="text"
                 data-testid="decision-comment"
                 placeholder={armed === "return"
-                  ? "例: 退勤時刻を確認して再申請してください"
-                  : "例: 現場の記録と一致しません"}
+                  ? t.pending.commentPlaceholderReturn
+                  : t.pending.commentPlaceholderReject}
                 value={comment}
                 onChange={(event) => setComment(event.target.value)}
                 className="w-full rounded border border-kumo-line bg-kumo-control px-2 py-1.5 text-sm text-kumo-default placeholder:text-kumo-inactive"
@@ -417,7 +407,7 @@ function DecisionControls(
                 : "press rounded-lg border border-kumo-danger bg-kumo-control px-3 py-1.5 text-xs font-medium text-kumo-danger hover:bg-kumo-tint disabled:opacity-60"}
               onClick={() => void decide()}
             >
-              {DECISION_LABELS[armed]}する
+              {t.pending.confirmAction(armed)}
             </button>
             <button
               type="button"
@@ -426,15 +416,20 @@ function DecisionControls(
               className="press rounded-lg px-3 py-1.5 text-xs font-medium text-kumo-subtle hover:bg-kumo-tint"
               onClick={cancel}
             >
-              取り消す
+              {t.common.cancel}
             </button>
           </div>
-          {error !== undefined && (
+          {/* A coded refusal reads as its own sentence. Anything else gets the fallback AND its
+              raw text underneath: the first live failure of this control showed the fallback
+              alone, and the cause was only in the server log. */}
+          {failure !== undefined && (
             <div className="mt-2" role="alert">
-              <p className="text-xs text-kumo-danger" data-testid="decision-error">{error.message}</p>
-              {error.detail !== undefined && (
+              <p className="text-xs text-kumo-danger" data-testid="decision-error">
+                {describeFailure(failure.caught, t.errors.fallbacks.decide, t)}
+              </p>
+              {failureDetail(failure.caught) !== undefined && (
                 <p className="mt-0.5 font-mono text-[11px] text-kumo-inactive" data-testid="decision-error-detail">
-                  {error.detail}
+                  {failureDetail(failure.caught)}
                 </p>
               )}
             </div>
@@ -460,77 +455,41 @@ function DecisionControls(
  * detail's presence, exactly as `describeApproval` does. Rendering every row through the overtime
  * shape is how an approver's queue once reported a punch correction as a request for zero minutes.
  */
-function describeAsk(item: PendingItem): string {
+function describeAsk(item: PendingItem, t: Messages): string {
   const amendment = item.amendment;
   if (amendment === undefined) {
-    return `${formatDuration(item.minutes)} of overtime on ${item.requested_for}`;
+    return t.pending.askOvertime(item.minutes, item.requested_for);
   }
   const requested = jstClockTime(amendment.requestedOccurredAt);
   // An addition has no left-hand side. "(none recorded)" is the honest comparison; a fabricated
   // 00:00 would read as a punch that exists.
   const change = amendment.currentOccurredAt === null
-    ? `${amendment.kind} added at ${requested} (none recorded)`
-    : `${amendment.kind} ${jstClockTime(amendment.currentOccurredAt)} → ${requested}`;
-  return `${amendment.workDate}: ${change}`;
+    ? t.pending.amendmentAdded(amendment.kind, requested)
+    : t.pending.amendmentMoved(
+      amendment.kind, jstClockTime(amendment.currentOccurredAt), requested,
+    );
+  return t.pending.askAmendment(amendment.workDate, change);
 }
 
-/**
- * `2h 30m`, `45m`, `3h`.
- *
- * The same shape as `formatDuration` in `src/kintai.ts`, and a genuine second copy of six lines of
- * arithmetic. It is tolerated because the alternative is worse in both directions: `kintai.ts`
- * imports the store, so importing it here fails `typecheck:app` on every `SqlStorage` in the
- * transitive graph, and moving the formatter into a leaf module (as `jstClockTime` legitimately
- * was) would put a payroll-confirmation string in a module whose other job is arithmetic on
- * instants. Nothing depends on the two agreeing to the character: this labels a triage row, that
- * one titles an approval a manager signs. If they ever must agree, the fix is a shared leaf, not a
- * third copy.
- */
-function formatDuration(minutes: number): string {
-  const hours = Math.floor(minutes / 60);
-  const rest = minutes % 60;
-  if (hours === 0) return `${rest}m`;
-  return rest === 0 ? `${hours}h` : `${hours}h ${rest}m`;
-}
-
-/**
- * How long it has waited, as a bucket: `3日`, `5時間`, or `1時間未満`.
- *
- * Truncated rather than rounded, so a row never claims to be older than it is, and coarse on
- * purpose — see the column's comment. `waitingMs` is measured server-side against one instant for
- * the whole read, so every row on one dashboard open is judged against the same moment; this
- * function reads no clock of its own and there is nothing for it to drift against.
- */
-function formatAge(waitingMs: number): string {
-  // Clamped at zero. `submitted_at` is nullable and reports 0 rather than a fifty-six-year wait
-  // (see `pendingOverview`), but a clock that moved backwards between the write and the read can
-  // still hand this a negative, and "-1時間" would read as a bug in the queue rather than in a
-  // clock.
-  const hours = Math.max(0, Math.floor(waitingMs / (60 * 60 * 1000)));
-  if (hours >= 24) return `${Math.floor(hours / 24)}日`;
-  return hours === 0 ? "1時間未満" : `${hours}時間`;
-}
+// The two formatters this section used to own are the dictionary's now:
+//
+//  - `formatDuration` → `labels.durations.short`, which is where its argument against
+//    `src/kintai.ts`'s copy now lives, beside the `full` format it contrasts with. The two were
+//    never required to agree to the character — this labels a triage row, that one titles an
+//    approval a manager signs — and `kintai.ts` reaches the store, so it cannot be imported here
+//    at all without failing `typecheck:app` on every `SqlStorage` in the transitive graph.
+//  - `formatAge` → `labels.ages.waiting`. It was never only arithmetic: `3日` against `2d` is one
+//    sentence each language builds its own way, which is exactly why the whole thing moved rather
+//    than being wrapped in a lookup here.
 
 // ---- 2. days that need a look ------------------------------------------------------------------
 
-/**
- * How each anomaly flag reads to a human.
- *
- * The keys are the strings `dayAnomalies` pushes, and an unknown one falls through to the flag
- * itself rather than to nothing: a flag added on the worker side must surface as an ugly row
- * rather than as a day that looks clean. Same reason this map has no `Record<Anomaly, string>`
- * type to enforce completeness — the flags are plain strings on the wire, and being exhaustive
- * against a list this module cannot see would be a compile-time promise about somebody else's
- * enumeration.
- */
-const ANOMALY_LABELS: Record<string, string> = {
-  unpaired_in: "退勤打刻なし",
-  unpaired_break: "休憩終了の打刻なし",
-  orphan_out: "出勤打刻のない退勤",
-  duplicate_in: "出勤打刻の重複",
-  negative_gross: "休憩が労働時間を超過",
-  long_span: "14時間以上の勤務",
-};
+// How each anomaly flag reads to a human is `labels.anomalies`, one map shared with the employee
+// screen where this module and `EmployeePage` each used to keep their own. The call site below
+// still falls through to the raw flag for an unknown one: a flag added on the worker side must
+// surface as an ugly row rather than as a day that looks clean, which is also why the dictionary
+// types that map `Record<string, string>` rather than promising to be exhaustive about somebody
+// else's enumeration.
 
 function AnomaliesSection({ api }: { api: KintaiAdminClient }) {
   /*
@@ -543,6 +502,7 @@ function AnomaliesSection({ api }: { api: KintaiAdminClient }) {
    * recomputed on every render would silently disagree with its own data the moment a page left
    * open crosses midnight on the 1st.
    */
+  const t = useT();
   const [period] = useState(() => jstWorkDate(Date.now()).slice(0, 7));
   const read = useCallback(() => api.listAnomalousDays(period), [api, period]);
   /*
@@ -560,7 +520,7 @@ function AnomaliesSection({ api }: { api: KintaiAdminClient }) {
    * those happen elsewhere — by design, see this module's header. If a decide control ever lands
    * on this tab, this is the paragraph that has to be redone rather than quietly outgrown.
    */
-  const { data, error } = useSectionRead(read, "Couldn’t read the flagged days.", 0);
+  const { data, failure } = useSectionRead(read, 0);
 
   // Grouped by employee, in the order the read returned them: one row per flagged day, but the
   // person named once. The read is already ordered by employee then date, so this preserves it.
@@ -580,20 +540,20 @@ function AnomaliesSection({ api }: { api: KintaiAdminClient }) {
   return (
     <Section
       testId="anomalies-section"
-      heading={`要確認の勤務日 · days that need a look (${period})`}
+      heading={t.anomalies.heading(period)}
       summary={data === undefined
         ? undefined
-        : `${data.length} ${data.length === 1 ? "day" : "days"} across ` +
-          `${groups.length} ${groups.length === 1 ? "employee" : "employees"}`}
+        : t.anomalies.summary(data.length, groups.length)}
     >
-      {error !== undefined ? (
-        <SectionError testId="anomalies-error" message={error} />
+      {failure !== undefined ? (
+        <SectionError
+          testId="anomalies-error"
+          message={describeFailure(failure.caught, t.errors.fallbacks.readAnomalousDays, t)}
+        />
       ) : data === undefined ? (
         <Loading />
       ) : data.length === 0 ? (
-        <Empty testId="anomalies-empty">
-          フラグの立った勤務日はありません — every day with punches this month pairs up.
-        </Empty>
+        <Empty testId="anomalies-empty">{t.anomalies.empty}</Empty>
       ) : (
         <div className="flex flex-col gap-4">
           {groups.map((group) => (
@@ -628,8 +588,10 @@ function AnomaliesSection({ api }: { api: KintaiAdminClient }) {
  * the truth about the day.
  */
 function AnomalousDayRow({ day, api }: { day: AnomalousDay; api: KintaiAdminClient }) {
+  const t = useT();
   const [open, setOpen] = useState(false);
-  const [detail, setDetail] = useState<{ day?: EmployeeDay; error?: string }>();
+  // The failure, never the sentence — see `useSectionRead`.
+  const [detail, setDetail] = useState<{ day?: EmployeeDay; failure?: { caught: unknown } }>();
   const live = useRef(true);
   // Armed here, not only by `useRef`: on a mount → unmount → remount of this row the ref survives
   // with `false` in it, and every later read would then be discarded on arrival — a row whose
@@ -647,7 +609,7 @@ function AnomalousDayRow({ day, api }: { day: AnomalousDay; api: KintaiAdminClie
       // and a stored error is state — so one transient blip used to make a day unreadable for the
       // life of the page, on the section whose entire job is "look at this day". Collapsing is
       // the only control the row has; it is therefore also the retry.
-      if (detail?.error !== undefined) setDetail(undefined);
+      if (detail?.failure !== undefined) setDetail(undefined);
       return;
     }
     setOpen(true);
@@ -659,9 +621,7 @@ function AnomalousDayRow({ day, api }: { day: AnomalousDay; api: KintaiAdminClie
         const read = await api.getEmployeeDay(day.employeeId, day.workDate);
         if (live.current) setDetail({ day: read });
       } catch (caught) {
-        if (live.current) {
-          setDetail({ error: describeFailure(caught, "Couldn’t read that day’s punches.") });
-        }
+        if (live.current) setDetail({ failure: { caught } });
       }
     })();
   };
@@ -671,7 +631,7 @@ function AnomalousDayRow({ day, api }: { day: AnomalousDay; api: KintaiAdminClie
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
         <p className="font-mono text-xs text-kumo-default">{day.workDate}</p>
         <p className="min-w-48 flex-1 text-xs text-kumo-danger" data-testid="flags">
-          {day.anomalies.map((flag) => ANOMALY_LABELS[flag] ?? flag).join(" · ")}
+          {day.anomalies.map((flag) => t.labels.anomalies[flag] ?? flag).join(" · ")}
         </p>
         <button
           type="button"
@@ -680,35 +640,37 @@ function AnomalousDayRow({ day, api }: { day: AnomalousDay; api: KintaiAdminClie
           className="press shrink-0 rounded-lg border border-kumo-line bg-kumo-control px-2.5 py-1 text-xs font-medium text-kumo-default hover:bg-kumo-tint"
           onClick={toggle}
         >
-          {open ? "Hide punches" : "Show punches"}
+          {open ? t.anomalies.hidePunches : t.anomalies.showPunches}
         </button>
       </div>
 
       {open && (
         <div className="mt-2 rounded-lg bg-kumo-tint px-3 py-2" data-testid="day-detail">
-          {detail?.error !== undefined ? (
-            <p className="text-xs text-kumo-danger" role="alert">{detail.error}</p>
+          {detail?.failure !== undefined ? (
+            <p className="text-xs text-kumo-danger" role="alert">
+              {describeFailure(detail.failure.caught, t.errors.fallbacks.readDay, t)}
+            </p>
           ) : detail?.day === undefined ? (
-            <p className="text-xs text-kumo-subtle">Reading the punches…</p>
+            <p className="text-xs text-kumo-subtle">{t.anomalies.readingPunches}</p>
           ) : (
             <>
               <ul className="flex flex-col gap-0.5">
                 {detail.day.punches.map((punch) => (
                   <li key={punch.id} className="font-mono text-xs text-kumo-default" data-testid="punch">
                     {jstClockTime(punch.occurred_at)} {punch.kind}
-                    <PunchSource punch={punch} />
+                    <PunchSource punch={punch} t={t} />
                   </li>
                 ))}
               </ul>
               {detail.day.punches.length === 0 && (
-                <p className="text-xs text-kumo-subtle">No punches on this day any more.</p>
+                <p className="text-xs text-kumo-subtle">{t.anomalies.noPunches}</p>
               )}
               {/* The minutes and the punches are one read, taken now; the flags on the row above
                   came with the list. They can disagree if a correction was applied in between,
                   and the fresher pair is the one to believe — which is the reason the drill-down
                   reads the day rather than being handed a cached copy of it. */}
               <p className="mt-1 text-xs text-kumo-subtle" data-testid="credited">
-                Credited {formatDuration(detail.day.workedMinutes)}
+                {t.anomalies.credited(detail.day.workedMinutes)}
               </p>
             </>
           )}
@@ -732,23 +694,19 @@ function AnomalousDayRow({ day, api }: { day: AnomalousDay; api: KintaiAdminClie
  * TO, so with one record the button that would scroll to an empty form is not rendered.
  */
 function BlockersSection({ roster, fixes }: { roster: RosterEntry[]; fixes: RowFixes }) {
+  const t = useT();
   const names = new Map(roster.map((row) => [row.id, row.display_name]));
   const blocked = roster.filter((row) => !isReady(row));
 
   return (
     <Section
       testId="blockers-section"
-      heading="未整備 · not ready to use Kintai"
-      summary={blocked.length === 0
-        ? undefined
-        : `${blocked.length} ${blocked.length === 1 ? "employee" : "employees"}`}
+      heading={t.blockers.heading}
+      summary={blocked.length === 0 ? undefined : t.blockers.summary(blocked.length)}
     >
       {blocked.length === 0 ? (
         <Empty testId="blockers-empty">
-          {roster.length === 0
-            ? "従業員がまだ登録されていません — add the first record on the Roster tab."
-            : "全員 Kintai を使える状態です — everybody is linked and has somebody who can" +
-              " approve for them."}
+          {roster.length === 0 ? t.blockers.emptyRoster : t.blockers.allReady}
         </Empty>
       ) : (
         <ul className="divide-y divide-kumo-line border-y border-kumo-line">
@@ -827,5 +785,6 @@ function SectionError({ testId, message }: { testId: string; message: string }) 
 }
 
 function Loading() {
-  return <p className="text-sm text-kumo-subtle">Loading…</p>;
+  const t = useT();
+  return <p className="text-sm text-kumo-subtle">{t.common.loading}</p>;
 }
