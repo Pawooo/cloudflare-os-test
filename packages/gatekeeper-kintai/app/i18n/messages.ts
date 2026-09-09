@@ -101,6 +101,18 @@ const JA_ANOMALIES: Record<string, string> = {
  * because the account code they are signed in with is the thing HR has to point at a record. The
  * rewrite says to read it out, and does not send them to a tab they cannot see — the employee
  * screen has no roster and no account card, unlike the administrator's.
+ *
+ * `KINTAI_NO_APPROVER` is here for a different reason from all of them: its detail is not merely
+ * unhelpful, it is in the WRONG LANGUAGE. The English text `NoApproverError` throws contains
+ * 管理監督者, so an English screen showing it dropped into 漢字 for the word its sentence turns on
+ * — which is the mixture this whole file replaces. Both rewrites keep the detail's substance (an
+ * exemption is not an approver, a punch correction still needs one, and the fix is a reporting
+ * line or a designated approver) and each stays in one language throughout, the English side
+ * glossing the term as Article 41 exactly as `roster.row.exempt` does.
+ *
+ * It is written WITHOUT "you", unlike the two above. Both an employee filing a correction
+ * (`fileAmendment`/`submitOvertime` → `assertApproverReachable`) and an administrator saving an
+ * organisation reach this code, and only one of those readers is the person who has no approver.
  */
 const EN_BY_CODE: Record<string, string> = {
   KINTAI_NOT_FOUND: "That employee record no longer exists. Reload the roster and try again.",
@@ -113,6 +125,11 @@ const EN_BY_CODE: Record<string, string> = {
   KINTAI_ACCOUNT_NOT_LINKED:
     "Your account is not linked to an employee record yet. Read your account code to HR so they" +
     " can link it.",
+  KINTAI_NO_APPROVER:
+    "Nobody can approve this: there is no manager and no designated approver on record. Being" +
+    " exempt under Article 41 does not change that — a punch correction still needs somebody to" +
+    " approve it. Ask an administrator to set a reporting line, or a designated approver for" +
+    " somebody who reports to nobody.",
 };
 
 const JA_BY_CODE: Record<string, string> = {
@@ -127,6 +144,10 @@ const JA_BY_CODE: Record<string, string> = {
   KINTAI_ACCOUNT_NOT_LINKED:
     "あなたのアカウントはまだ従業員レコードに紐づいていません。アカウントコードを人事に伝えて、" +
     "紐づけてもらってください。",
+  KINTAI_NO_APPROVER:
+    "承認できる人がいません — 上長も指定承認者も登録されていません。管理監督者であってもこれは" +
+    "変わりません: 打刻の修正には承認する人が必要です。管理者に上長の設定を依頼してください。" +
+    "誰にも報告しない場合は指定承認者を設定してもらってください。",
 };
 
 const EN_PUNCH_KINDS: Record<PunchKind, string> = {

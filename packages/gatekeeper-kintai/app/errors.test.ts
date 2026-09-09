@@ -99,6 +99,45 @@ describe("describeFailure", () => {
     expect(ja.errors.byCode.KINTAI_ACCOUNT_NOT_LINKED).toMatch(JAPANESE);
   });
 
+  /*
+   * The detail that is not merely unhelpful but WRONG-LANGUAGE. `NoApproverError`'s English text
+   * contains 管理監督者, so before this rewrite an English screen dropped into 漢字 for the word
+   * its sentence turns on — reachable from an employee filing a missing punch (`fileAmendment`
+   * calls `assertApproverReachable`) as well as from an administrator saving an organisation.
+   * Spelled out here exactly as `src/store/org.ts` throws it, so a change to either side lands.
+   */
+  const NO_APPROVER =
+    "KINTAI_NO_APPROVER: employee 3 has no manager and no designated approver, so nobody could " +
+    "approve anything they file -- a punch correction included, which a 管理監督者 exemption does " +
+    "not excuse them from needing. Ask an administrator to set a reporting line, or a designated " +
+    "approver if they report to nobody.";
+
+  it.each([["en", en], ["ja", ja]] as const)(
+    "replaces the no-approver detail rather than showing its 管理監督者 to an English reader (%s)",
+    (_language, t) => {
+      expect(describeFailure(new Error(NO_APPROVER), t.errors.fallbacks.fileRequest, t))
+        .toBe(t.errors.byCode.KINTAI_NO_APPROVER);
+    },
+  );
+
+  // One language per screen, on the one rewrite that exists because the server's own English was
+  // not: the English side glosses the term as Article 41, the way `roster.row.exempt` does.
+  it("writes the no-approver sentence in one language each", () => {
+    expect(en.errors.byCode.KINTAI_NO_APPROVER).not.toMatch(JAPANESE);
+    expect(ja.errors.byCode.KINTAI_NO_APPROVER).toMatch(JAPANESE);
+    expect(en.errors.byCode.KINTAI_NO_APPROVER).not.toContain("管理監督者");
+  });
+
+  // The rewrite must still SAY what the server said: an exemption is not an approver, and the fix
+  // is a reporting line or a designated approver. Kept as a substring check per language rather
+  // than a second copy of the whole sentence.
+  it("keeps the detail's substance in both languages", () => {
+    expect(en.errors.byCode.KINTAI_NO_APPROVER).toContain("Article 41");
+    expect(en.errors.byCode.KINTAI_NO_APPROVER).toContain("designated approver");
+    expect(ja.errors.byCode.KINTAI_NO_APPROVER).toContain("管理監督者");
+    expect(ja.errors.byCode.KINTAI_NO_APPROVER).toContain("指定承認者");
+  });
+
   // Every employee id this page sends comes from a select, so `Number("")` is `0` and the API
   // answers with a fact about an argument. What the reader did was forget to pick somebody — and
   // with the sandbox making `required` inert, this is the likeliest failure on the screen. The
@@ -130,12 +169,23 @@ describe("describeFailure", () => {
     }
   });
 
+  /*
+   * `capitalize` uppercases the first character ONLY, so a detail that opens on 漢字 survives it.
+   * Pinned against `KINTAI_EXEMPT_EMPLOYEE`, which `submitOvertime` throws and which has no
+   * by-code rewrite — this case used to use `KINTAI_NO_APPROVER`, and now that that code IS
+   * rewritten the assertion would have been about the dictionary rather than about capitalising.
+   */
   it("keeps 管理監督者 and other non-Latin text intact when capitalising", () => {
     expect(describeFailure(
-      new Error("KINTAI_NO_APPROVER: 管理監督者 exemption missing for employee 3."),
+      new Error(
+        "KINTAI_EXEMPT_EMPLOYEE: 管理監督者-exempt for the requested period and may not raise an " +
+        "overtime request for it.",
+      ),
       "fallback",
       ja,
-    )).toBe("管理監督者 exemption missing for employee 3.");
+    )).toBe(
+      "管理監督者-exempt for the requested period and may not raise an overtime request for it.",
+    );
   });
 
   it("keeps a multi-line detail whole", () => {
