@@ -67,7 +67,9 @@ const EN_ANOMALIES: Record<string, string> = {
   orphan_out: "Clock-out with no clock-in",
   duplicate_in: "Duplicate clock-in",
   negative_gross: "Breaks longer than the day",
-  long_span: "14 hours or more",
+  // A PROBLEM, like its five neighbours, not a measurement: "14 hours or more" named a threshold
+  // and left the reader to guess what had crossed it — while `ja` said 14時間以上の勤務, the work.
+  long_span: "Worked 14 hours or more",
 };
 
 const JA_ANOMALIES: Record<string, string> = {
@@ -688,7 +690,14 @@ export const en = {
    * in `punches.source`, and never the platform's own word `gadget`.
    */
   punchSource: {
-    gadget: "Punched by the employee",
+    /**
+     * WHERE the punch came from, not who it belongs to. "Punched by the employee" was written for
+     * the admin drill-down and reads as somebody else's punch on the one screen where it is the
+     * reader's own — an employee looking at their 今日 tab is the employee. Naming the app instead
+     * says the same thing to both readers, and still contrasts with `admin` and `import`, which is
+     * the whole distinction this map exists to draw. `ja` has always been 本人打刻.
+     */
+    gadget: "Punched in the app",
     /**
      * The one source with a story worth telling: it is an approved correction, and what matters is
      * WHO approved it and WHY, not the bare fact that it differs from what was first recorded.
@@ -877,7 +886,7 @@ export const ja = {
       reasonPlaceholder: "例: 退勤時に打刻を忘れました",
       submit: "退勤の打刻漏れを申請",
       hint: "実際に職場を離れた時刻を入力してください（例 18:30）。理由は承認する人が読みます。",
-      filed: "申請しました・承認待ち",
+      filed: "申請しました · 承認待ち",
     },
   },
 
@@ -902,7 +911,7 @@ export const ja = {
     filerUnknown: "申請者は記録されていません。",
 
     closedPeriod: (period: string) =>
-      `締め済み ${period} — この期間は締め済みです。承認すると、すでに締めた月の内容が変わります。`,
+      `締め済み · ${period} は締め済みです。承認すると、すでに締めた月の内容が変わります。`,
 
     stranded: (employeeName: string) =>
       `これを決定できる人がいません — このままでは永久に待ち続けます。名簿タブで ${employeeName} に` +
@@ -963,7 +972,7 @@ export const ja = {
     empty: "従業員レコードがまだありません。下のフォームで最初の一人を追加してください。",
 
     row: {
-      nightShift: "夜勤 · 打刻はシフトの開始日に記録されます",
+      nightShift: "夜勤 · 打刻はシフトの開始日に記録されます。",
       exempt: "管理監督者 · 時間外・休日の割増はつきませんが、深夜割増は適用されます",
       ready: (reason: string) => `利用可能 · ${reason}`,
       notLinked: "アカウントコードが紐づいていません — 本人としてサインインできません。",
