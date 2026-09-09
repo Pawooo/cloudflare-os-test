@@ -354,6 +354,11 @@ function DecisionControls(
         });
         setBusy(false);
       }
+      // A stale marker is a fact about THIS row's read, so refresh the read: without this every
+      // retry carries the same stale marker and is refused until the whole page is reloaded.
+      if (caught instanceof Error && caught.message.startsWith("KINTAI_STALE_DECISION")) {
+        onDecided();
+      }
     }
   };
 

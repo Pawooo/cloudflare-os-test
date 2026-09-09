@@ -714,22 +714,27 @@ describe("AdminPage", () => {
           .toContain("does not implement");
       });
 
-      it("tells a reader whose row moved under them to reload, in words", async () => {
+      it("tells a reader whose row moved under them to reload, and re-reads the row for them", async () => {
+        const listPendingOverview = vi.fn(async () => [
+          waiting({ id: 72, eligibleActorIds: [9], eligibleActorNames: ["Me"] }),
+        ]);
         const api = adminApi({
-          listPendingOverview: vi.fn(async () => [
-            waiting({ id: 72, eligibleActorIds: [9], eligibleActorNames: ["Me"] }),
-          ]),
+          listPendingOverview,
           decideSubmission: vi.fn(async () => {
             throw new Error("KINTAI_STALE_DECISION: this submission has changed since it was read.");
           }),
         });
         await render(<AdminPage api={api} />);
+        const reads = listPendingOverview.mock.calls.length;
 
         await click('[data-submission="72"] [data-action="decide-approve"]');
         await click('[data-submission="72"] [data-action="confirm-decision"]');
         const error = within(pendingRow(72), '[data-testid="decision-error"]');
         expect(error.toLowerCase()).toContain("reload");
         expect(pendingRow(72).querySelector('[data-testid="decision-error-detail"]')).toBeNull();
+        // The row's marker is what went stale, so the queue is re-read: the next click carries a
+        // fresh one instead of being refused for ever.
+        expect(listPendingOverview.mock.calls.length).toBeGreaterThan(reads);
       });
 
       it("shows the store's refusal in the row and leaves the request where it was", async () => {
