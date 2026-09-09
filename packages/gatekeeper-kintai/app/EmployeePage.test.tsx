@@ -333,6 +333,92 @@ describe("EmployeePage", () => {
     expect(today().textContent).toContain("You already clocked in.");
   });
 
+  /*
+   * A MESSAGE ALREADY ON SCREEN MUST FOLLOW THE TOGGLE. The reads on these panels hold what they
+   * CAUGHT and describe it at render time (see `TodayPanel`, and `useSectionRead` on the
+   * dashboard); the two WRITES here used to hold the rendered sentence instead, which froze it in
+   * whichever language the failure happened in. The reader most likely to press the toggle is
+   * precisely the one who cannot read the refusal in front of them, and the language they pressed
+   * it for is the one it stayed out of.
+   *
+   * Both cases toggle 日本語 → English with an error standing, and assert the sentence is now the
+   * English dictionary's — not merely that it changed, and not the fallback either, since the
+   * fallback is also translated and would pass a weaker assertion.
+   */
+  it("retranslates a punch failure already on screen when the language is toggled", async () => {
+    const api = employeeApi({
+      getDay: vi.fn(async () => day([])),
+      punch: vi.fn(async () => {
+        // HR closed the link between the read and the press: `punch` resolves the employee too.
+        throw new Error(
+          "KINTAI_ACCOUNT_NOT_LINKED: this account is not linked to an employee record. " +
+          "Contact HR to be set up.",
+        );
+      }),
+    });
+    await render(<EmployeePage api={api} />);
+
+    await click('[data-testid="panel-today"] [data-punch="in"]');
+    expect(inToday('[data-testid="punch-error"]').textContent)
+      .toBe(ja.errors.byCode.KINTAI_ACCOUNT_NOT_LINKED);
+
+    await click('[data-testid="language-toggle"]');
+
+    expect(inToday('[data-testid="punch-error"]').textContent)
+      .toBe(en.errors.byCode.KINTAI_ACCOUNT_NOT_LINKED);
+  });
+
+  it("retranslates a filing failure already on screen when the language is toggled", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-09-07T12:00:00+09:00"));
+    const api = employeeApi({
+      getDay: vi.fn(async () => day([punchRow({ kind: "in" })], { anomalies: ["unpaired_in"] })),
+      // The refusal this form actually meets: nobody can approve what this employee files.
+      requestMissingPunch: vi.fn(async () => {
+        throw new Error(
+          "KINTAI_NO_APPROVER: employee 7 has no manager and no designated approver, so nobody " +
+          "could approve anything they file -- a punch correction included, which a 管理監督者 " +
+          "exemption does not excuse them from needing. Ask an administrator to set a reporting " +
+          "line, or a designated approver if they report to nobody.",
+        );
+      }),
+    });
+    await render(<EmployeePage api={api} />);
+
+    await setInput('[data-testid="correction-time"]', "18:30");
+    await setInput('[data-testid="correction-reason"]', "退勤の打刻を忘れました");
+    await click('[data-testid="panel-today"] [data-testid="file-correction"]');
+    expect(inToday('[data-testid="correction-notice"]').textContent)
+      .toBe(ja.errors.byCode.KINTAI_NO_APPROVER);
+
+    await click('[data-testid="language-toggle"]');
+
+    expect(inToday('[data-testid="correction-notice"]').textContent)
+      .toBe(en.errors.byCode.KINTAI_NO_APPROVER);
+  });
+
+  // The SUCCESS notice was stored rendered for the same reason and is wrong in the same way: 申請
+  // しました・承認待ち is the one sentence telling the reader nothing is fixed yet, and a reader who
+  // switched language would have kept reading it in the language they switched away from.
+  it("retranslates the filed confirmation when the language is toggled", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-09-07T12:00:00+09:00"));
+    const api = employeeApi({
+      getDay: vi.fn(async () => day([punchRow({ kind: "in" })], { anomalies: ["unpaired_in"] })),
+      requestMissingPunch: vi.fn(async () => 1),
+    });
+    await render(<EmployeePage api={api} />);
+
+    await setInput('[data-testid="correction-time"]', "18:30");
+    await setInput('[data-testid="correction-reason"]', "退勤の打刻を忘れました");
+    await click('[data-testid="panel-today"] [data-testid="file-correction"]');
+    expect(inToday('[data-testid="correction-notice"]').textContent)
+      .toBe(ja.today.missingOut.filed);
+
+    await click('[data-testid="language-toggle"]');
+
+    expect(inToday('[data-testid="correction-notice"]').textContent)
+      .toBe(en.today.missingOut.filed);
+  });
+
   // The core interaction: a punch must re-read the day so the control advances. Sequence `getDay`
   // — an empty day, then a day carrying the new `in` — and prove the UI reflects the SECOND read
   // (出勤 → 退勤/休憩開始), not just the first. If the reload after a punch is dropped, the button

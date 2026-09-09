@@ -249,6 +249,11 @@ function TodayPanel({ api }: { api: KintaiEmployeeClient }) {
  * The always-visible shift control: the next legal punch(es) for right now, from `nextPunchKind`.
  * Pressing one calls `api.punch` and, on success, reloads the day so the control redraws for the
  * new state. A failure is shown through `describeFailure` and the day is left as it was.
+ *
+ * THE FAILURE IS HELD, NOT THE SENTENCE — the same rule `TodayPanel`'s read follows, and for a
+ * sharper reason on a write: this state used to be a rendered `string`, so a refusal froze in
+ * whichever language it happened in and the toggle left it behind. The reader most likely to press
+ * that toggle is the one who cannot read the refusal in front of them.
  */
 function ShiftControl(
   { api, punches, reload, live }: {
@@ -259,18 +264,18 @@ function ShiftControl(
   },
 ) {
   const t = useT();
-  const [error, setError] = useState<string>();
+  const [failure, setFailure] = useState<{ caught: unknown }>();
   const [busy, setBusy] = useState(false);
   const kinds = nextPunchKind(punches);
 
   const doPunch = async (kind: PunchKind) => {
     setBusy(true);
-    setError(undefined);
+    setFailure(undefined);
     try {
       await api.punch(kind);
       if (live.current) reload();
     } catch (caught) {
-      if (live.current) setError(describeFailure(caught, t.errors.fallbacks.punch, t));
+      if (live.current) setFailure({ caught });
     } finally {
       if (live.current) setBusy(false);
     }
@@ -302,9 +307,9 @@ function ShiftControl(
           );
         })}
       </div>
-      {error !== undefined && (
+      {failure !== undefined && (
         <p className="mt-2 text-xs text-kumo-danger" role="alert" data-testid="punch-error">
-          {error}
+          {describeFailure(failure.caught, t.errors.fallbacks.punch, t)}
         </p>
       )}
     </section>
@@ -320,6 +325,12 @@ function ShiftControl(
  * their own — never a fabricated "now") and WHY (the reason the server requires). Both are plain
  * `<input>`s, not a `<form>` and not a `<textarea>`/`<select>` — the host sandbox forbids form
  * submission, and the file button is `type="button"`, inert if ever moved inside a form.
+ *
+ * NEITHER HALF OF THE NOTICE IS STORED AS A SENTENCE. `filed` is a flag and a failure is the value
+ * that was CAUGHT, both rendered at render time against the current `t`, so the toggle carries an
+ * outcome already on screen into the new language. This state used to hold two rendered strings,
+ * which is worst on exactly this control: 申請しました・承認待ち is the one sentence telling the
+ * reader that nothing is fixed yet, and it stayed in the language they had just switched away from.
  */
 function MissingOutForm(
   { api, workDate, reload, live }: {
@@ -333,7 +344,7 @@ function MissingOutForm(
   const [time, setTime] = useState("");
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState<{ ok?: string; error?: string }>();
+  const [notice, setNotice] = useState<{ filed?: true; failure?: { caught: unknown } }>();
   // Stable, unique per instance: 今日 and several 今月 rows can each hold one of these forms at once,
   // and a caption has to point at ITS field for a tap on the words to focus the right input.
   const timeId = useId();
@@ -349,13 +360,11 @@ function MissingOutForm(
       const occurredAt = Date.parse(`${workDate}T${time}:00+09:00`);
       await api.requestMissingPunch(workDate, "out", occurredAt, reason);
       if (live.current) {
-        setNotice({ ok: t.today.missingOut.filed });
+        setNotice({ filed: true });
         reload();
       }
     } catch (caught) {
-      if (live.current) {
-        setNotice({ error: describeFailure(caught, t.errors.fallbacks.fileRequest, t) });
-      }
+      if (live.current) setNotice({ failure: { caught } });
     } finally {
       if (live.current) setBusy(false);
     }
@@ -412,14 +421,14 @@ function MissingOutForm(
       <p id={hintId} data-testid="correction-time-hint" className="mt-1.5 text-[11px] text-kumo-subtle">
         {t.today.missingOut.hint}
       </p>
-      {notice?.ok !== undefined && (
+      {notice?.filed === true && (
         <p className="mt-2 text-xs text-kumo-success" data-testid="correction-notice">
-          {notice.ok}
+          {t.today.missingOut.filed}
         </p>
       )}
-      {notice?.error !== undefined && (
+      {notice?.failure !== undefined && (
         <p className="mt-2 text-xs text-kumo-danger" role="alert" data-testid="correction-notice">
-          {notice.error}
+          {describeFailure(notice.failure.caught, t.errors.fallbacks.fileRequest, t)}
         </p>
       )}
     </div>
