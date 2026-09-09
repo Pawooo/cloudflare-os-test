@@ -1,8 +1,9 @@
 import React, { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it } from "vitest";
-import type { PunchRow } from "../src/types";
+import type { PunchRow, UiLanguage } from "../src/types";
 import { PunchSource } from "./PunchSource";
+import { LanguageProvider, en, ja } from "./i18n";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -23,12 +24,17 @@ describe("PunchSource", () => {
     root = undefined;
   });
 
-  async function render(element: React.ReactNode): Promise<void> {
+  /**
+   * One explicit language per render, 日本語 by default. `PunchSource` reads the language off the
+   * provider (`useT()`) rather than taking a prop, so that the admin drill-down and 今日 both get
+   * their own screen's language without either call site passing anything.
+   */
+  async function render(element: React.ReactNode, language: UiLanguage = "ja"): Promise<void> {
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
     await act(async () => {
-      root!.render(element);
+      root!.render(<LanguageProvider initial={language}>{element}</LanguageProvider>);
     });
   }
 
@@ -57,8 +63,29 @@ describe("PunchSource", () => {
   it("renders 本人打刻 for a self-recorded punch, not the raw word gadget", async () => {
     await render(<PunchSource punch={punch({ source: "gadget" })} />);
 
-    expect(container!.textContent).toContain("本人打刻");
+    expect(container!.textContent).toContain(ja.punchSource.gadget);
     expect(container!.textContent).not.toContain("gadget");
+  });
+
+  // The same punch on an English screen says it in English — the provenance line follows the
+  // screen's language like every other word on it, and neither language leaks into the other.
+  it("renders the same punch in English on an English screen", async () => {
+    await render(<PunchSource punch={punch({ source: "gadget" })} />, "en");
+
+    expect(container!.textContent).toContain(en.punchSource.gadget);
+    expect(container!.textContent).not.toContain(ja.punchSource.gadget);
+  });
+
+  it("builds the amendment sentence out of the dictionary, in the screen's language", async () => {
+    await render(<PunchSource punch={punch({
+      source: "amendment", amended_by: null, amend_reason: null,
+    })} />);
+
+    // No approver recorded and no reason given: both hold the dictionary's words for the gap,
+    // never a blank that would read as an amendment nobody made for no reason.
+    expect(container!.textContent).toBe(
+      ja.punchSource.amendment(ja.punchSource.unknownApprover, ja.punchSource.noReason),
+    );
   });
 
   it("renders an amendment's approver and stated reason, not the bare word amendment", async () => {

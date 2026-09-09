@@ -1,9 +1,12 @@
 import React, { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { EmployeeMonth, EmployeeMonthDay, KintaiEmployeeClient, PunchRow } from "../src/types";
+import type {
+  EmployeeMonth, EmployeeMonthDay, KintaiEmployeeClient, PunchRow, UiLanguage,
+} from "../src/types";
 import { jstWorkDate } from "../src/work-date";
 import EmployeePage, { nextPunchKind } from "./EmployeePage";
+import { LanguageProvider, en, ja } from "./i18n";
 
 /** One current punch on today's day, everything but the fields under test defaulted to inert. */
 function punchRow(overrides: Partial<PunchRow> = {}): PunchRow {
@@ -105,8 +108,48 @@ describe("EmployeePage", () => {
     expect(panel("month").hidden).toBe(true);
     // Both mounted from the first render — the hidden one is present, not absent.
     expect(panel("month")).not.toBeNull();
-    expect(tab("today").textContent).toBe("今日");
-    expect(tab("month").textContent).toBe("今月");
+    expect(tab("today").textContent).toBe(ja.tabs.today);
+    expect(tab("month").textContent).toBe(ja.tabs.month);
+  });
+
+  // One language per screen. The header carries the one control that changes it, right of the
+  // title, offering the OTHER language by its own name — "English" while the screen is in 日本語.
+  it("puts the language toggle in the header, after the title, offering the other language", async () => {
+    await render(<EmployeePage api={employeeApi()} />);
+
+    const toggle = field<HTMLButtonElement>('[data-testid="language-toggle"]');
+    const header = field<HTMLElement>("header");
+    expect(header.contains(toggle)).toBe(true);
+    // Right-aligned means: it comes after the title in the header's own flex row.
+    const title = field<HTMLElement>("header h1");
+    expect(title.compareDocumentPosition(toggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // Inert, like every control in this sandboxed frame.
+    expect(toggle.getAttribute("type")).toBe("button");
+    // The other language's own name, and the aria-label in the language being read now.
+    expect(toggle.textContent).toContain(ja.labels.languageNames.en);
+    expect(toggle.getAttribute("aria-label"))
+      .toBe(ja.header.language.switchTo(ja.labels.languageNames.en));
+  });
+
+  // The whole screen in English when that is the account's language — the tabs and the sentence a
+  // reader meets on an empty day, with nothing of the other language left anywhere on the page.
+  it("renders the whole screen in English when the account language is en", async () => {
+    const api = employeeApi({
+      whoAmI: vi.fn<KintaiEmployeeClient["whoAmI"]>(async () => ({
+        accountId: "acct-emp", linked: true, employeeId: 7, language: "en",
+      })),
+      getDay: vi.fn(async () => day([])),
+    });
+    await render(<EmployeePage api={api} />, "en");
+
+    expect(tab("today").textContent).toBe(en.tabs.today);
+    expect(tab("month").textContent).toBe(en.tabs.month);
+    expect(today().textContent).toContain(en.today.emptyDay);
+    expect(container!.textContent).not.toContain(ja.tabs.today);
+    expect(container!.textContent).not.toContain(ja.today.emptyDay);
+    // The toggle now offers 日本語, and says so in English.
+    expect(field('[data-testid="language-toggle"]').getAttribute("aria-label"))
+      .toBe(en.header.language.switchTo(en.labels.languageNames.ja));
   });
 
   it("reveals 今月 on click and hides 今日, without remounting either", async () => {
@@ -216,7 +259,7 @@ describe("EmployeePage", () => {
 
     const punches = today().querySelectorAll('[data-testid="punch"]');
     expect(punches).toHaveLength(1);
-    expect(punches[0].textContent).toContain("本人打刻");
+    expect(punches[0].textContent).toContain(ja.punchSource.gadget);
     expect(punches[0].textContent).not.toContain("gadget");
   });
 
@@ -224,7 +267,7 @@ describe("EmployeePage", () => {
     const api = employeeApi({ getDay: vi.fn(async () => day([])) });
     await render(<EmployeePage api={api} />);
 
-    expect(today().textContent).toContain("今日はまだ打刻がありません");
+    expect(today().textContent).toContain(ja.today.emptyDay);
   });
 
   it("guides the correction form: captions attached to their fields, a placeholder reason, a hint for the time", async () => {
@@ -261,7 +304,7 @@ describe("EmployeePage", () => {
     await render(<EmployeePage api={api} />);
 
     // Plain language, never the wire flag.
-    expect(today().textContent).toContain("退勤打刻なし");
+    expect(today().textContent).toContain(ja.labels.anomalies.unpaired_in);
     expect(today().textContent).not.toContain("unpaired_in");
 
     await setInput('[data-testid="correction-time"]', "18:30");
@@ -272,7 +315,7 @@ describe("EmployeePage", () => {
       "2026-09-07", "out", Date.parse("2026-09-07T18:30:00+09:00"), "退勤の打刻を忘れました",
     );
     // A request, awaiting a decision — never "fixed".
-    expect(today().textContent).toContain("申請しました・承認待ち");
+    expect(today().textContent).toContain(ja.today.missingOut.filed);
     expect(today().textContent!.toLowerCase()).not.toContain("fixed");
   });
 
@@ -330,7 +373,7 @@ describe("EmployeePage", () => {
 
     expect(api.requestMissingPunch).toHaveBeenCalledTimes(1);
     expect(getDay).toHaveBeenCalledTimes(2);
-    expect(today().textContent).toContain("申請しました・承認待ち");
+    expect(today().textContent).toContain(ja.today.missingOut.filed);
   });
 
   it("keeps every 今日 control an inert button and adds no form/select/textarea", async () => {
@@ -408,9 +451,9 @@ describe("EmployeePage", () => {
       const rows = month().querySelectorAll("[data-month-day]");
       expect(rows).toHaveLength(2);
       expect(inMonth(`[data-month-day="${currentMonth}-01"] [data-testid="worked"]`).textContent)
-        .toBe("8h 15m");
+        .toBe(ja.labels.durations.full(495));
       expect(inMonth(`[data-month-day="${currentMonth}-02"] [data-testid="worked"]`).textContent)
-        .toBe("1h 0m");
+        .toBe(ja.labels.durations.full(60));
     });
 
     // A day WITH an overtime request shows the request and its state. A day WITHOUT one shows no
@@ -427,13 +470,13 @@ describe("EmployeePage", () => {
       await render(<EmployeePage api={employeeApi({ myMonth })} />);
 
       const withOt = inMonth(`[data-month-day="${currentMonth}-01"] [data-testid="overtime"]`);
-      expect(withOt.textContent).toContain("1h 30m");
-      expect(withOt.textContent).toContain("承認待ち");
+      expect(withOt.textContent).toContain(ja.labels.durations.full(90));
+      expect(withOt.textContent).toContain(ja.labels.overtimeStates.pending);
 
       // The day with no request renders an empty overtime cell — no minutes, no state, no zero.
       const noOt = inMonth(`[data-month-day="${currentMonth}-02"] [data-testid="overtime"]`);
       expect(noOt.textContent!.trim()).toBe("");
-      expect(noOt.textContent).not.toContain("0h");
+      expect(noOt.textContent).not.toContain(ja.labels.durations.full(0));
       expect(noOt.textContent).not.toContain("承認");
     });
 
@@ -447,7 +490,7 @@ describe("EmployeePage", () => {
       await render(<EmployeePage api={employeeApi({ myMonth })} />);
 
       const flagged = inMonth(`[data-month-day="${currentMonth}-01"] [data-testid="day-anomalies"]`);
-      expect(flagged.textContent).toContain("退勤打刻なし");
+      expect(flagged.textContent).toContain(ja.labels.anomalies.unpaired_in);
       expect(flagged.textContent).not.toContain("unpaired_in");
       // The clean day carries no marker.
       expect(month().querySelector(
@@ -486,7 +529,7 @@ describe("EmployeePage", () => {
         flaggedDate, "out", Date.parse(`${flaggedDate}T18:00:00+09:00`), "退勤を押し忘れました",
       );
       expect(inMonth(`[data-month-day="${flaggedDate}"] [data-testid="correction-notice"]`).textContent)
-        .toBe("申請しました・承認待ち");
+        .toBe(ja.today.missingOut.filed);
       expect(calls).toBeGreaterThan(before);
     });
 
@@ -506,9 +549,7 @@ describe("EmployeePage", () => {
     it("states that overtime figures are claims awaiting approval, not payouts", async () => {
       await render(<EmployeePage api={employeeApi()} />);
 
-      expect(inMonth('[data-testid="claims-note"]').textContent).toBe(
-        "残業時間は承認待ちの申請であり、承認されるまで支給額ではありません — overtime shown here is a claim awaiting approval, not a payout.",
-      );
+      expect(inMonth('[data-testid="claims-note"]').textContent).toBe(ja.month.claimsNote);
     });
 
     // An empty month is a statement, not a blank space.
@@ -518,7 +559,7 @@ describe("EmployeePage", () => {
       );
       await render(<EmployeePage api={employeeApi({ myMonth })} />);
 
-      expect(month().textContent).toContain("打刻がありません");
+      expect(month().textContent).toContain(ja.month.empty(jstWorkDate(Date.now()).slice(0, 7)));
       expect(month().querySelectorAll("[data-month-day]")).toHaveLength(0);
     });
 
@@ -558,12 +599,18 @@ describe("EmployeePage", () => {
     return [String(year).padStart(4, "0"), String(monthNo).padStart(2, "0")];
   }
 
-  async function render(element: React.ReactNode): Promise<void> {
+  /**
+   * Every render here is in ONE explicit language, and 日本語 is the default because the fake
+   * `whoAmI` returns `language: "ja"` — the account language the real entry resolves and hands the
+   * provider. The page itself takes the answer rather than resolving it (see `employee-main.tsx`),
+   * so a test names the language here, and the one English test passes `"en"`.
+   */
+  async function render(element: React.ReactNode, language: UiLanguage = "ja"): Promise<void> {
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
     await act(async () => {
-      root!.render(element);
+      root!.render(<LanguageProvider initial={language}>{element}</LanguageProvider>);
     });
     await settle();
   }
