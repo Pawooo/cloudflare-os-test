@@ -29,7 +29,23 @@ function walk(
     }
     return;
   }
-  if (typeof english === "object" && english !== null && japanese !== null) {
+  if (typeof english === "object") {
+    /*
+     * `typeof null` is `"object"`, so the check above lets a null through on either side and the
+     * key comparison below would throw on it. Asserted rather than skipped: the version of this
+     * walk that guarded with `japanese !== null` fell straight past a `ja` entry written as `null`
+     * against an `en` group of thirty keys, reported nothing, and passed — a whole section of the
+     * screen missing from one language, with a green parity test over it.
+     */
+    if (english === null || japanese === null) {
+      if (english !== japanese) {
+        report(
+          `${path}: en is ${english === null ? "null" : "an object"},` +
+          ` ja is ${japanese === null ? "null" : "an object"}`,
+        );
+      }
+      return;
+    }
     const left = Object.keys(english as object).sort();
     const right = Object.keys(japanese as object).sort();
     if (left.join() !== right.join()) {

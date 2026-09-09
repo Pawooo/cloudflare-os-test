@@ -83,16 +83,25 @@ const JA_ANOMALIES: Record<string, string> = {
  * Codes whose own detail should not be shown, keyed by the `KINTAI_*` code on the wire.
  *
  * `KINTAI_NOT_FOUND` says "there is no employee 42", where the number came from a control the
- * reader never typed into — the useful half is that their copy of the roster is stale. The other
- * two mean the same thing to the person in front of the queue: the row they are looking at is not
- * the request as it now stands. The API's own wording is true and gives them nothing to do;
- * "reload" does.
+ * reader never typed into — the useful half is that their copy of the roster is stale.
+ * `KINTAI_INVALID_TRANSITION` and `KINTAI_STALE_DECISION` mean the same thing to the person in
+ * front of the queue: the row they are looking at is not the request as it now stands. The API's
+ * own wording is true and gives them nothing to do; "reload" does.
+ *
+ * `KINTAI_ADMIN_NOT_LINKED` is the odd one out, and the only one whose rewrite names a fix rather
+ * than a reload. An administrator whose own account is not linked to an employee record cannot
+ * perform a write that RECORDS who performed it — closing a month, deciding a request — because
+ * there is nobody to record. The server's detail is about the missing link; what the reader needs
+ * is that their own account card, one tab away, is where they repair it.
  */
 const EN_BY_CODE: Record<string, string> = {
   KINTAI_NOT_FOUND: "That employee record no longer exists. Reload the roster and try again.",
   KINTAI_INVALID_TRANSITION:
     "Somebody already decided this request. Reload the page to see where it stands.",
   KINTAI_STALE_DECISION: "This request changed since you read it. Reload the page, then decide again.",
+  KINTAI_ADMIN_NOT_LINKED:
+    "Your account is not linked to an employee record, so this action cannot be recorded against" +
+    " you. Link your account code on the Roster tab first.",
 };
 
 const JA_BY_CODE: Record<string, string> = {
@@ -101,6 +110,9 @@ const JA_BY_CODE: Record<string, string> = {
     "この申請はすでに誰かが決定しています。ページを読み込み直して現在の状態を確認してください。",
   KINTAI_STALE_DECISION:
     "この申請は読み込んだあとに変わりました。ページを読み込み直してから、もう一度決定してください。",
+  KINTAI_ADMIN_NOT_LINKED:
+    "あなたのアカウントが従業員レコードに紐づいていないため、この操作をあなたの記録として残せません。" +
+    "まず名簿タブでアカウントコードを紐づけてください。",
 };
 
 const EN_PUNCH_KINDS: Record<PunchKind, string> = {
@@ -461,7 +473,9 @@ export const en = {
        * A neutral badge, deliberately NOT in the readiness column: it is a fact about this
        * person's overtime, not a verdict about whether anybody can approve for them.
        */
-      exempt: "Exempt under Article 41 · overtime bears no premium",
+      exempt:
+        "Exempt under Article 41 · no overtime or holiday premium, but the late-night premium" +
+        " still applies",
       ready: (reason: string) => `Ready · ${reason}`,
       notLinked: "No account code linked — they cannot sign in as themselves.",
       /**
@@ -538,7 +552,8 @@ export const en = {
         hint:
           "For a manager or officer whose authority and treatment make them a managerial or" +
           " supervisory employee under Article 41 of the Labour Standards Act: it marks them exempt" +
-          " from overtime premiums, so they file no overtime requests. It does NOT give them an" +
+          " from overtime and holiday premiums, but the late-night premium still applies, so they" +
+          " file no overtime requests. It does NOT give them an" +
           " approver — their punches still need correcting sometimes, and a correction needs a" +
           " person, so they still need a manager or a designated approver. Recorded from now and" +
           " open-ended — there is no way to end it here yet, so use it only where the" +
@@ -837,7 +852,7 @@ export const ja = {
       `${count}件` + (stranded > 0 ? ` · ${stranded}件は決定できる人がいません` : ""),
     empty: "承認待ちはありません — 誰の決定も待っていません。",
 
-    filedBy: (name: string) => `申請者: ${name}`,
+    filedBy: (name: string) => `申請者: ${name}。`,
     filerUnknown: "申請者は記録されていません。",
 
     closedPeriod: (period: string) =>
@@ -903,7 +918,7 @@ export const ja = {
 
     row: {
       nightShift: "夜勤 · 打刻はシフトの開始日に記録されます",
-      exempt: "管理監督者 · 残業に割増はつきません",
+      exempt: "管理監督者 · 時間外・休日の割増はつきませんが、深夜割増は適用されます",
       ready: (reason: string) => `利用可能 · ${reason}`,
       notLinked: "アカウントコードが紐づいていません — 本人としてサインインできません。",
       noApproverExempt:
@@ -966,8 +981,9 @@ export const ja = {
       exemption: {
         title: "管理監督者の認定を記録する",
         hint:
-          "権限と待遇から労働基準法41条の管理監督者にあたる管理者・役職者のためのものです。残業の" +
-          "割増の対象外として記録され、残業申請は行わなくなります。承認者が設定されるわけでは" +
+          "権限と待遇から労働基準法41条の管理監督者にあたる管理者・役職者のためのものです。時間外・" +
+          "休日の割増の対象外として記録されますが、深夜割増は適用されます。残業申請は行わなくなり" +
+          "ます。承認者が設定されるわけでは" +
           "ありません — 打刻の修正はときに必要で、修正には承認する人が必要ですから、上長または" +
           "指定承認者は引き続き必要です。記録は設定時点から始まり、終了日はありません — ここで" +
           "終わらせる方法はまだないため、実際に認定した場合にのみ使ってください。",
