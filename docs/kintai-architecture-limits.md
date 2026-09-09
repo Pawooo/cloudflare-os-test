@@ -1,5 +1,7 @@
 # What the Gatekeeper architecture permits, and what it does not
 
+> Drawn as a board on 2026-09-09: https://miro.com/app/board/uXjVHpI36p4=/ (runtime, storage, the two frontends, who does what, these limits, and scaling).
+
 Findings from trying to build a demo-org seeder for `packages/gatekeeper-kintai` entirely through
 compliant surfaces — no direct SQLite, no reaching past the capability model. The seeder itself was
 dropped (real onboarding starts from scratch, with users creating their own accounts), but what it
@@ -15,8 +17,9 @@ to punching holes in the model to save an afternoon.
 
 `AdminKintaiApi` is handed out **only** by `KintaiSession.startAppUi`, gated on `context.isAdmin`,
 which the Workshop computes fresh on every open and which never travels further — not into the
-frame, not to the iframe, not accepted back from it. A non-admin receives `ViewerKintaiApi`, whose
-methods throw.
+frame, not to the iframe, not accepted back from it. A non-admin receives `EmployeeKintaiApi`, a
+different capability scoped to their own attendance, on which the admin methods do not exist at all
+(since 2026-09-07; before that a `ViewerKintaiApi` whose methods threw).
 
 The consequence: **there is no headless admin path.** Anything that administers Kintai must
 authenticate to the Workshop as an admin and open the app. An external script cannot hold the admin
