@@ -336,8 +336,10 @@ export const en = {
     },
 
     /**
-     * The header toggle. `switchTo` is read by a reader who is still in the CURRENT language, so
-     * it is written in it; the name it is given is the other language's own.
+     * UNREFERENCED SINCE 2026-09-10, kept only so the two dictionaries stay in parity: these were
+     * the header toggle's words, and the toggle is gone — the OS shell owns the language control
+     * now. A later dictionary chore removes them. `switchTo` was read by a reader still in the
+     * CURRENT language, so it is written in it; the name it is given is the other language's own.
      */
     language: {
       switchTo: (name: string) => `Switch the language to ${name}`,
