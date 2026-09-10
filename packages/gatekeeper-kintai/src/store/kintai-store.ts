@@ -498,8 +498,8 @@ export class KintaiStore extends DurableObject<Cloudflare.Env> {
     return languageFor(this.sql, accountId);
   }
 
-  /** Record the caller's UI language, keyed on the account. See `setLanguage`. */
-  async setLanguage(accountId: string, language: UiLanguage, now: number): Promise<void> {
+  /** Record the caller's UI language, keyed on the account, or forget it given null. See `setLanguage`. */
+  async setLanguage(accountId: string, language: UiLanguage | null, now: number): Promise<void> {
     setLanguage(this.sql, accountId, language, now);
   }
 

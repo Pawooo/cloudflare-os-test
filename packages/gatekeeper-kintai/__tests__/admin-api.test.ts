@@ -425,6 +425,29 @@ describe("setLanguage", () => {
 
     expect((await appUi(theirs, true).whoAmI()).language).toBeNull();
   });
+
+  // The OS's "system" arrives here as null — see `AdminKintaiApi.setLanguage`'s doc comment for
+  // why forgetting has to be a real state and not just "never chosen yet" reused.
+  it("forgets a previous choice when set to null, and whoAmI reports null again", async () => {
+    const accountId = `acct-lang-forget-${seq}`;
+    const hr = appUi(accountId, true);
+
+    await hr.setLanguage("ja");
+    expect((await hr.whoAmI()).language).toBe("ja");
+
+    expect(await hr.setLanguage(null)).toBeUndefined();
+
+    expect((await hr.whoAmI()).language).toBeNull();
+  });
+
+  it("setting null on an account with no saved choice is a no-op that still succeeds", async () => {
+    const accountId = `acct-lang-forget-noop-${seq}`;
+    const hr = appUi(accountId, true);
+
+    expect(await hr.setLanguage(null)).toBeUndefined();
+
+    expect((await hr.whoAmI()).language).toBeNull();
+  });
 });
 
 describe("the capability an admin receives", () => {

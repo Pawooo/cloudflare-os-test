@@ -507,13 +507,13 @@ export type KintaiEmployeeClient = {
   withdrawSubmission(submissionId: number): Promise<void>;
   resubmit(submissionId: number): Promise<void>;
   /**
-   * Save the caller's own UI language. Identity comes from the capability, so there is nothing to
-   * name but themselves.
+   * Save the caller's own UI language, or forget it given null. Identity comes from the
+   * capability, so there is nothing to name but themselves.
    *
    * The header's `LanguageToggle` is the only caller: it switches the screen first and calls this
    * second, so a rejection here costs the reader their saved preference and not the switch they
    * just made. `@validateRpc()` on `EmployeeKintaiApi.setLanguage` refuses anything but the two
-   * `UI_LANGUAGES` literals before the store is asked.
+   * `UI_LANGUAGES` literals and null before the store is asked.
    */
-  setLanguage(language: UiLanguage): Promise<void>;
+  setLanguage(language: UiLanguage | null): Promise<void>;
 };

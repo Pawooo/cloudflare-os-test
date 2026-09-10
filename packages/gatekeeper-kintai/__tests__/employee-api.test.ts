@@ -343,4 +343,25 @@ describe("setLanguage", () => {
 
     expect((await appUi(theirs).whoAmI()).language).toBeNull();
   });
+
+  // The OS's "system" arrives here as null — see `EmployeeKintaiApi.setLanguage`'s doc comment
+  // for why forgetting has to be a real state and not just "never chosen yet" reused.
+  it("forgets a previous choice when set to null, and whoAmI reports null again", async () => {
+    const accountId = `acct-emp-lang-forget-${seq}`;
+
+    await appUi(accountId).setLanguage("ja");
+    expect((await appUi(accountId).whoAmI()).language).toBe("ja");
+
+    expect(await appUi(accountId).setLanguage(null)).toBeUndefined();
+
+    expect((await appUi(accountId).whoAmI()).language).toBeNull();
+  });
+
+  it("setting null on an account with no saved choice is a no-op that still succeeds", async () => {
+    const accountId = `acct-emp-lang-forget-noop-${seq}`;
+
+    expect(await appUi(accountId).setLanguage(null)).toBeUndefined();
+
+    expect((await appUi(accountId).whoAmI()).language).toBeNull();
+  });
 });

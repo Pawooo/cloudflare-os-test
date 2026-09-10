@@ -90,11 +90,11 @@ export interface KintaiAdminApi {
   whoAmI(): Promise<KintaiIdentity>;
 
   /**
-   * Save the caller's own UI language. Identity from the capability, like everywhere else on this
-   * package — there is no account or employee argument, so nobody can set anyone's language but
-   * their own. See `AdminKintaiApi.setLanguage`.
+   * Save the caller's own UI language, or forget it given null. Identity from the capability, like
+   * everywhere else on this package — there is no account or employee argument, so nobody can set
+   * anyone's language but their own. See `AdminKintaiApi.setLanguage`.
    */
-  setLanguage(language: UiLanguage): Promise<void>;
+  setLanguage(language: UiLanguage | null): Promise<void>;
 
   /**
    * The whole roster, with the computed columns HR reads it for. Admin only — this is the
@@ -320,17 +320,20 @@ export class AdminKintaiApi extends RpcTarget implements KintaiAdminApi {
 
   /**
    * Save the caller's own UI language, keyed on `this.#accountId` — never an argument, so there is
-   * nothing for a caller to name but themselves.
+   * nothing for a caller to name but themselves. `null` forgets the choice instead: the OS sends
+   * null for "system", meaning it wants Kintai to decide for itself again (its own saved
+   * preference, then the browser) — see `setLanguage` in `store/preferences.ts` for why that has
+   * to delete the row rather than store a null language.
    *
-   * `language` is not re-checked here: it is `UiLanguage`, a string-literal union, and
-   * `@validateRpc()` refuses anything outside it before this body runs — the same reason
-   * `setWorkDatePolicy` above does not re-check its own literal union either. No `appendAudit`
-   * call, unlike every other mutation on this class: a UI language is a personal display
-   * preference, not an administrative act over the org or its records, so `audit_log` — which
-   * exists to record authority-relevant change — has nothing to say about it. See the doc comment
-   * on `account_preferences` in `schema.ts`.
+   * `language` is not re-checked here: it is `UiLanguage | null`, a string-literal union plus
+   * `null`, and `@validateRpc()` refuses anything outside it before this body runs — the same
+   * reason `setWorkDatePolicy` above does not re-check its own literal union either. No
+   * `appendAudit` call, unlike every other mutation on this class: a UI language is a personal
+   * display preference, not an administrative act over the org or its records, so `audit_log` —
+   * which exists to record authority-relevant change — has nothing to say about it, forgetting one
+   * included. See the doc comment on `account_preferences` in `schema.ts`.
    */
-  async setLanguage(language: UiLanguage): Promise<void> {
+  async setLanguage(language: UiLanguage | null): Promise<void> {
     await this.#store.setLanguage(this.#accountId, language, Date.now());
   }
 

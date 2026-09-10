@@ -2033,13 +2033,17 @@ export class EmployeeKintaiApi extends RpcTarget {
    * see `account_preferences` in `schema.ts`. Deliberately NOT behind `#requireEmployee`: an
    * unlinked account may still choose a language, the same way it may still call `whoAmI`, because
    * the choice is about which language this browser reads in, not about anything HR has recorded.
+   * `null` forgets the choice instead: the OS sends null for "system", meaning it wants Kintai to
+   * decide for itself again — see `setLanguage` in `store/preferences.ts` for why that has to
+   * delete the row rather than store a null language.
    *
-   * `language` is `UiLanguage`, a string-literal union, so `@validateRpc()` refuses anything
-   * outside it before this body runs — mirroring `AdminKintaiApi.setLanguage`, which this method
-   * is the employee-facing twin of. No `appendAudit` call, for the same reason that one has none:
-   * a personal display preference is not an administrative act.
+   * `language` is `UiLanguage | null`, a string-literal union plus `null`, so `@validateRpc()`
+   * refuses anything outside it before this body runs — mirroring `AdminKintaiApi.setLanguage`,
+   * which this method is the employee-facing twin of. No `appendAudit` call, for the same reason
+   * that one has none: a personal display preference is not an administrative act, forgetting one
+   * included.
    */
-  async setLanguage(language: UiLanguage): Promise<void> {
+  async setLanguage(language: UiLanguage | null): Promise<void> {
     await this.#store.setLanguage(this.#accountId, language, Date.now());
   }
 
