@@ -1,11 +1,20 @@
 import type { RpcTarget } from "capnweb";
 
+/** The languages Workshop offers; an app supporting a subset maps the rest to its own default. */
+export const APP_LOCALES = ["en", "ja"] as const;
+export type AppLocale = (typeof APP_LOCALES)[number];
+
 /** The complete appearance state sent from Workshop to a sandboxed gatekeeper app. */
 export interface GatekeeperAppTheme {
   /** The concrete light or dark mode resolved by Workshop. */
   mode: "light" | "dark";
   /** The deployment accent seed, or null to use the app's base palette. */
   accentColor: string | null;
+  /**
+   * The language the person picked in the shell, or null when they left it on "system" — i.e.
+   * the app should decide from its own knowledge (a saved preference, then the browser).
+   */
+  locale: AppLocale | null;
 }
 
 /** A sandboxed gatekeeper app capability that receives complete appearance updates. */

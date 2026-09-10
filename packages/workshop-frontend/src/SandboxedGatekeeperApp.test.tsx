@@ -17,6 +17,7 @@ import type {
   GatekeeperAppTheme,
   GatekeeperAppThemeReceiver,
 } from "@gadgets/workshop-shared/theme";
+import { LocaleProvider, useLocale } from "./LocaleContext";
 import SandboxedGatekeeperApp from "./SandboxedGatekeeperApp";
 
 vi.mock("./ThemeContext", () => ({
@@ -58,7 +59,20 @@ interface TestHost extends RpcTarget {
 class EmptyUi extends RpcTarget {}
 
 class TestThemeReceiver extends RpcTarget implements GatekeeperAppThemeReceiver {
-  setTheme(_theme: GatekeeperAppTheme): void {}
+  readonly themes: GatekeeperAppTheme[] = [];
+  setTheme(theme: GatekeeperAppTheme): void {
+    this.themes.push(theme);
+  }
+}
+
+// Lets a test drive the shell's language choice from inside the provider the host reads.
+function LocaleSwitch({ to }: { to: "system" | "en" | "ja" }) {
+  const { setLocaleChoice } = useLocale();
+  return (
+    <button type="button" data-testid="switch" onClick={() => setLocaleChoice(to)}>
+      {`Switch to ${to}`}
+    </button>
+  );
 }
 
 describe("SandboxedGatekeeperApp navigation", () => {
@@ -68,12 +82,14 @@ describe("SandboxedGatekeeperApp navigation", () => {
 
   beforeEach(() => {
     listGadgets.mockClear();
+    window.localStorage.clear();
   });
 
   afterEach(async () => {
     host?.[Symbol.dispose]();
     await act(async () => root?.unmount());
     container?.remove();
+    window.localStorage.clear();
     vi.restoreAllMocks();
   });
 
@@ -83,7 +99,11 @@ describe("SandboxedGatekeeperApp navigation", () => {
       ui: new RpcStub(new EmptyUi()),
     } as unknown as GatekeeperUiFrame;
     const rootRoute = createRootRoute({
-      component: () => <SandboxedGatekeeperApp frame={frame} gatekeeperVendorId="scheduler" />,
+      component: () => (
+        <LocaleProvider>
+          <SandboxedGatekeeperApp frame={frame} gatekeeperVendorId="scheduler" />
+        </LocaleProvider>
+      ),
     });
     const indexRoute = createRoute({ getParentRoute: () => rootRoute, path: "/" });
     const gadgetRoute = createRoute({
@@ -118,7 +138,20 @@ describe("SandboxedGatekeeperApp navigation", () => {
     await expect(host.subscribeTheme(themeReceiver)).resolves.toEqual({
       mode: "light",
       accentColor: "#7c3aed",
+      // "system" is sent as null so the app can consult its own memory of the person first.
+      locale: null,
     });
+    /*
+     * SUBSCRIBING IS NOT A PUSH, and an app is entitled to rely on that.
+     *
+     * `subscribeTheme` answers with the current theme; `setTheme` is only ever a CHANGE afterwards.
+     * Kintai reads a push against the locale it is already showing and writes to the account when
+     * they differ, so a push that merely repeated the reply would look like a person choosing.
+     * (What does arrive later, unbidden, is the deployment's accent colour resolving from
+     * `useServerConfig()` — the same theme with the same locale. That one is why the app has to
+     * compare rather than trust.)
+     */
+    expect(themeReceiver.themes).toEqual([]);
 
     await act(async () => {
       await host!.setPresenting(true);
@@ -177,5 +210,63 @@ describe("SandboxedGatekeeperApp navigation", () => {
       await vi.waitFor(() => expect(router.state.location.pathname).toBe("/"));
     });
     expect(router.state.location.search).toEqual({ prompt: "Create a daily brief." });
+  });
+
+  it("carries the shell's language choice and re-pushes it when it changes", async () => {
+    window.localStorage.setItem("gadgets:locale", "ja");
+    const frame = {
+      iframeHtml: "<!doctype html><title>Scheduler</title>",
+      ui: new RpcStub(new EmptyUi()),
+    } as unknown as GatekeeperUiFrame;
+    const rootRoute = createRootRoute({
+      component: () => (
+        <LocaleProvider>
+          <SandboxedGatekeeperApp frame={frame} gatekeeperVendorId="scheduler" />
+          <LocaleSwitch to="system" />
+        </LocaleProvider>
+      ),
+    });
+    const indexRoute = createRoute({ getParentRoute: () => rootRoute, path: "/" });
+    const history = createMemoryHistory({ initialEntries: ["/"] });
+    const router = createRouter({ history, routeTree: rootRoute.addChildren([indexRoute]) });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    await act(async () => root!.render(<RouterProvider router={router} />));
+
+    const iframe = container.querySelector("iframe");
+    if (!iframe) throw new Error("Missing gatekeeper iframe");
+    const { port1, port2 } = new MessageChannel();
+    host = newMessagePortRpcSession<TestHost>(port1);
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: { type: "handshake" },
+        origin: "null",
+        source: iframe.contentWindow,
+        ports: [port2],
+      }),
+    );
+
+    const themeReceiver = new TestThemeReceiver();
+    await expect(host.subscribeTheme(themeReceiver)).resolves.toEqual({
+      mode: "light",
+      accentColor: "#7c3aed",
+      locale: "ja",
+    });
+    // Again: the reply is not a push. Nothing has been sent to the receiver yet.
+    expect(themeReceiver.themes).toEqual([]);
+
+    const switchButton = container.querySelector<HTMLButtonElement>('[data-testid="switch"]');
+    await act(async () => switchButton!.click());
+    await vi.waitFor(() =>
+      expect(themeReceiver.themes.at(-1)).toEqual({
+        mode: "light",
+        accentColor: "#7c3aed",
+        locale: null,
+      }),
+    );
+    // One change, one push — the app must not be told twice about a single click either.
+    expect(themeReceiver.themes).toHaveLength(1);
   });
 });
