@@ -6,6 +6,11 @@
 **Code verified:** `feat/os-language-switcher` at `30188c0` — shell 373 / Kintai 553 worker + 205 app,
 `tsc --noEmit` and `typecheck:app` green per Task 3's gates; nothing in code changed during this pass,
 so they were not re-run.
+**Amended 2026-09-10 after the fix wave:** §4's finding 1 is fixed in `fix(kintai): a theme re-push is
+not somebody choosing a language`, together with a second, worse consequence of the same line that the
+whole-branch review found and this pass had no scenario for (§4f). The amendments are marked; the
+observations above them are left exactly as they were driven, against `30188c0`. Everything added
+after the fix is labelled **VERIFIED BY TEST** — no browser was driven again.
 **Transport:** own stack, `pnpm run-local --port 8799` (wrangler dev on `localhost:8799`, the dev server
 generating every `wrangler.dev.jsonc` and serving the Kintai bundles unminified — 897,733 chars for the
 worker page, 950,251 for the admin page); fixtures and every "what did the account save" read over real
@@ -135,10 +140,35 @@ S4c — a new tab in the OTHER en-US context (the §3 browser): English, both ro
 S4b — the OTHER context's already-open tab: still 日本語 (no live cross-device push; only the next open follows — as designed)
 ```
 
-So the fall-back itself is right and one push late. Not fixed here; the shape of a fix is one line in
-either place — resolve with `saved: null` when `locale === null` (the row is about to be deleted, so
-"as it stood a moment ago" is the wrong moment), or re-set the source after `save(null)` resolves —
-plus the flipped expectation in that test.
+So the fall-back itself is right and one push late.
+
+**FIXED** (`fix(kintai): a theme re-push is not somebody choosing a language`). A change now resolves
+as `(locale, null, browser)` — the account is not consulted, because this very push is what overwrites
+or deletes it, so falling back through the row would show the value being thrown away. The flipped
+expectation is in `language-source.test.ts`: *"clears the account and follows the browser at once when
+the shell says system"* — `{ locale: null, previousLocale: "ja", saved: "ja", nav: "en-US" }` →
+`source.get() === "en"`, `save(null)`. §4d above is what the screen now does in the same instant as
+the row disappears, without needing the theme button. **VERIFIED BY TEST**, not re-driven.
+
+### 4f. A dark-mode flip on a fresh device leaves the account row intact — **VERIFIED BY TEST**
+
+Not a scenario this pass had, and the reason the fix is more than the one line §4 asked for. `followHost`
+saved on EVERY push, including one that carried the locale UNCHANGED — and the shell re-pushes the whole
+theme whenever any part of it changes. On the §3 device (shell on system, account `"ja"`, `en-US`
+browser) that meant a flip of the theme button ran `save(localeToLanguage(null))` and **deleted the
+account row**, silently, with nobody having touched the language. Worse, no click is needed at all: the
+deployment's accent colour reaches `SandboxedGatekeeperApp` from `useServerConfig()` after the first
+push, so the theme is pushed a second time on a plain page open. §3 passed only because it read the row
+before anything re-pushed.
+
+A push is now read against the locale the page is already following (`previousLocale`, seeded with the
+locale the FIRST PAINT used), and an unchanged one does nothing at all unless it is the retry of a
+refused save. Three tests pin it — *"does nothing when a re-push carries the locale already being
+followed"* (returns `null`, `save` not called, the source silent), *"retries a refused save on an
+unchanged re-push, without touching the screen"*, and the `createHostFollower` sequence *"stays quiet on
+an opening re-push, then follows every change the shell makes"* — plus, on the shell side,
+`SandboxedGatekeeperApp.test.tsx` now asserts the receiver has been pushed **nothing** at the moment
+`subscribeTheme` answers, which is the assumption the whole comparison rests on.
 
 ## 5. The same for an administrator — PASS / FAIL exactly as the employee
 
@@ -188,14 +218,16 @@ linked before any screen was opened; it is not resolved by this branch.
 
 1. **"System" leaves the open screen in the language it just deleted** (§4, both roles). Row
    `null` at once; screen unchanged until the next theme push or open. The spec's "genuinely follows
-   the browser again" fails for the current session; `language-source.test.ts:126` encodes the
-   current behaviour. Recorded, not fixed.
+   the browser again" fails for the current session; `language-source.test.ts:126` encoded the
+   observed behaviour. **FIXED** in `fix(kintai): a theme re-push is not somebody choosing a
+   language`; that test's expectation is flipped. See §4 and, for the larger defect behind it, §4f.
 2. **`packages/gatekeeper-kintai/wrangler.dev.jsonc` is still tracked.** The gitignore rule
    `wrangler.dev.jsonc` does not untrack a file already committed, and this is the only one that is
    (`git ls-files | grep wrangler.dev.jsonc`). The dev server rewrote its `vars.BASE_URL` from
    `…:8787/…` to `…:8799/…`, which showed up as a modification and was reverted with `git checkout`.
    The brief's "nothing to revert there" is true for the other 18; a `git rm --cached` on this one
-   would make it true for all.
+   would make it true for all. **FIXED** — `chore(kintai): untrack the generated dev wrangler
+   config`. The file stays on disk, ignored, and `run-local` writes it from scratch.
 3. **The first click writes to the account without changing anything visible** (§2): system → `EN`
    in an English browser saves `"en"`. Per spec (the save mirrors the OS choice), harmless, and the
    reason §3's "empty localStorage" test needs the SECOND click to mean anything.
@@ -229,7 +261,7 @@ empty, `git status` clean.
 - [x] **(1)** Translate button beside the theme button; `Language: system (English). Switch to English.`; Kintai English (§1).
 - [x] **(2)** `EN` → `日本`; 日本語 without reload; `whoAmI().language === "ja"`; `gadgets:locale === "ja"` (§2).
 - [x] **(3)** Fresh `en-US` context, empty `localStorage` → strip system, Kintai 日本語 (§3).
-- [x] **(4)** Click to system → `whoAmI().language === null` — **the open screen did not follow** (§4, finding 1).
+- [x] **(4)** Click to system → `whoAmI().language === null` — **the open screen did not follow** (§4, finding 1); fixed after the pass, VERIFIED BY TEST (§4, §4f).
 - [x] **(5)** Admin and employee both (§5).
 - [x] **(6)** `ja-JP` on system: `Language: system (日本語). Switch to English.`, Kintai 日本語, no row (§6).
 - [x] **(7)** Sweep: no English copy under 日本語, no Japanese under English; the shell stays English (§7).
