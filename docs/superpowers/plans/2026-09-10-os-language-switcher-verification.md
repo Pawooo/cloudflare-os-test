@@ -10,7 +10,8 @@ so they were not re-run.
 not somebody choosing a language`, together with a second, worse consequence of the same line that the
 whole-branch review found and this pass had no scenario for (§4f). The amendments are marked; the
 observations above them are left exactly as they were driven, against `30188c0`. Everything added
-after the fix is labelled **VERIFIED BY TEST** — no browser was driven again.
+after the fix is labelled **VERIFIED BY TEST** — no browser was driven again. **Re-driven live later
+the same day**, against `f808b33`, for §4, §4f and §4g only: see "Re-run after the fix wave" at the end.
 **Transport:** own stack, `pnpm run-local --port 8799` (wrangler dev on `localhost:8799`, the dev server
 generating every `wrangler.dev.jsonc` and serving the Kintai bundles unminified — 897,733 chars for the
 worker page, 950,251 for the admin page); fixtures and every "what did the account save" read over real
@@ -265,3 +266,146 @@ empty, `git status` clean.
 - [x] **(5)** Admin and employee both (§5).
 - [x] **(6)** `ja-JP` on system: `Language: system (日本語). Switch to English.`, Kintai 日本語, no row (§6).
 - [x] **(7)** Sweep: no English copy under 日本語, no Japanese under English; the shell stays English (§7).
+
+---
+
+## Re-run after the fix wave (2026-09-10)
+
+**Code driven:** `feat/os-language-switcher` at `f808b33` (the fix `08ff49b` plus the two commits
+above it, none touching Kintai's app code). Same rig as the pass above, reused file-for-file: own
+stack `pnpm run-local --port 8799`, headless **Chrome 152.0.7977.83** over CDP, one
+`Target.createBrowserContext` per "device" with `acceptLanguage` + `setLocaleOverride` applied to the
+page session and the srcdoc frame's session before its scripts run, the strip clicked with
+`Input.dispatchMouseEvent`, every saved-language read `getGatekeeperApp("kintai").ui.whoAmI().language`
+over real Cap'n Web from Node 24.15.0. The bundles the dev server served were pinned before the first
+tab opened: the `iframeHtml` for `probe10emp` (898,487 chars) and `probe10admin` (951,005) both contain
+`previousLocale` and `createHostFollower` and neither contains the old test's phrase *"falls back to it,
+then the browser"* — the post-fix code, unminified. `probe10admin` was put back into
+`config.vars.ADMINS` for the admin bundle and **reverted** before committing. Both probes started with
+`whoAmI().language === null` (no `account_preferences` row), and both were left that way.
+
+Latencies below are measured from the moment the CDP `mouseReleased` dispatch returned to the first
+poll that saw the new state — the frame polled every 40 ms, `whoAmI()` re-read every ~100 ms (each
+read opens its own RPC session) — so they are upper bounds. "No reload" is the same three-way proof:
+a `window.__probe10` mark set inside the frame just before the click, the frame's CDP `targetId`,
+and the shell page's `performance.timeOrigin`, all compared after.
+
+### §4 — click to system → English at once, row null — **PASS** (both roles)
+
+`en-US` context, `localStorage` `["authToken"]` on open; strip driven system → `EN` → `日本`
+(`whoAmI().language` `"en"` then `"ja"`, as in §2). Then one click:
+
+```
+employee: strip "Language: system (English). Switch to English."  localStorage["gadgets:locale"]="system"
+          frame → <html lang>=en  tabs ["Today*","This month"]  Your attendance and overtime.     after   3 ms
+          whoAmI().language → null                                                                 after  37 ms
+          mark "mark-before-§4-…" intact · frame targetId 147859AE… unchanged · page timeOrigin unchanged
+          Japanese strings on the English screen: []     uncaught / console: 0 / 0
+admin:    strip as above, localStorage "system"
+          frame → <html lang>=en  tabs ["Needs attention*","Monthly","Roster"]  Employee records, …    after   4 ms
+          whoAmI().language → null                                                                 after  33 ms
+          mark intact · targetId 9741891B… unchanged · timeOrigin unchanged · Japanese strings: [] · 0 / 0
+```
+
+Finding 1 of the first pass is gone: the frame switched in the same push that deleted the row, with
+no theme flip and no reopen. (The first pass saw the frame still 日本語 10 s later.)
+
+### §4f — a fresh device, theme re-pushes, the row survives — **PASS** (both roles)
+
+Row set to `"ja"` again in the first context (system → `EN` → `日本`, `whoAmI()` `"en"` → `"ja"`) and
+left there. A **new** `en-US` context, `localStorage` `["authToken"]`, same account. First paint (frame
+tabs present) 321 ms after `Page.navigate`, both roles:
+
+```
+employee: strip "Language: system (English). Switch to English."  Translate glyph  localStorage["gadgets:locale"]: null
+          frame: navigator.language en-US  <html lang>=ja  tabs ["今日*","今月"]  あなたの勤怠と残業。  data-mode=dark
+          whoAmI().language right after first paint → "ja"
+          5,055 ms after first paint: whoAmI().language → "ja"   tabs still ["今日*","今月"]  <html lang>=ja
+          theme flip 1: "Theme: system (dark). Switch to light." → "Theme: light. Switch to dark."
+                        frame data-mode dark → light (the push reached the frame)
+                        frame <html lang>=ja  tabs ["今日*","今月"]   whoAmI().language → "ja"   localStorage["gadgets:locale"]: null
+          theme flip 2: "Theme: light. Switch to dark." → "Theme: dark. Switch to system."
+                        frame data-mode light → dark
+                        frame <html lang>=ja  tabs ["今日*","今月"]   whoAmI().language → "ja"   localStorage["gadgets:locale"]: null
+          no reload through both flips (mark, targetId 4465642A…, timeOrigin)   uncaught / console: 0 / 0
+admin:    strip as above, localStorage null
+          frame: en-US  <html lang>=ja  tabs ["要対応*","月次","名簿"]  従業員レコード、アカウントコード、報告ラインの管理。
+          right after first paint → "ja";  5,083 ms after first paint → "ja", tabs still Japanese
+          flip 1: dark → light, tabs ["要対応*","月次","名簿"], whoAmI().language "ja"
+          flip 2: light → dark, tabs ["要対応*","月次","名簿"], whoAmI().language "ja"
+          no reload (targetId 97BBEAC9…)   uncaught / console: 0 / 0
+```
+
+Neither the late accent-colour push on open nor two theme re-pushes touched the account row; the
+screen stayed 日本語 through all of them while the strip kept saying `system (English)`.
+
+### §4g — from that device, the language button to system → English at once, row null — **PASS** (both roles)
+
+**Rig error first, recorded as driven.** The first driver clicked the button once on the §4f device
+and expected system. But on that device the strip is *already* on system (`localStorage["gadgets:locale"]`
+null; it is the account, not the browser, that is showing 日本語), so the three-state cycle's one
+click went system → **`EN`**:
+
+```
+employee: strip "Language: English. Switch to 日本語."  text "EN"  localStorage["gadgets:locale"]="en"
+          frame → English after 7 ms (no reload)   whoAmI().language → "en"  (the driver's poll for null timed out at 10 s)
+admin:    same — frame → English after 9 ms, whoAmI().language → "en"
+```
+
+That is the correct behaviour of the control (the OS choice `EN`, mirrored onto the account) and not
+what the scenario asks. Both rows were left `"en"` by it. The §4f state was rebuilt (row to `"ja"` in
+a throwaway `en-US` context; a new `en-US` context with `localStorage` `["authToken"]` → strip
+system, frame 日本語, `whoAmI().language` `"ja"`) and the button cycled to system, every click timed:
+
+```
+employee: click 1 system → EN:   strip "Language: English. Switch to 日本語."  localStorage "en"     frame English  6 ms   row "en"  34 ms
+          click 2 EN → 日本:      strip "Language: 日本語. Switch to system."   localStorage "ja"     frame 日本語   28 ms   row "ja"  72 ms
+          click 3 日本 → system:  strip "Language: system (English). Switch to English."  localStorage "system"
+                                  frame → <html lang>=en  tabs ["Today*","This month"]                 after  9 ms
+                                  whoAmI().language → null                                              after 59 ms
+                                  mark "mark-before-§4g click 3 …" intact · targetId unchanged · timeOrigin unchanged
+                                  Japanese strings on the English screen: []   uncaught / console: 0 / 0
+admin:    click 1 system → EN:   frame English  8 ms   row "en"  35 ms
+          click 2 EN → 日本:      frame 日本語   34 ms   row "ja"  74 ms
+          click 3 日本 → system:  strip "Language: system (English). Switch to English."  localStorage "system"
+                                  frame → <html lang>=en  tabs ["Needs attention*","Monthly","Roster"]  after 15 ms
+                                  whoAmI().language → null                                              after 59 ms
+                                  mark intact · targetId unchanged · timeOrigin unchanged · Japanese strings: [] · 0 / 0
+```
+
+Every click switched the frame in the same push it wrote the row, in the browser's language the
+moment the row was deleted. The first context's tab, left on `日本` throughout, still showed 日本語
+when the other device's row went null — §4b's "no live cross-device push", unchanged.
+
+### Observations (none is a defect)
+
+1. **The §4g rig error is worth keeping** as a description of the control: on a device that has never
+   picked a language, the strip reads `system (English)` while Kintai, following the account, shows
+   日本語 — and the one-click route from there is to `EN`, not to "system", because system is what is
+   already selected. Making Kintai forget the account from such a device takes the full cycle
+   (`EN` → `日本` → system), writing `"en"` and `"ja"` on the way. This is the three-state control the
+   spec chose; recorded so the next reader does not mistake the `EN` click for a failure to reach system.
+2. **Latencies.** Frame switch 3–34 ms after the click (the 日本 direction is the slower one, ~20–35 ms;
+   it re-renders more text), row write/delete 33–74 ms, on every one of the fourteen timed clicks. The
+   first pass's "within ~1 s" for the row was the poll interval, not the write.
+3. **The frame's `data-mode` flipped with each theme click**, so the re-pushes in §4f demonstrably
+   reached the frame that kept its language — the comparison the fix relies on was exercised, not
+   assumed.
+
+### State left in the owner's `.wrangler/state`
+
+File list snapshotted before the stack started and after it stopped: **347 files both times, none
+added, none removed.** The only Kintai file that changed is the `KintaiStore` SQLite (same size,
+159,744 bytes; the row writes `en` → `ja` → deleted, twice per account in the first run and once more
+in the second, plus the reads). No new Workshop account, no employee, no punch, no period, no link:
+the two `UserDurableObject` SQLites touched are the probes' own (same sizes). `account_preferences`:
+**no row for either probe** — `whoAmI().language === null` for `probe10emp` and `probe10admin` at the
+end, read after the last tab closed. Everything else in the delta is `metadata.sqlite-shm` mtimes
+(unchanged 32,768 bytes) and Miniflare's observability trace store growing 54.7 → 61.3 MB, which it
+does on every run. `E-01` / `A-02` appear in the admin's 108 strings as data, read only.
+
+Reverted before committing: `config.vars.ADMINS` back to `["admin"]`. `git status` clean apart from
+this record; the generated `wrangler.dev.jsonc` files and the bundles under `src/generated/` are
+ignored and were left as the dev server wrote them. Dev server stopped (SIGINT to `run-local`, gone
+in 2 s; 8799 free; the owner's 8787 was not in use before, during or after), headless Chrome exited
+with the driver, `pgrep -fl "vite.js build.*--watch"` empty, no `workerd` left.
