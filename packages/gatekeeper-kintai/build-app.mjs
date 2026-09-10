@@ -52,6 +52,13 @@ if (watch) {
     child.on("exit", (code) => shutDown(code));
     child.on("error", () => shutDown(1));
   }
+  // The dev server stops this process with a signal, and Node's default signal action exits
+  // WITHOUT running the exit path above — so the two vite watchers were reparented and kept
+  // rewriting `src/generated/*.txt` after `pnpm run-local` was gone (observed 2026-09-10, four
+  // orphaned watchers). Forward the signal into `shutDown` so the children die with us.
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+    process.on(signal, () => shutDown(0));
+  }
 } else {
   // Sequential: each build empties its own `outDir` and writes its `.txt` in `closeBundle` before
   // the next starts, so order does not matter and neither can clobber the other's output.
