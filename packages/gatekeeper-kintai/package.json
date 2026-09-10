@@ -23,6 +23,7 @@
   "devDependencies": {
     "@cloudflare/kumo": "^2.9.2",
     "@cloudflare/vitest-pool-workers": "catalog:",
+    "@gadgets/scripts": "workspace:*",
     "@tailwindcss/vite": "^4.3.3",
     "@types/node": "^26.1.0",
     "@types/react": "^19.2.18",

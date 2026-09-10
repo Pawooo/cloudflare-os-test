@@ -50,6 +50,6 @@ export default defineConfig({
   ],
   test: {
     include: ["__tests__/*.test.ts"],
-    setupFiles: ["../../scripts/assert-workerd.ts"],
+    setupFiles: ["@gadgets/scripts/assert-workerd"],
   },
 });
