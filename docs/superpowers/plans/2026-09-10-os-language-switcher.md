@@ -72,3 +72,5 @@
 ## Task 4: Live pass
 
 Own stack on 8799 (see `docs/superpowers/plans/2026-09-07-kintai-employee-gadget-verification.md` for the procedure; `PROBE-EMP-` users; owner data untouched; the dev server generates `wrangler.dev.jsonc` itself now — nothing to revert there). In headless Chrome against the real shell: (1) the utility strip shows the Translate button; system + `en-US` → Kintai English; (2) click to 日本語 → Kintai re-renders in Japanese WITHOUT reload, `whoAmI().language === "ja"`; (3) new context, empty `localStorage`, `en-US` → Kintai 日本語 (the account); (4) click to system → Kintai English, `language === null`; (5) admin and employee both. Record to `docs/superpowers/plans/2026-09-10-os-language-switcher-verification.md`; commit.
+
+- [x] **Live pass driven and recorded** — `2026-09-10-os-language-switcher-verification.md`. (1)–(3), (5)–(7) pass verbatim; (4) passes on the row (`language === null`) and **fails on the open screen**, which stays in the deleted language until the next push or open (finding 1 there, not fixed). Also: `packages/gatekeeper-kintai/wrangler.dev.jsonc` is still tracked (finding 2).
