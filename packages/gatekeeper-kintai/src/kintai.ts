@@ -24,6 +24,7 @@ import type {
   ResourceDescription,
   SupportedResource,
   VendorDescription,
+  GitCache,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type {
   ApprovalAction, EmployeeId, EmployeeMonth, KintaiIdentity, PunchKind, PunchReceipt, UiLanguage,
@@ -1768,7 +1769,13 @@ export class KintaiGatekeeper
    *    re-pointed at somebody else (`KINTAI_STALE_ACTOR`) or revoked
    *    (`KINTAI_ACCOUNT_NOT_LINKED`) cannot spend a decision staged by its previous holder.
    */
-  async applyAction(action: number): Promise<void> {
+  /**
+   * `_cache` is the workspace git cache the Overseer hands every gatekeeper on apply (upstream,
+   * 2026-09). Kintai pushes no git objects, so it is unused here — but it is part of the wire
+   * contract: `@validateRpc()` sharpens this signature against `Gatekeeper.applyAction`, so a caller
+   * that omits it is refused before this body runs, exactly as the real Overseer never omits it.
+   */
+  async applyAction(action: number, _cache: NativeRpcStub<GitCache>): Promise<void> {
     const row = this.#staged(action);
     if (!row) throw new UnknownActionError(action);
     // Idempotent: the Overseer may call back more than once, and a replay would be counted as a

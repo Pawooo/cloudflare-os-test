@@ -1,4 +1,4 @@
-import { DurableObject, RpcTarget } from "cloudflare:workers";
+import { DurableObject, RpcStub, RpcTarget } from "cloudflare:workers";
 import type {
   ActionDescription, ActionKind, GatekeeperUiFrame, ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
@@ -148,6 +148,25 @@ class TestApprovalQueue extends RpcTarget {
  * imbued class to the Overseer, which installs it as a facet under itself. This class is that
  * parent, and nothing more.
  */
+/**
+ * Stands in for the workspace git cache the Overseer passes to `applyAction`. Kintai pushes no
+ * git objects and reads none back, so nothing here is ever called; it exists so the stub the
+ * validator requires is a real `RpcTarget`, as in production. Every method answers "nothing
+ * cached" rather than throwing, so a future read would fail visibly on its own terms.
+ */
+class TestGitCache extends RpcTarget {
+  async get(): Promise<null> { return null; }
+  async has(): Promise<boolean> { return false; }
+  async stat(): Promise<null> { return null; }
+  async put(): Promise<string> { throw new Error("TestGitCache: Kintai never writes git objects."); }
+  async advertiseCommit(): Promise<void> {}
+  async buildPack(): Promise<ReadableStream<Uint8Array>> {
+    return new ReadableStream({ start(controller) { controller.close(); } });
+  }
+  async consumePack(): Promise<string[]> { return []; }
+  async isAncestor(): Promise<boolean> { return false; }
+}
+
 export class KintaiFacetHost extends DurableObject<Cloudflare.Env> {
   readonly #queueState = {
     log: { observations: [], actions: [] } as QueueLog,
@@ -172,6 +191,13 @@ export class KintaiFacetHost extends DurableObject<Cloudflare.Env> {
   callFacet(accountId: string, name: string, method: string, args: unknown[]): Promise<unknown> {
     const callable =
       this.#facet(accountId, name) as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+    // The real Overseer hands every `applyAction` a workspace git-cache stub (upstream, 2026-09), and
+    // the facet's validator refuses the call without one. This host IS the tests' Overseer, so it
+    // supplies the stub the same way — a fresh one per call, since a stub passed as an RPC argument
+    // is disposed when the call returns. Kintai never reads it; see `TestGitCache`.
+    if (method === "applyAction" && args.length === 1) {
+      args = [...args, new RpcStub(new TestGitCache())];
+    }
     return callable[method](...args);
   }
 
