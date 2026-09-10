@@ -8,7 +8,8 @@ import type { LanguageSource } from "./language-source";
 
 export { en, ja, DICTIONARIES, type Messages } from "./messages";
 export {
-  createLanguageSource, followHost, localeToLanguage, resolveLanguage, type LanguageSource,
+  createHostFollower, createLanguageSource, followHost, localeToLanguage, resolveLanguage,
+  type HostFollower, type LanguageSource,
 } from "./language-source";
 
 /**

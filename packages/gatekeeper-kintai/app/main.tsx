@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { RpcTarget, newMessagePortRpcSession, type RpcStub } from "capnweb";
 import type {
+  AppLocale,
   GatekeeperAppTheme,
   GatekeeperAppThemeReceiver,
 } from "@gadgets/workshop-shared/theme";
@@ -11,7 +12,7 @@ import ErrorBoundary from "./ErrorBoundary";
 import { installErrorReporting, reportIssue } from "./error-reporting";
 import { LanguageProvider, useT } from "./i18n";
 import {
-  createLanguageSource, followHost, localeToLanguage, resolveLanguage, type LanguageSource,
+  createHostFollower, createLanguageSource, resolveLanguage, type LanguageSource,
 } from "./i18n/language-source";
 import { applyAppTheme } from "./theme";
 import "./styles.css";
@@ -48,20 +49,22 @@ function TranslatedBoundary({ children }: { children: ReactNode }) {
  *
  * `follow` is set AFTER the first render's inputs have landed, because the language source it
  * writes to does not exist until then. A push that arrives before that is not lost: it is kept in
- * `latest`, which is what the first render resolves from. Deliberately not replayed through
- * `follow` when it is set — the mirror onto the account is what a person CHANGING the language
- * asks for, and merely opening the page must not write to their account.
+ * `latest`, which is what the first render resolves from — and the locale it resolved from is what
+ * the follower starts from, so the identical push that follows is correctly read as no news.
+ * Deliberately not replayed through `follow` when it is set — the mirror onto the account is what
+ * a person CHANGING the language asks for, and merely opening the page must not write to their
+ * account.
  */
 class AppIframe extends RpcTarget implements GatekeeperAppThemeReceiver {
   /** The newest theme the host has pushed, or undefined while none has arrived. */
   latest: GatekeeperAppTheme | undefined;
-  /** Where a push goes once there is a language source to write to. */
-  follow: ((theme: GatekeeperAppTheme) => void) | undefined;
+  /** Where the pushed locale goes once there is a language source to write to. */
+  follow: ((locale: AppLocale | null) => void) | undefined;
 
   setTheme(theme: GatekeeperAppTheme): void {
     this.latest = theme;
     applyAppTheme(theme);
-    this.follow?.(theme);
+    this.follow?.(theme.locale);
   }
 }
 
@@ -140,38 +143,33 @@ function main() {
       ?? (pushed.status === "fulfilled" ? pushed.value : undefined);
     if (theme !== undefined) applyAppTheme(theme);
 
-    /*
-     * `saved` is the account row as it stands, and it is BOOKKEEPING, not a constant.
-     *
-     * Every mirror that succeeds changes what is on the account, and the next push that says
-     * "system" falls back through this value — so if it were left at what `whoAmI` returned, a
-     * reader who picked 日本語 in the shell and then picked system would fall back to whatever
-     * they had saved months ago instead of to the 日本語 they just asked for and had saved.
-     * Updated only after the save resolves: a refused save changed nothing on the server, and
-     * this must go on describing the server.
-     */
-    let saved: UiLanguage | null = identity.status === "fulfilled" ? identity.value.language : null;
+    const saved: UiLanguage | null =
+      identity.status === "fulfilled" ? identity.value.language : null;
+    const initialLocale = theme?.locale ?? null;
 
     const source = createLanguageSource(
-      resolveLanguage(theme?.locale ?? null, saved, navigator.language),
+      resolveLanguage(initialLocale, saved, navigator.language),
     );
 
-    iframe.follow = (next) => {
-      const mirrored = localeToLanguage(next.locale);
-      void followHost({
-        locale: next.locale,
-        saved,
-        navigatorLanguage: navigator.language,
-        source,
-        save: (language) => host.ui.setLanguage(language),
-      }).then(
-        () => { saved = mirrored; },
-        // REPORTED, NOT SHOWN. The control that caused this is the shell's, in another frame;
-        // Kintai has nowhere honest to put a notice about a button that is not on its screen, and
-        // the switch the reader actually asked for has already happened either way.
-        (caught: unknown) => reportIssue("kintai.language-save", caught),
-      );
-    };
+    /*
+     * WHAT HAPPENS ON EVERY LATER PUSH, and the state it is read against — all of it in
+     * `createHostFollower`, where it can be tested (this file cannot be imported by one).
+     *
+     * `initialLocale` is the locale the paint above actually used, NOT null-for-nothing-yet: the
+     * follower compares each push against it, and the shell re-pushes the whole theme when its
+     * accent colour lands from `useServerConfig()`. Starting from the wrong value would make that
+     * opening re-push look like a choice and write to the account of somebody who only opened
+     * the page — deleting the row, when the shell is on "system".
+     */
+    const follower = createHostFollower({
+      initialLocale,
+      saved,
+      navigatorLanguage: navigator.language,
+      source,
+      save: (language) => host.ui.setLanguage(language),
+      onSaveError: (caught) => reportIssue("kintai.language-save", caught),
+    });
+    iframe.follow = follower.follow;
 
     start(source);
   })();
