@@ -2,7 +2,9 @@
 
 This repository is a fork of https://github.com/cloudflare/cloudflare-os with one product added:
 `packages/gatekeeper-kintai` (and its docs under `docs/superpowers/` and `docs/kintai-*.md`).
-The remote `upstream` points at Cloudflare's repository. Until 2026-09-10 the fork had no shared
+Two remotes: `origin` is our fork, https://github.com/Pawooo/cloudflare-os-test (where we push);
+`upstream` is Cloudflare's repository (where we pull from). Do not use GitHub's "Sync fork" button:
+sync locally, where the tests run, then push. Until 2026-09-10 the fork had no shared
 history with upstream (it began as a snapshot); that was fixed by rebasing every commit onto
 `upstream/main`, so from now on a sync is routine.
 
@@ -31,7 +33,7 @@ history with upstream (it began as a snapshot); that was fixed by rebasing every
    method we implement shows up as a validator refusal in tests, because `@validateRpc()` sharpens
    our signature against the interface (2026-09-10: `applyAction` gained a git-cache stub).
 7. Start the dev server and open Kintai once as an admin and once as an employee.
-8. Fast-forward `main`.
+8. Fast-forward `main` and `git push origin main`. The fork's base moves with it.
 
 ## What keeps the loop cheap
 
