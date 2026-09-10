@@ -22,7 +22,6 @@ import type {
 import { WORK_DATE_POLICIES } from "../src/work-date";
 import { describeFailure } from "./errors";
 import { useT, type Messages } from "./i18n";
-import { LanguageToggle } from "./i18n/LanguageToggle";
 import { MonthlyTab } from "./MonthlyTab";
 import { OverviewTab } from "./OverviewTab";
 import { isReady, RosterRow } from "./RosterRow";
@@ -75,10 +74,11 @@ export type KintaiAdminClient = {
    * Save the caller's own UI language, or forget it given null. Identity comes from the
    * capability, as everywhere here.
    *
-   * The header's `LanguageToggle` is the only caller, and it switches the screen BEFORE calling
-   * this: a rejection costs the reader the saved preference, never the switch they just made. The
-   * employee mirror carries the same method (`KintaiEmployeeClient` in `src/types.ts`), because
-   * the toggle sits in the header of both pages.
+   * The entry point is the only caller, from `followHost` on each theme push: it mirrors the OS
+   * shell's language picker onto the account, `null` (i.e. "system", which deletes the row)
+   * included. The screen has already switched by then — a rejection costs the reader the saved
+   * preference, never the switch they can see. The employee mirror carries the same method
+   * (`KintaiEmployeeClient` in `src/types.ts`), because both entries do the same mirroring.
    */
   setLanguage(language: UiLanguage | null): Promise<void>;
 };
@@ -159,11 +159,11 @@ type Tab = "overview" | "monthly" | "roster";
  * So `load` has two answers: a roster, or a failure shown as one. Any error from either read is
  * a failure — there is no error that means "not an administrator" any more.
  *
- * ONE LANGUAGE, and this component does not choose it: `main.tsx` resolves it from the account's
- * saved choice and the browser's own preference and hands it to `LanguageProvider`, and every word
- * below — this file's, `RosterRow`'s and `MonthlyTab`'s — comes off `useT()`. The toggle that
- * changes it sits in the header, the only control here that is not about attendance and the only
- * one whose effect is the whole screen at once.
+ * ONE LANGUAGE, and this component does not choose it: `main.tsx` resolves it from the OS shell's
+ * picker, then the account's saved choice, then the browser's own preference, and hands it to
+ * `LanguageProvider`, and every word below — this file's, `RosterRow`'s and `MonthlyTab`'s —
+ * comes off `useT()`. There is no language control on this page: the shell's sidebar has it, and
+ * a push from there re-renders every panel here without remounting one.
  */
 export default function AdminPage({ api }: { api: KintaiAdminClient }) {
   const t = useT();
@@ -357,9 +357,9 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
 
   return (
     <main className="mx-auto flex min-h-full w-full max-w-4xl flex-col gap-8 px-5 py-10 sm:px-8 sm:py-12">
-      {/* Title and subtitle left, the language toggle hard right — a row, so the control keeps the
-          trailing edge whatever the subtitle's length in either language. Same shape as the
-          employee gadget's header, because it is the same control doing the same thing. */}
+      {/* Title and subtitle, and nothing else: the language control that used to sit hard right
+          belongs to the OS shell now. Same shape as the employee gadget's header, because both
+          lost the same control on the same day. */}
       <header className="flex items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight text-kumo-default">
@@ -369,7 +369,6 @@ export default function AdminPage({ api }: { api: KintaiAdminClient }) {
             {view.status === "admin" ? t.header.adminSubtitle : t.header.subtitle}
           </p>
         </div>
-        <LanguageToggle api={api} />
       </header>
 
       {view.status === "loading" && (

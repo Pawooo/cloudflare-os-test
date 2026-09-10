@@ -39,6 +39,7 @@
  * an English screen that drops into 漢字 for its most consequential determination is the mixture
  * this replaces.
  */
+import type { AppLocale } from "@gadgets/workshop-shared/theme";
 import type {
   ApprovalAction, PunchKind, SubmissionState, UiLanguage, WorkDatePolicy,
 } from "../../src/types";
@@ -1184,19 +1185,26 @@ export const ja = {
 export const DICTIONARIES: Record<UiLanguage, Messages> = { en, ja };
 
 /**
- * Which language a screen opens in: the saved choice if there is one, otherwise the browser's.
+ * Which language a screen is read in: the OS choice, then the account's, then the browser's.
  *
- * Pure, and takes both inputs rather than reading `navigator` itself, so the whole rule is one
- * table in a test rather than a global to stub. The two facts it exists because of: the Workshop
- * exposes no locale to a gatekeeper app (`startAppUi` receives `{ isAdmin }`, and the theme channel
- * carries only light/dark and an accent), and the sandboxed iframe has no storage — an opaque
- * origin with no localStorage, no IndexedDB and no cookies. So the browser's own language is the
- * only signal available on a first open, and `account_preferences` is the only place a choice can
- * live.
+ * Pure, and takes all three inputs rather than reading `navigator` itself, so the whole rule is
+ * one table in a test rather than a global to stub.
  *
- * `chosen` wins whenever it is set, including when it disagrees with the browser: it is the one
- * thing in the system that records what this person actually asked for. `null` means never chosen
- * — not "chose English", which is why the column is nullable.
+ * `os` IS THE SHELL'S PICKER (`theme.locale`, pushed into this iframe on the same channel as dark
+ * mode since 2026-09-10) and it outranks everything, because it is the control the reader can see
+ * and press. `null` there is not "English": it is the shell sitting on "system", which is the
+ * shell explicitly declining to answer so that an app with its own memory of this person can use
+ * it. Sending the browser-resolved value instead would make that memory dead weight, which is why
+ * the OS patch sends null.
+ *
+ * `saved` IS THAT MEMORY — the choice on `account_preferences`, `null` when there is none. It is
+ * the only cross-device fact in the chain and the only one that survives a different browser; it
+ * loses to the OS and beats `navigator`. `null` means never chosen, not "chose English", which is
+ * why the column is nullable.
+ *
+ * `navigatorLanguage` IS THE LAST RESORT, and on a first open by somebody who has chosen nowhere
+ * it is the only signal there is: the sandboxed iframe is an opaque origin with no localStorage,
+ * no IndexedDB and no cookies, so this app can remember nothing locally at all.
  *
  * Anything that is not a `ja` tag resolves to English, including a language this dictionary has no
  * words for. `fr-FR` becoming French would be a promise the bundle cannot keep; becoming English is
@@ -1204,9 +1212,12 @@ export const DICTIONARIES: Record<UiLanguage, Messages> = { en, ja };
  * .language` is `ja`, `ja-JP` and (on some hosts) `JA-jp`.
  */
 export function resolveLanguage(
-  chosen: UiLanguage | null,
+  os: AppLocale | null,
+  saved: UiLanguage | null,
   navigatorLanguage: string | undefined,
 ): UiLanguage {
-  if (chosen !== null && UI_LANGUAGES.includes(chosen)) return chosen;
+  for (const chosen of [os, saved]) {
+    if (chosen !== null && UI_LANGUAGES.includes(chosen)) return chosen;
+  }
   return navigatorLanguage?.toLowerCase().startsWith("ja") === true ? "ja" : "en";
 }

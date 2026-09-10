@@ -9,7 +9,10 @@ import type { KintaiEmployeeClient, UiLanguage } from "../src/types";
 import EmployeePage from "./EmployeePage";
 import ErrorBoundary from "./ErrorBoundary";
 import { installErrorReporting, reportIssue } from "./error-reporting";
-import { LanguageProvider, resolveLanguage, useT } from "./i18n";
+import { LanguageProvider, useT } from "./i18n";
+import {
+  createLanguageSource, followHost, localeToLanguage, resolveLanguage, type LanguageSource,
+} from "./i18n/language-source";
 import { applyAppTheme } from "./theme";
 import "./styles.css";
 
@@ -25,8 +28,8 @@ installErrorReporting();
  * `<html lang>`, and two frozen objects), so putting it above the boundary costs nothing, and
  * putting it below would have left the crash screen with keys it could not reach.
  *
- * It follows a toggle too: a switch rerenders this, so a crash after a switch speaks the language
- * the reader chose rather than the one the page opened in.
+ * It follows the shell too: a language push rerenders this, so a crash after a switch speaks the
+ * language the reader chose rather than the one the page opened in.
  *
  * `main.tsx` has the same four lines. Not shared, deliberately: a module holding it would have to
  * be imported by both entries to save four lines that say nothing either entry does not already
@@ -41,9 +44,26 @@ function TranslatedBoundary({ children }: { children: ReactNode }) {
   );
 }
 
+/**
+ * What the Workshop pushes appearance into: light/dark, the accent seed, and — since 2026-09-10 —
+ * the language picked in the shell's sidebar.
+ *
+ * `follow` is set AFTER the first render's inputs have landed, because the language source it
+ * writes to does not exist until then. A push that arrives before that is not lost: it is kept in
+ * `latest`, which is what the first render resolves from. Deliberately not replayed through
+ * `follow` when it is set — the mirror onto the account is what a person CHANGING the language
+ * asks for, and merely opening the page must not write to their account.
+ */
 class AppIframe extends RpcTarget implements GatekeeperAppThemeReceiver {
+  /** The newest theme the host has pushed, or undefined while none has arrived. */
+  latest: GatekeeperAppTheme | undefined;
+  /** Where a push goes once there is a language source to write to. */
+  follow: ((theme: GatekeeperAppTheme) => void) | undefined;
+
   setTheme(theme: GatekeeperAppTheme): void {
+    this.latest = theme;
     applyAppTheme(theme);
+    this.follow?.(theme);
   }
 }
 
@@ -69,10 +89,6 @@ function main() {
   window.parent.postMessage({ type: "handshake" }, "*", [port2]);
   const iframe = new AppIframe();
   const host = newMessagePortRpcSession<HostCapability>(port1, iframe);
-  host
-    .subscribeTheme(iframe)
-    .then(applyAppTheme)
-    .catch(() => {});
 
   const root = createRoot(element, {
     onUncaughtError: (error) =>
@@ -83,9 +99,9 @@ function main() {
       }),
   });
 
-  const start = (language: UiLanguage) => {
+  const start = (source: LanguageSource) => {
     root.render(
-      <LanguageProvider initial={language}>
+      <LanguageProvider source={source}>
         <TranslatedBoundary>
           <EmployeePage api={host.ui} />
         </TranslatedBoundary>
@@ -94,31 +110,71 @@ function main() {
   };
 
   /*
-   * WHICH LANGUAGE THIS SCREEN OPENS IN, decided here and once.
+   * WHICH LANGUAGE THIS SCREEN OPENS IN, decided here, and again on every push from the shell.
    *
-   * `whoAmI()` carries the choice saved against this account (`null` if the person has never
-   * pressed the toggle) and `navigator.language` is the browser's own preference; `resolveLanguage`
-   * combines them, saved choice first. The page is not asked to work this out — it takes the
-   * answer through the provider — and nothing below reads `navigator`.
+   * THREE INPUTS IN A FIXED ORDER (`resolveLanguage`): the language picked in the OS shell
+   * (`theme.locale`, arriving with the rest of the appearance), then the choice saved against
+   * this account (`whoAmI().language`, `null` if there has never been one), then the browser's
+   * own preference. The page is not asked to work any of this out — it takes the answer through
+   * the provider — and nothing below reads `navigator`.
    *
-   * The first render waits for that one round trip, deliberately: rendering earlier would mean
-   * painting the wrong language at somebody who has told us which one they read, and then either
-   * leaving it wrong or remounting the whole screen (and its `getDay` read) underneath them. The
-   * frame before it lands is the host's own background, which the page's `<style>` already paints.
+   * BOTH ROUND TRIPS, IN PARALLEL, BEFORE THE FIRST RENDER. `allSettled` rather than `all`
+   * because neither is allowed to withhold the screen; parallel because they are independent and
+   * the wait is what the reader sees. Rendering earlier would mean painting the wrong language at
+   * somebody who has told us which one they read, and then either leaving it wrong or remounting
+   * the whole screen (and its `getDay` read) underneath them. The frame before they land is the
+   * host's own background, which the page's `<style>` already paints.
    *
-   * A REFUSED OR DROPPED `whoAmI` STILL RENDERS, on the browser's language: the screen a worker
-   * needs to clock in on must not be withheld because a preference could not be read, and
-   * `EmployeePage`'s own reads report their own failures where they happen.
+   * A REFUSED OR DROPPED `whoAmI` STILL RENDERS, on the OS choice or the browser's language: the
+   * screen a worker needs to clock in on must not be withheld because a preference could not be
+   * read, and `EmployeePage`'s own reads report their own failures where they happen. A refused
+   * `subscribeTheme` likewise costs the appearance and nothing else.
    */
   void (async () => {
-    let chosen: UiLanguage | null = null;
-    try {
-      chosen = (await host.ui.whoAmI()).language;
-    } catch {
-      // Nothing to report: the preference is a nicety, and every read this screen depends on
-      // reports its own failure through `describeFailure` where the reader can see it.
-    }
-    start(resolveLanguage(chosen, navigator.language));
+    const [pushed, identity] = await Promise.allSettled([
+      host.subscribeTheme(iframe),
+      host.ui.whoAmI(),
+    ]);
+    // `iframe.latest` first: a push can beat `subscribeTheme`'s own answer back, and it is the
+    // newer of the two.
+    const theme = iframe.latest
+      ?? (pushed.status === "fulfilled" ? pushed.value : undefined);
+    if (theme !== undefined) applyAppTheme(theme);
+
+    /*
+     * `saved` is the account row as it stands, and it is BOOKKEEPING, not a constant.
+     *
+     * Every mirror that succeeds changes what is on the account, and the next push that says
+     * "system" falls back through this value — so if it were left at what `whoAmI` returned, a
+     * reader who picked 日本語 in the shell and then picked system would fall back to whatever
+     * they had saved months ago instead of to the 日本語 they just asked for and had saved.
+     * Updated only after the save resolves: a refused save changed nothing on the server, and
+     * this must go on describing the server.
+     */
+    let saved: UiLanguage | null = identity.status === "fulfilled" ? identity.value.language : null;
+
+    const source = createLanguageSource(
+      resolveLanguage(theme?.locale ?? null, saved, navigator.language),
+    );
+
+    iframe.follow = (next) => {
+      const mirrored = localeToLanguage(next.locale);
+      void followHost({
+        locale: next.locale,
+        saved,
+        navigatorLanguage: navigator.language,
+        source,
+        save: (language) => host.ui.setLanguage(language),
+      }).then(
+        () => { saved = mirrored; },
+        // REPORTED, NOT SHOWN. The control that caused this is the shell's, in another frame;
+        // Kintai has nowhere honest to put a notice about a button that is not on its screen, and
+        // the switch the reader actually asked for has already happened either way.
+        (caught: unknown) => reportIssue("kintai.language-save", caught),
+      );
+    };
+
+    start(source);
   })();
 }
 

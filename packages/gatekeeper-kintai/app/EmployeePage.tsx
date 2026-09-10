@@ -5,7 +5,6 @@ import type {
 import { jstClockTime, jstWorkDate } from "../src/work-date";
 import { describeFailure } from "./errors";
 import { useT } from "./i18n";
-import { LanguageToggle } from "./i18n/LanguageToggle";
 import { PunchSource } from "./PunchSource";
 
 /**
@@ -22,10 +21,10 @@ type Tab = "today" | "month";
  * (matching `AdminPage`), so switching tabs never remounts a panel or drops the read it holds. 今日
  * is live (this task); 今月 is still a placeholder (Task 6).
  *
- * ONE LANGUAGE, and the page does not choose it: `employee-main.tsx` resolves it from the account's
- * saved choice and the browser's own preference, and every word below comes off `useT()`. The
- * toggle that changes it sits in the header — the only control here that is not about attendance,
- * and the only one whose effect is the whole screen at once.
+ * ONE LANGUAGE, and the page does not choose it: `employee-main.tsx` resolves it from the OS
+ * shell's picker, then the account's saved choice, then the browser's own preference, and every
+ * word below comes off `useT()`. There is no language control on this screen — the shell's
+ * sidebar has it, and a push from there re-renders everything here through the provider's source.
  */
 export default function EmployeePage({ api }: { api: KintaiEmployeeClient }) {
   const [tab, setTab] = useState<Tab>("today");
@@ -33,8 +32,9 @@ export default function EmployeePage({ api }: { api: KintaiEmployeeClient }) {
 
   return (
     <main className="mx-auto flex min-h-full w-full max-w-4xl flex-col gap-8 px-5 py-10 sm:px-8 sm:py-12">
-      {/* Title left, the language toggle hard right — a row, so the control keeps the trailing edge
-          whatever the subtitle's length in either language. */}
+      {/* Title and subtitle, and nothing else: the language control that used to sit hard right
+          belongs to the OS shell now. The row survives its removal deliberately — it is what
+          keeps the heading block's own alignment stable in either language. */}
       <header className="flex items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight text-kumo-default">
@@ -42,7 +42,6 @@ export default function EmployeePage({ api }: { api: KintaiEmployeeClient }) {
           </h1>
           <p className="mt-1 text-sm text-kumo-subtle">{t.header.employeeSubtitle}</p>
         </div>
-        <LanguageToggle api={api} />
       </header>
 
       <TabBar tab={tab} onSelect={setTab} />

@@ -7,6 +7,7 @@ import type {
 import { jstWorkDate } from "../src/work-date";
 import EmployeePage, { nextPunchKind } from "./EmployeePage";
 import { LanguageProvider, en, ja } from "./i18n";
+import { createLanguageSource, type LanguageSource } from "./i18n/language-source";
 
 /** One current punch on today's day, everything but the fields under test defaulted to inert. */
 function punchRow(overrides: Partial<PunchRow> = {}): PunchRow {
@@ -89,10 +90,13 @@ function employeeApi(overrides: Partial<KintaiEmployeeClient> = {}): KintaiEmplo
 describe("EmployeePage", () => {
   let root: Root | undefined;
   let container: HTMLDivElement | undefined;
+  /** The store the provider subscribes to, kept so a test can push a language the way the shell does. */
+  let source: LanguageSource | undefined;
 
   afterEach(() => {
     act(() => root?.unmount());
     container?.remove();
+    source = undefined;
     vi.restoreAllMocks();
   });
 
@@ -112,23 +116,35 @@ describe("EmployeePage", () => {
     expect(tab("month").textContent).toBe(ja.tabs.month);
   });
 
-  // One language per screen. The header carries the one control that changes it, right of the
-  // title, offering the OTHER language by its own name — "English" while the screen is in 日本語.
-  it("puts the language toggle in the header, after the title, offering the other language", async () => {
+  /*
+   * ONE LANGUAGE PER SCREEN, AND NO CONTROL HERE FOR CHANGING IT.
+   *
+   * Kintai had its own A→文 toggle in this header until 2026-09-10. The OS shell now carries a
+   * language picker in its sidebar utility strip and pushes the answer into every gatekeeper
+   * iframe, so a second control inside the frame would be a second answer to the same question —
+   * two switches for one setting, disagreeing the moment either is pressed. The header is title
+   * and subtitle again, and this test is what keeps it that way.
+   */
+  it("carries no language control of its own — the shell owns that now", async () => {
     await render(<EmployeePage api={employeeApi()} />);
 
-    const toggle = field<HTMLButtonElement>('[data-testid="language-toggle"]');
-    const header = field<HTMLElement>("header");
-    expect(header.contains(toggle)).toBe(true);
-    // Right-aligned means: it comes after the title in the header's own flex row.
-    const title = field<HTMLElement>("header h1");
-    expect(title.compareDocumentPosition(toggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    // Inert, like every control in this sandboxed frame.
-    expect(toggle.getAttribute("type")).toBe("button");
-    // The other language's own name, and the aria-label in the language being read now.
-    expect(toggle.textContent).toContain(ja.labels.languageNames.en);
-    expect(toggle.getAttribute("aria-label"))
-      .toBe(ja.header.language.switchTo(ja.labels.languageNames.en));
+    expect(container!.querySelector('[data-testid="language-toggle"]')).toBeNull();
+    expect(field<HTMLElement>("header").querySelector("button")).toBeNull();
+  });
+
+  // The shell's push, seen from inside the frame: the source the provider subscribes to changes,
+  // and the whole screen re-renders in the new language without a reload and without remounting
+  // the panel the reader was on.
+  it("re-renders in the language the shell pushes, without remounting the panel", async () => {
+    await render(<EmployeePage api={employeeApi()} />);
+    const before = panel("today");
+    expect(tab("today").textContent).toBe(ja.tabs.today);
+
+    await switchTo("en");
+
+    expect(tab("today").textContent).toBe(en.tabs.today);
+    expect(tab("month").textContent).toBe(en.tabs.month);
+    expect(panel("today")).toBe(before);
   });
 
   // The whole screen in English when that is the account's language — the tabs and the sentence a
@@ -147,9 +163,6 @@ describe("EmployeePage", () => {
     expect(today().textContent).toContain(en.today.emptyDay);
     expect(container!.textContent).not.toContain(ja.tabs.today);
     expect(container!.textContent).not.toContain(ja.today.emptyDay);
-    // The toggle now offers 日本語, and says so in English.
-    expect(field('[data-testid="language-toggle"]').getAttribute("aria-label"))
-      .toBe(en.header.language.switchTo(en.labels.languageNames.ja));
   });
 
   it("reveals 今月 on click and hides 今日, without remounting either", async () => {
@@ -334,18 +347,18 @@ describe("EmployeePage", () => {
   });
 
   /*
-   * A MESSAGE ALREADY ON SCREEN MUST FOLLOW THE TOGGLE. The reads on these panels hold what they
+   * A MESSAGE ALREADY ON SCREEN MUST FOLLOW THE SWITCH. The reads on these panels hold what they
    * CAUGHT and describe it at render time (see `TodayPanel`, and `useSectionRead` on the
    * dashboard); the two WRITES here used to hold the rendered sentence instead, which froze it in
-   * whichever language the failure happened in. The reader most likely to press the toggle is
-   * precisely the one who cannot read the refusal in front of them, and the language they pressed
+   * whichever language the failure happened in. The reader most likely to change the language is
+   * precisely the one who cannot read the refusal in front of them, and the language they changed
    * it for is the one it stayed out of.
    *
-   * Both cases toggle 日本語 → English with an error standing, and assert the sentence is now the
-   * English dictionary's — not merely that it changed, and not the fallback either, since the
-   * fallback is also translated and would pass a weaker assertion.
+   * Both cases push 日本語 → English from the shell with an error standing, and assert the
+   * sentence is now the English dictionary's — not merely that it changed, and not the fallback
+   * either, since the fallback is also translated and would pass a weaker assertion.
    */
-  it("retranslates a punch failure already on screen when the language is toggled", async () => {
+  it("retranslates a punch failure already on screen when the shell pushes English", async () => {
     const api = employeeApi({
       getDay: vi.fn(async () => day([])),
       punch: vi.fn(async () => {
@@ -362,13 +375,13 @@ describe("EmployeePage", () => {
     expect(inToday('[data-testid="punch-error"]').textContent)
       .toBe(ja.errors.byCode.KINTAI_ACCOUNT_NOT_LINKED);
 
-    await click('[data-testid="language-toggle"]');
+    await switchTo("en");
 
     expect(inToday('[data-testid="punch-error"]').textContent)
       .toBe(en.errors.byCode.KINTAI_ACCOUNT_NOT_LINKED);
   });
 
-  it("retranslates a filing failure already on screen when the language is toggled", async () => {
+  it("retranslates a filing failure already on screen when the shell pushes English", async () => {
     vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-09-07T12:00:00+09:00"));
     const api = employeeApi({
       getDay: vi.fn(async () => day([punchRow({ kind: "in" })], { anomalies: ["unpaired_in"] })),
@@ -390,7 +403,7 @@ describe("EmployeePage", () => {
     expect(inToday('[data-testid="correction-notice"]').textContent)
       .toBe(ja.errors.byCode.KINTAI_NO_APPROVER);
 
-    await click('[data-testid="language-toggle"]');
+    await switchTo("en");
 
     expect(inToday('[data-testid="correction-notice"]').textContent)
       .toBe(en.errors.byCode.KINTAI_NO_APPROVER);
@@ -399,7 +412,7 @@ describe("EmployeePage", () => {
   // The SUCCESS notice was stored rendered for the same reason and is wrong in the same way: 申請
   // しました・承認待ち is the one sentence telling the reader nothing is fixed yet, and a reader who
   // switched language would have kept reading it in the language they switched away from.
-  it("retranslates the filed confirmation when the language is toggled", async () => {
+  it("retranslates the filed confirmation when the shell pushes English", async () => {
     vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-09-07T12:00:00+09:00"));
     const api = employeeApi({
       getDay: vi.fn(async () => day([punchRow({ kind: "in" })], { anomalies: ["unpaired_in"] })),
@@ -413,7 +426,7 @@ describe("EmployeePage", () => {
     expect(inToday('[data-testid="correction-notice"]').textContent)
       .toBe(ja.today.missingOut.filed);
 
-    await click('[data-testid="language-toggle"]');
+    await switchTo("en");
 
     expect(inToday('[data-testid="correction-notice"]').textContent)
       .toBe(en.today.missingOut.filed);
@@ -690,14 +703,32 @@ describe("EmployeePage", () => {
    * `whoAmI` returns `language: "ja"` — the account language the real entry resolves and hands the
    * provider. The page itself takes the answer rather than resolving it (see `employee-main.tsx`),
    * so a test names the language here, and the one English test passes `"en"`.
+   *
+   * The language arrives as a SOURCE rather than as an initial value: that is what
+   * `employee-main.tsx` builds and what the shell writes into when somebody changes the language
+   * in the sidebar. Holding it here is what lets `switchTo` below stand in for that push.
    */
   async function render(element: React.ReactNode, language: UiLanguage = "ja"): Promise<void> {
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
+    source = createLanguageSource(language);
     await act(async () => {
-      root!.render(<LanguageProvider initial={language}>{element}</LanguageProvider>);
+      root!.render(<LanguageProvider source={source!}>{element}</LanguageProvider>);
     });
+    await settle();
+  }
+
+  /**
+   * The OS shell changing the language, as this screen experiences it.
+   *
+   * `employee-main.tsx` writes the resolved language into the source from `AppIframe.setTheme`;
+   * everything below `useSyncExternalStore` cannot tell that apart from this call, which is
+   * exactly why the page can be tested without the entry point (see `language-source.test.ts` for
+   * the push itself, and the account save that rides along with it).
+   */
+  async function switchTo(language: UiLanguage): Promise<void> {
+    await act(async () => source!.set(language));
     await settle();
   }
 

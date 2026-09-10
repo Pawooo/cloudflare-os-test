@@ -142,32 +142,48 @@ describe("the dictionary", () => {
 });
 
 /**
- * Which language a screen opens in.
+ * Which language a screen is read in — three inputs, in a fixed order of authority.
  *
- * The Workshop exposes no locale to a gatekeeper app (`startAppUi` receives `{ isAdmin }`), and
- * the sandboxed iframe has no storage, so these two inputs are all there is: the choice saved
- * server-side against the account, and the browser's own language. A saved choice always wins —
- * it is the only thing in the system that records what this person actually asked for.
+ * THE OS FIRST. Since 2026-09-10 the shell carries a language picker in its utility strip and
+ * pushes the answer into every gatekeeper iframe on the theme channel (`theme.locale`). That is
+ * the control the reader can actually see and press, so it outranks everything Kintai remembers
+ * about them — including a choice they made through Kintai's own toggle before that toggle was
+ * removed.
+ *
+ * THEN THE ACCOUNT. `null` locale means the shell is on "system": the person has not told the OS
+ * which language they read, so Kintai falls back to its own memory of them. That memory is the
+ * whole reason the shell sends null rather than the browser-resolved value — a resolved value
+ * would make the account row dead weight.
+ *
+ * THEN THE BROWSER. The sandboxed iframe has no storage of its own (an opaque origin: no
+ * localStorage, no IndexedDB, no cookies), so `navigator.language` is the last thing left and the
+ * only signal available on a first open by somebody who has never chosen anywhere.
  */
 describe("resolveLanguage", () => {
-  it("follows the browser when nothing has been chosen", () => {
-    expect(resolveLanguage(null, "ja-JP")).toBe("ja");
-    expect(resolveLanguage(null, "en-GB")).toBe("en");
-    expect(resolveLanguage(null, undefined)).toBe("en");
+  // The four rows of the precedence table, one per source of an answer.
+  it("takes the OS choice over the account and the browser", () => {
+    expect(resolveLanguage("ja", "en", "en-US")).toBe("ja");
+    expect(resolveLanguage("en", "ja", "ja-JP")).toBe("en");
   });
 
-  it("prefers the saved choice over the browser", () => {
-    expect(resolveLanguage("en", "ja-JP")).toBe("en");
-    expect(resolveLanguage("ja", "en")).toBe("ja");
+  it("falls back to the account when the shell is on system", () => {
+    expect(resolveLanguage(null, "ja", "en-US")).toBe("ja");
+    expect(resolveLanguage(null, "en", "ja-JP")).toBe("en");
+  });
+
+  it("falls back to the browser when neither the shell nor the account has an answer", () => {
+    expect(resolveLanguage(null, null, "ja-JP")).toBe("ja");
+    expect(resolveLanguage(null, null, "en-US")).toBe("en");
+    expect(resolveLanguage(null, null, undefined)).toBe("en");
   });
 
   // `ja` alone, `ja-JP`, `JA-jp`: the prefix decides, case-insensitively. Anything else is
   // English, because English is the fallback and not a match — a language this dictionary has no
   // words for must not resolve to itself.
   it("reads any ja tag as Japanese and everything else as English", () => {
-    expect(resolveLanguage(null, "ja")).toBe("ja");
-    expect(resolveLanguage(null, "JA-JP")).toBe("ja");
-    expect(resolveLanguage(null, "fr-FR")).toBe("en");
-    expect(resolveLanguage(null, "")).toBe("en");
+    expect(resolveLanguage(null, null, "ja")).toBe("ja");
+    expect(resolveLanguage(null, null, "JA-JP")).toBe("ja");
+    expect(resolveLanguage(null, null, "fr-FR")).toBe("en");
+    expect(resolveLanguage(null, null, "")).toBe("en");
   });
 });

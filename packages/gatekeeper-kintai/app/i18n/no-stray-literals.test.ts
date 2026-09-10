@@ -12,7 +12,7 @@ import { describe, expect, it } from "vitest";
  *
  * WHICH FILES. Every `.ts`/`.tsx` under `app/`, with exactly two exemptions: the tests (they assert
  * Japanese copy on purpose) and `messages.ts` (the one file whose job is to hold it). NOT exempt:
- * the rest of `app/i18n/` — `LanguageToggle.tsx` and `index.tsx` are components like any other, and
+ * the rest of `app/i18n/` — `index.tsx` and `language-source.ts` are modules like any other, and
  * a literal there would evade every other sweep precisely because a reader assumes that directory
  * is where the Japanese is supposed to be.
  *
@@ -183,10 +183,10 @@ export function scan(source: string): number[] {
 describe("no stray Japanese literals outside the dictionary", () => {
   it("reads the whole of app/, not a hand-picked list", () => {
     const files = sourceFiles();
-    // The screens, the entries, and — deliberately — the i18n module's own components.
+    // The screens, the entries, and — deliberately — the i18n module's own non-dictionary files.
     for (const expected of [
       "AdminPage.tsx", "EmployeePage.tsx", "main.tsx", "employee-main.tsx",
-      "i18n/LanguageToggle.tsx", "i18n/index.tsx",
+      "i18n/index.tsx", "i18n/language-source.ts",
     ]) {
       expect(files).toContain(expected);
     }

@@ -6,6 +6,7 @@ import type {
 } from "../src/types";
 import AdminPage, { type KintaiAdminClient } from "./AdminPage";
 import { LanguageProvider, en, ja } from "./i18n";
+import { createLanguageSource, type LanguageSource } from "./i18n/language-source";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -176,10 +177,13 @@ function flagged(overrides: Partial<AnomalousDay> = {}): AnomalousDay {
 describe("AdminPage", () => {
   let root: Root | undefined;
   let container: HTMLDivElement | undefined;
+  /** The store the provider subscribes to, kept so a test can push a language the way the shell does. */
+  let source: LanguageSource | undefined;
 
   afterEach(() => {
     act(() => root?.unmount());
     container?.remove();
+    source = undefined;
     vi.restoreAllMocks();
   });
 
@@ -500,33 +504,50 @@ describe("AdminPage", () => {
   });
 
   /**
-   * ONE LANGUAGE PER SCREEN, and the one control that changes which one.
+   * ONE LANGUAGE PER SCREEN, and the shell is what changes it.
    *
-   * The dashboard does not resolve the language — `main.tsx` does, from the account's saved choice
-   * and the browser's own preference, and hands it to `LanguageProvider`. So these two tests are
-   * about what the screen DOES with the answer: it puts the switch where a reader can find it, and
-   * it says everything in the language it was given.
+   * The dashboard does not resolve the language — `main.tsx` does, from the OS choice the shell
+   * pushes, then the account's saved choice, then the browser — and hands it to
+   * `LanguageProvider` as a source. So these tests are about what the screen DOES with the
+   * answer: it says everything in the language it was given, it follows a push without a reload,
+   * and it offers no second control of its own.
    */
   describe("the language the dashboard is read in", () => {
-    it("puts the language toggle in the header, right of the title, offering the other language",
-      async () => {
-        await render(<AdminPage api={adminApi({}, [TANAKA])} />);
+    /*
+     * NO LANGUAGE CONTROL IN THIS HEADER, deliberately, since 2026-09-10.
+     *
+     * Kintai's own A→文 toggle lived here from the day the dictionary landed, because the OS gave
+     * a gatekeeper app nothing about language. The shell now has a picker in its sidebar utility
+     * strip and pushes the answer into every iframe, so keeping this one would leave two controls
+     * for one setting — and the moment either was used they would disagree.
+     */
+    it("carries no language control of its own — the shell owns that now", async () => {
+      await render(<AdminPage api={adminApi({}, [TANAKA])} />);
 
-        const toggle = field<HTMLButtonElement>('[data-testid="language-toggle"]');
-        const header = field<HTMLElement>("header");
-        expect(header.contains(toggle)).toBe(true);
-        // Right-aligned means: it comes after the title in the header's own flex row. Asserted by
-        // document order rather than by a Tailwind class, which is styling and not structure.
-        const title = field<HTMLElement>("header h1");
-        expect(title.compareDocumentPosition(toggle) & Node.DOCUMENT_POSITION_FOLLOWING)
-          .toBeTruthy();
-        // Inert, like every control in this sandboxed frame.
-        expect(toggle.getAttribute("type")).toBe("button");
-        // The other language's own name, and the aria-label in the language being read now.
-        expect(toggle.textContent).toContain(ja.labels.languageNames.en);
-        expect(toggle.getAttribute("aria-label"))
-          .toBe(ja.header.language.switchTo(ja.labels.languageNames.en));
-      });
+      expect(container!.querySelector('[data-testid="language-toggle"]')).toBeNull();
+      expect(field<HTMLElement>("header").querySelector("button")).toBeNull();
+    });
+
+    /*
+     * A PUSH FROM THE SHELL RE-RENDERS THE WHOLE DASHBOARD, and does not reload it.
+     *
+     * All three panels are mounted at once and each holds a read; a language change must not cost
+     * any of them. So this asserts both halves: every tab's word is the other dictionary's now,
+     * and `listEmployees` was not called a second time.
+     */
+    it("re-renders every panel in the language the shell pushes, re-reading nothing", async () => {
+      const api = adminApi({}, [TANAKA]);
+      await render(<AdminPage api={api} />);
+      expect(field('[data-testid="tab-roster"]').textContent).toBe(ja.tabs.roster);
+
+      await switchTo("en");
+
+      expect(field('[data-testid="tab-overview"]').textContent).toBe(en.tabs.overview);
+      expect(field('[data-testid="tab-monthly"]').textContent).toBe(en.tabs.monthly);
+      expect(field('[data-testid="tab-roster"]').textContent).toBe(en.tabs.roster);
+      expect(api.listEmployees).toHaveBeenCalledTimes(1);
+      expect(api.whoAmI).toHaveBeenCalledTimes(1);
+    });
 
     /**
      * THE WHOLE SCREEN in English when that is the account's language — every panel, not a
@@ -539,12 +560,15 @@ describe("AdminPage", () => {
      * is the assertion that actually proves "one language per screen" — a sampled negative only
      * proves the samples.
      *
-     * THE ONE EXEMPTION IS THE LANGUAGE TOGGLE, whose subtree is removed before the scan rather
-     * than tolerated inside it. It renders the OTHER language's own name, and a language's name is
-     * written the way its own readers write it in both dictionaries (`labels.languageNames`) — so
-     * "日本語" on this English screen is the control working, and a reader hunting for their
-     * language finds the word they would look for. Removing exactly that subtree keeps the scan a
-     * blanket one everywhere else.
+     * THERE IS NO EXEMPTION ANY MORE. Until 2026-09-10 the language toggle's subtree was cut out
+     * before the scan: it rendered the OTHER language's own name ("日本語" on an English screen),
+     * which was the control working rather than a label that missed the dictionary. The shell
+     * owns that control now, so nothing on this page is allowed to be Japanese and the sweep is
+     * unconditional — which is a stronger test than it was.
+     *
+     * The positive control moved with it. A sweep that passes because the pattern matches nothing
+     * proves nothing, so the last line asserts the pattern DOES fire on a word from the Japanese
+     * dictionary — the same dictionary this screen would have rendered had it been given `"ja"`.
      *
      * `outerHTML` and not `textContent`: a placeholder, an `aria-label` and a `title` are words a
      * reader is given too, and they are attributes. There are no comments in the DOM to strip.
@@ -564,9 +588,6 @@ describe("AdminPage", () => {
       expect(text('[data-testid="roster-summary"]')).toBe(en.roster.summary(2, 0));
       expect(row(TANAKA.id).textContent)
         .toContain(en.roster.row.ready(en.roster.row.reportsTo("Suzuki")));
-      // And the toggle now offers 日本語, saying so in English.
-      expect(field('[data-testid="language-toggle"]').getAttribute("aria-label"))
-        .toBe(en.header.language.switchTo(en.labels.languageNames.ja));
       // 要対応 and 月次 are mounted from the first render too, so their empty states are in this
       // markup and are covered by the sweep below. Two of them named, so a sweep that passed
       // because a panel rendered nothing at all would still be red.
@@ -575,13 +596,10 @@ describe("AdminPage", () => {
       expect(within(overview('[data-testid="blockers-section"]'), '[data-testid="blockers-empty"]'))
         .toBe(en.blockers.allReady);
 
-      // The sweep: nothing of the other language anywhere in the rendered page, the toggle's own
-      // subtree excepted (see this test's comment).
-      const swept = container!.cloneNode(true) as HTMLElement;
-      swept.querySelector('[data-testid="language-toggle"]')!.remove();
-      expect(swept.outerHTML).not.toMatch(JAPANESE);
-      // …and the sweep can see 日本語 when there is 日本語 to see.
-      expect(container!.outerHTML).toMatch(JAPANESE);
+      // The sweep: nothing of the other language anywhere in the rendered page, no exceptions.
+      expect(container!.outerHTML).not.toMatch(JAPANESE);
+      // …and the pattern can see 日本語 when there is 日本語 to see, or the line above is vacuous.
+      expect(ja.tabs.roster).toMatch(JAPANESE);
     });
   });
 
@@ -2184,14 +2202,31 @@ describe("AdminPage", () => {
    * `whoAmI` returns `language: "ja"` — the account language the real entry resolves and hands the
    * provider. The page itself takes the answer rather than resolving it (see `main.tsx`), so a
    * test names the language here, and the one English test passes `"en"`.
+   *
+   * The language arrives as a SOURCE rather than as an initial value: that is what `main.tsx`
+   * builds and what the shell writes into when somebody changes the language in the sidebar.
+   * Holding it here is what lets `switchTo` below stand in for that push.
    */
   async function render(element: React.ReactNode, language: UiLanguage = "ja"): Promise<void> {
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
+    source = createLanguageSource(language);
     await act(async () => {
-      root!.render(<LanguageProvider initial={language}>{element}</LanguageProvider>);
+      root!.render(<LanguageProvider source={source!}>{element}</LanguageProvider>);
     });
+  }
+
+  /**
+   * The OS shell changing the language, as this screen experiences it.
+   *
+   * `main.tsx` writes the resolved language into the source from `AppIframe.setTheme`; everything
+   * below `useSyncExternalStore` cannot tell that apart from this call, which is why the
+   * dashboard can be tested without the entry point (see `language-source.test.ts` for the push
+   * itself, and the account save that rides along with it).
+   */
+  async function switchTo(language: UiLanguage): Promise<void> {
+    await act(async () => source!.set(language));
   }
 
   function field<T extends Element>(selector: string): T {
