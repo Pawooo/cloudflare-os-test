@@ -676,6 +676,16 @@ export class KintaiAccount
     return { iframeHtml: context.isAdmin ? APP_HTML : EMPLOYEE_APP_HTML, ui };
   }
 
+  /**
+   * Refuses the reconnect commit: Kintai is auto-provisioned and has no connect flow, so no
+   * credentials are ever staged for this account and there is nothing a `stageId` could name.
+   * Required by `GatekeeperUser` since upstream's reconnect staging (2026-09); the same shape the
+   * other ambient gatekeepers use.
+   */
+  commitReconnect(_stageId: string): Promise<void> {
+    throw new Error("Kintai is auto-provisioned and has no connect flow.");
+  }
+
   /** Returns no URL-addressed resources: attendance is ambient, not a thing with a URL. */
   async getSupportedResources(): Promise<SupportedResource[]> {
     return [];
